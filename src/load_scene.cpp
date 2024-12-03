@@ -10,6 +10,48 @@
 #include <string>
 #include <moveit_visual_tools/moveit_visual_tools.h>
 
+void disableCollisions(const std::string &object_name, const std::string &base_name,
+                       moveit::planning_interface::PlanningSceneInterface &planning_scene_interface)
+{
+    // Prepare the PlanningScene message to update the Allowed Collision Matrix (ACM)
+    moveit_msgs::msg::PlanningScene planning_scene;
+    planning_scene.is_diff = true;
+
+    // Retrieve the existing ACM from the planning scene
+    moveit_msgs::msg::AllowedCollisionMatrix &acm = planning_scene.allowed_collision_matrix;
+
+    // Get the current ACM entry names (links/objects already in the ACM)
+    std::vector<std::string> existing_entry_names = planning_scene_interface.getKnownObjectNames();
+
+    // Add the new entries if they are not already in the ACM
+    acm.entry_names = existing_entry_names;
+    if (std::find(acm.entry_names.begin(), acm.entry_names.end(), object_name) == acm.entry_names.end())
+        acm.entry_names.push_back(object_name);
+    if (std::find(acm.entry_names.begin(), acm.entry_names.end(), base_name) == acm.entry_names.end())
+        acm.entry_names.push_back(base_name);
+
+    // Create a new ACM matrix of size N x N
+    size_t matrix_size = acm.entry_names.size();
+    acm.entry_values.resize(matrix_size);
+    for (auto &row : acm.entry_values)
+    {
+        row.enabled.resize(matrix_size, false); // Default all collisions to "not allowed"
+    }
+
+    // Allow collision for the specific pair (object_name, base_name)
+    size_t object_idx = std::distance(acm.entry_names.begin(),
+                                      std::find(acm.entry_names.begin(), acm.entry_names.end(), object_name));
+    size_t base_idx = std::distance(acm.entry_names.begin(),
+                                    std::find(acm.entry_names.begin(), acm.entry_names.end(), base_name));
+    acm.entry_values[object_idx].enabled[base_idx] = true;
+    acm.entry_values[base_idx].enabled[object_idx] = true;
+
+    // Apply the updated Allowed Collision Matrix
+    planning_scene_interface.applyPlanningScene(planning_scene);
+
+    RCLCPP_INFO(rclcpp::get_logger("disable_collisions"), "Disabled collision between '%s' and '%s'", object_name.c_str(), base_name.c_str());
+}
+
 void loadCustomScene(const std::string &path, rclcpp::Node::SharedPtr move_group_node)
 {
     // planning_scene_monitor::LockedPlanningSceneRW ps(planning_scene_monitor);
@@ -102,6 +144,9 @@ void loadCustomScene(const std::string &path, rclcpp::Node::SharedPtr move_group
             collision_object.operation = collision_object.ADD;
 
             collision_objects.push_back(collision_object);
+
+            // Disable collision with base
+            // disableCollisions(object_name, "base", planning_scene_interface);
         }
         
     }
