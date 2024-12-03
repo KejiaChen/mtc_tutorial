@@ -1,6 +1,7 @@
 #include <rclcpp/rclcpp.hpp>
 #include <moveit/planning_scene/planning_scene.h>
 #include <moveit/planning_scene_interface/planning_scene_interface.h>
+#include <moveit/move_group_interface/move_group_interface.h>
 #include <moveit/task_constructor/task.h>
 #include <moveit/task_constructor/solvers.h>
 #include <moveit/task_constructor/stages.h>
@@ -17,6 +18,9 @@
 #include <moveit/task_constructor/marker_tools.h>
 #include <rviz_marker_tools/marker_creation.h>
 #include <geometry_msgs/msg/pose_stamped.hpp>
+#include <moveit_visual_tools/moveit_visual_tools.h>
+#include <std_msgs/msg/bool.hpp>
+
 
 static const rclcpp::Logger LOGGER = rclcpp::get_logger("mtc_tutorial");
 namespace mtc = moveit::task_constructor;
@@ -48,9 +52,12 @@ public:
 
   rclcpp::node_interfaces::NodeBaseInterface::SharedPtr getNodeBaseInterface();
 
-  void doTask();
+  // Add this public getter
+  rclcpp::Node::SharedPtr getNode();
 
-  void setupPlanningScene();
+  void doTask(std::string& goal_clip_id);
+
+  // void loadCustomScene(const std::string &path);
 
 private:
   // Compose an MTC task from a series of stages.
@@ -69,30 +76,113 @@ MTCTaskNode::MTCTaskNode(const rclcpp::NodeOptions& options)
 {
 }
 
-void MTCTaskNode::setupPlanningScene()
+rclcpp::Node::SharedPtr MTCTaskNode::getNode()
 {
-  moveit_msgs::msg::CollisionObject object;
-  object.id = "object";
-  object.header.frame_id = "right_panda_link0";
-  object.primitives.resize(1);
-  object.primitives[0].type = shape_msgs::msg::SolidPrimitive::CYLINDER;
-  object.primitives[0].dimensions = { 0.1, 0.02 };
-
-  geometry_msgs::msg::Pose pose;
-  pose.position.x = 0.5;
-  pose.position.y = -0.25;
-  pose.position.z = 0.1;
-  pose.orientation.w = 1.0;
-  object.pose = pose;
-
-  moveit::planning_interface::PlanningSceneInterface psi;
-  psi.applyCollisionObject(object);
+  return node_;
 }
 
-void MTCTaskNode::doTask()
+// void MTCTaskNode::loadCustomScene(const std::string &path)
+// {
+//     moveit::planning_interface::PlanningSceneInterface psi;
+    
+//     using moveit::planning_interface::MoveGroupInterface;
+//     auto move_group_interface = MoveGroupInterface(node_, "right_panda_arm");
+
+//     moveit_visual_tools::MoveItVisualTools visual_tools(node_, "right_panda_link0", rviz_visual_tools::RVIZ_MARKER_TOPIC,
+//                                                       move_group_interface.getRobotModel());
+
+//     std::vector<moveit_msgs::msg::CollisionObject> collision_objects;
+//     std::ifstream fin(path);
+//     if (!fin.is_open())
+//     {
+//         throw std::runtime_error("Failed to open scene file: " + path);
+//     }
+
+//     std::string line;
+//     while (std::getline(fin, line))
+//     {
+//         // Skip invalid lines or empty lines
+//         if (line.empty() || line[0] == '.' || line.find("(noname)+") != std::string::npos)
+//             continue;
+
+//         if (line[0] == '*') // Object definition starts
+//         {
+//             std::string object_name = line.substr(2); // Extract object name after "* "
+//             RCLCPP_INFO(LOGGER, "Loading object: %s", object_name.c_str());
+
+//             moveit_msgs::msg::CollisionObject collision_object;
+//             collision_object.id = object_name;
+//             collision_object.header.frame_id = "world"; // Default frame
+
+//             // Read the next lines for the object block
+//             std::string pos_line, ori_line, shape_line, dim_line, unused_line;
+//             double x, y, z, qx, qy, qz, qw, dx, dy, dz;
+
+//             // Read position
+//             if (!std::getline(fin, pos_line) || !(std::istringstream(pos_line) >> x >> y >> z))
+//                 throw std::runtime_error("Invalid position line for object: " + object_name);
+
+//             // Read orientation
+//             if (!std::getline(fin, ori_line) || !(std::istringstream(ori_line) >> qx >> qy >> qz >> qw))
+//                 throw std::runtime_error("Invalid orientation line for object: " + object_name);
+
+//             // Skip one line (the "1" marker)
+//             if (!std::getline(fin, unused_line))
+//                 throw std::runtime_error("Unexpected end of file after orientation for object: " + object_name);
+
+//             // Read shape type (assuming it's always "box")
+//             if (!std::getline(fin, shape_line) || shape_line != "box")
+//                 throw std::runtime_error("Invalid or unsupported shape type for object: " + object_name);
+
+//             // Read dimensions
+//             if (!std::getline(fin, dim_line) || !(std::istringstream(dim_line) >> dx >> dy >> dz))
+//                 throw std::runtime_error("Invalid dimensions line for object: " + object_name);
+
+//             // Skip the remaining unused lines in the block
+//             for (int i = 0; i < 4; ++i)
+//             {
+//                 if (!std::getline(fin, unused_line))
+//                     throw std::runtime_error("Unexpected end of file in unused block for object: " + object_name);
+//             }
+            
+//             shape_msgs::msg::SolidPrimitive primitive;
+//             primitive.type = primitive.BOX;
+//             primitive.dimensions.resize(3);
+//             primitive.dimensions[primitive.BOX_X] = dx;
+//             primitive.dimensions[primitive.BOX_Y] = dy;
+//             primitive.dimensions[primitive.BOX_Z] = dz;
+
+//             // Create pose
+//             geometry_msgs::msg::Pose pose;
+//             pose.position.x = x;
+//             pose.position.y = y;
+//             pose.position.z = z;
+//             pose.orientation.x = qx;
+//             pose.orientation.y = qy;
+//             pose.orientation.z = qz;
+//             pose.orientation.w = qw;
+
+//             collision_object.primitives.push_back(primitive);
+//             collision_object.primitive_poses.push_back(pose);
+//             collision_object.operation = collision_object.ADD;
+
+//             collision_objects.push_back(collision_object);
+//         }
+        
+//     }
+//     // Add object to planning scene
+    
+//     psi.addCollisionObjects(collision_objects);
+
+//     // Show text in RViz of status and wait for MoveGroup to receive and process the collision object message
+//     visual_tools.trigger();
+
+//     RCLCPP_INFO(LOGGER, "Scene loaded successfully from %s", path.c_str());
+// }
+
+void MTCTaskNode::doTask(std::string& goal_clip_id)
 {
-  std::string clip_id = "clip5";
-  task_ = createTask(clip_id);
+  task_ = createTask(goal_clip_id);
 
   try
   {
@@ -158,11 +248,14 @@ mtc::Task MTCTaskNode::createTask(std::string& goal_frame_name)
   // Set up planners
   
   auto sampling_planner = std::make_shared<mtc::solvers::PipelinePlanner>(node_);
+  sampling_planner->setMaxVelocityScalingFactor(0.05);
+  sampling_planner->setMaxAccelerationScalingFactor(0.05);
+
   auto interpolation_planner = std::make_shared<mtc::solvers::JointInterpolationPlanner>();
 
   auto cartesian_planner = std::make_shared<mtc::solvers::CartesianPath>();
-  cartesian_planner->setMaxVelocityScalingFactor(1.0);
-  cartesian_planner->setMaxAccelerationScalingFactor(1.0);
+  cartesian_planner->setMaxVelocityScalingFactor(0.05);
+  cartesian_planner->setMaxAccelerationScalingFactor(0.05);
   cartesian_planner->setStepSize(.01);
 
   /****************************************************
@@ -297,6 +390,15 @@ int main(int argc, char** argv)
 
   auto mtc_task_node = std::make_shared<MTCTaskNode>(options);
   rclcpp::executors::MultiThreadedExecutor executor;
+  
+  // Create a publisher to start the follower tracking
+  auto tracking_start_pub = mtc_task_node->getNode()->create_publisher<std_msgs::msg::Bool>("/start_tracking", 10);
+
+  moveit::planning_interface::MoveGroupInterface move_group(mtc_task_node->getNode(), "right_panda_arm");
+  namespace rvt = rviz_visual_tools;
+  moveit_visual_tools::MoveItVisualTools visual_tools(mtc_task_node->getNode(), "right_panda_link0", "dual_mtc_routing",
+                                                      move_group.getRobotModel());
+  visual_tools.loadRemoteControl();
 
   auto spin_thread = std::make_unique<std::thread>([&executor, &mtc_task_node]() {
     executor.add_node(mtc_task_node->getNodeBaseInterface());
@@ -304,8 +406,21 @@ int main(int argc, char** argv)
     executor.remove_node(mtc_task_node->getNodeBaseInterface());
   });
 
-//   mtc_task_node->setupPlanningScene();
-  mtc_task_node->doTask();
+  // initial clip
+  std::string clip_id = "clip5";
+  mtc_task_node->doTask(clip_id);
+
+  // start follower tracking
+  std_msgs::msg::Bool start_tracking_msg;
+  start_tracking_msg.data = true;
+  tracking_start_pub->publish(start_tracking_msg);
+
+  // Use visul tools to control the movement from one clip to another
+  visual_tools.prompt("Press 'next' in the RvizVisualToolsGui window to start the demo");
+
+  // the next clip
+  clip_id = "clip6";
+  mtc_task_node->doTask(clip_id);
 
   spin_thread->join();
   rclcpp::shutdown();

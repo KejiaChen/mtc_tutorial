@@ -16,12 +16,15 @@ find_package(geometry_msgs REQUIRED)
 find_package(moveit_core REQUIRED)
 find_package(moveit_ros_planning_interface REQUIRED)
 find_package(moveit_visual_tools REQUIRED)
-find_package(nlohmann_json REQUIRED)
 
 # declare a demo consisting of a single cpp file
 function(demo name)
 	add_executable(${name} src/${name}.cpp)
-	ament_target_dependencies(${name} moveit_task_constructor_core rclcpp)
+	ament_target_dependencies(${name} 
+                            moveit_task_constructor_core 
+                            rclcpp
+                            moveit_visual_tools
+                            std_msgs)
     target_include_directories(${name} PUBLIC
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
         $<INSTALL_INTERFACE:include>)
@@ -34,12 +37,12 @@ demo(dual_mtc_tutorial)
 demo(dual_mtc_routing)
 
 add_executable(load_scene src/load_scene.cpp)
-target_link_libraries(load_scene nlohmann_json::nlohmann_json)
 ament_target_dependencies(load_scene
   rclcpp
   geometry_msgs
   moveit_core
   moveit_ros_planning_interface
+  # moveit_task_constructor_core
   moveit_visual_tools
 )
 install(TARGETS load_scene DESTINATION lib/${PROJECT_NAME})

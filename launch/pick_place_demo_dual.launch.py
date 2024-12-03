@@ -6,6 +6,12 @@ from moveit_configs_utils import MoveItConfigsBuilder
 
 
 def generate_launch_description():
+    exe_arg = DeclareLaunchArgument(name="exe")
+    # scene_file_arg = DeclareLaunchArgument("scene_file",
+    #                                         default_value="/home/tp2/ws_humble/scene/mongodb_8.scene",  # Default file path
+    #                                         description="Path to the .scene file to be loaded",
+    #                                     )
+    
     moveit_config = (
         MoveItConfigsBuilder("dual_arm_panda")
         .robot_description(file_path="config/panda.urdf.xacro",
@@ -32,7 +38,8 @@ def generate_launch_description():
         parameters=[
             moveit_config.to_dict(),
         ],
+        # arguments=[LaunchConfiguration("scene_file")],
     )
     
-    arg = DeclareLaunchArgument(name="exe")
-    return LaunchDescription([arg, pick_place_demo])
+    # return LaunchDescription([exe_arg, scene_file_arg, pick_place_demo])
+    return LaunchDescription([exe_arg, pick_place_demo])
