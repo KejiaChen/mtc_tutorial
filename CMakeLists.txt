@@ -12,6 +12,11 @@ find_package(rclcpp REQUIRED)
 # uncomment the following section in order to fill in
 # further dependencies manually.
 # find_package(<dependency> REQUIRED)
+find_package(geometry_msgs REQUIRED)
+find_package(moveit_core REQUIRED)
+find_package(moveit_ros_planning_interface REQUIRED)
+find_package(moveit_visual_tools REQUIRED)
+find_package(nlohmann_json REQUIRED)
 
 # declare a demo consisting of a single cpp file
 function(demo name)
@@ -27,6 +32,17 @@ endfunction()
 demo(mtc_tutorial)
 demo(dual_mtc_tutorial)
 demo(dual_mtc_routing)
+
+add_executable(load_scene src/load_scene.cpp)
+target_link_libraries(load_scene nlohmann_json::nlohmann_json)
+ament_target_dependencies(load_scene
+  rclcpp
+  geometry_msgs
+  moveit_core
+  moveit_ros_planning_interface
+  moveit_visual_tools
+)
+install(TARGETS load_scene DESTINATION lib/${PROJECT_NAME})
 
 install(DIRECTORY launch DESTINATION share/${PROJECT_NAME})
 
