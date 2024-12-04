@@ -20,11 +20,13 @@
 #include <geometry_msgs/msg/pose_stamped.hpp>
 #include <moveit_visual_tools/moveit_visual_tools.h>
 #include <std_msgs/msg/bool.hpp>
+// #include <moveit_msgs>
 
 
 static const rclcpp::Logger LOGGER = rclcpp::get_logger("mtc_tutorial");
 namespace mtc = moveit::task_constructor;
 
+// scene configuration
 std::vector<double> clip_size = {0.04, 0.04, 0.06};
 double hold_x_offset = 0.03;
 std::vector<double> leader_pre_clip = {-(clip_size[0]/2+hold_x_offset), -clip_size[1]/2, clip_size[2]/2};
@@ -52,18 +54,30 @@ public:
 
   rclcpp::node_interfaces::NodeBaseInterface::SharedPtr getNodeBaseInterface();
 
-  // Add this public getter
+  // public getter
   rclcpp::Node::SharedPtr getNode();
+  moveit::planning_interface::MoveGroupInterface& getMoveGroup();
+  moveit_visual_tools::MoveItVisualTools& getVisualTools();
 
   void doTask(std::string& goal_clip_id);
 
   // void loadCustomScene(const std::string &path);
 
 private:
+  geometry_msgs::msg::PoseStamped getPoseTransform(const geometry_msgs::msg::PoseStamped& pose, const std::string& target_frame);
+  moveit_msgs::msg::Constraints createBoxConstraints(const std::string& link_name, geometry_msgs::msg::PoseStamped& goal_pose);
+
   // Compose an MTC task from a series of stages.
   mtc::Task createTask(std::string& goal_frame_name);
   mtc::Task task_;
   rclcpp::Node::SharedPtr node_;
+
+  // interfaces
+  moveit::planning_interface::MoveGroupInterface move_group_;
+  moveit_visual_tools::MoveItVisualTools visual_tools_;
+  // TF2 components
+  tf2_ros::Buffer tf_buffer_;
+  tf2_ros::TransformListener tf_listener_;
 };
 
 rclcpp::node_interfaces::NodeBaseInterface::SharedPtr MTCTaskNode::getNodeBaseInterface()
@@ -72,8 +86,13 @@ rclcpp::node_interfaces::NodeBaseInterface::SharedPtr MTCTaskNode::getNodeBaseIn
 }
 
 MTCTaskNode::MTCTaskNode(const rclcpp::NodeOptions& options)
-  : node_{ std::make_shared<rclcpp::Node>("mtc_node", options) }
+  : node_{ std::make_shared<rclcpp::Node>("mtc_node", options) },
+    move_group_(node_, "right_panda_arm"),
+    visual_tools_(node_, "world", rviz_visual_tools::RVIZ_MARKER_TOPIC, move_group_.getRobotModel()),
+    tf_buffer_(node_->get_clock()), // Initialize TF Buffer with node clock
+    tf_listener_(tf_buffer_)       // Initialize TF Listener with TF Buffer
 {
+  visual_tools_.loadRemoteControl();
 }
 
 rclcpp::Node::SharedPtr MTCTaskNode::getNode()
@@ -81,104 +100,88 @@ rclcpp::Node::SharedPtr MTCTaskNode::getNode()
   return node_;
 }
 
-// void MTCTaskNode::loadCustomScene(const std::string &path)
-// {
-//     moveit::planning_interface::PlanningSceneInterface psi;
-    
-//     using moveit::planning_interface::MoveGroupInterface;
-//     auto move_group_interface = MoveGroupInterface(node_, "right_panda_arm");
+moveit::planning_interface::MoveGroupInterface& MTCTaskNode::getMoveGroup()
+{
+  return move_group_;
+}
 
-//     moveit_visual_tools::MoveItVisualTools visual_tools(node_, "right_panda_link0", rviz_visual_tools::RVIZ_MARKER_TOPIC,
-//                                                       move_group_interface.getRobotModel());
+moveit_visual_tools::MoveItVisualTools& MTCTaskNode::getVisualTools()
+{
+  return visual_tools_;
+}
 
-//     std::vector<moveit_msgs::msg::CollisionObject> collision_objects;
-//     std::ifstream fin(path);
-//     if (!fin.is_open())
-//     {
-//         throw std::runtime_error("Failed to open scene file: " + path);
-//     }
+geometry_msgs::msg::PoseStamped MTCTaskNode::getPoseTransform(const geometry_msgs::msg::PoseStamped& pose, const std::string& target_frame)
+{   
+    std::string frame_id = pose.header.frame_id;
+    geometry_msgs::msg::TransformStamped transform;
+    try {
+        transform = tf_buffer_.lookupTransform(
+            target_frame,   // Target frame
+            frame_id,  // Source frame
+            rclcpp::Time(0),  // Get the latest transform
+            rclcpp::Duration::from_seconds(1.0)// Timeout
+        );
+    } catch (tf2::TransformException &ex) {
+        RCLCPP_ERROR(LOGGER, "Could not transform %s frame to %s frame: %s", frame_id.c_str(), target_frame.c_str(), ex.what());
+        return pose;
+    }
 
-//     std::string line;
-//     while (std::getline(fin, line))
-//     {
-//         // Skip invalid lines or empty lines
-//         if (line.empty() || line[0] == '.' || line.find("(noname)+") != std::string::npos)
-//             continue;
+    geometry_msgs::msg::PoseStamped pose_world;
+    tf2::doTransform(pose, pose_world, transform);
+    return pose_world;
+}
 
-//         if (line[0] == '*') // Object definition starts
-//         {
-//             std::string object_name = line.substr(2); // Extract object name after "* "
-//             RCLCPP_INFO(LOGGER, "Loading object: %s", object_name.c_str());
+moveit_msgs::msg::Constraints MTCTaskNode::createBoxConstraints(const std::string& link_name, geometry_msgs::msg::PoseStamped& goal_pose)
+{
+  // Assume current_pose and goal_pose are of type geometry_msgs::msg::PoseStamped
+  geometry_msgs::msg::PoseStamped current_pose = move_group_.getCurrentPose("right_panda_hand");
+  geometry_msgs::msg::PoseStamped current_pose_transformed = getPoseTransform(current_pose, "world");
+  geometry_msgs::msg::PoseStamped goal_pose_transformed = getPoseTransform(goal_pose, "world");
+  RCLCPP_INFO(LOGGER, "Goal pose transformed: x: %f, y: %f, z: %f", goal_pose_transformed.pose.position.x, goal_pose_transformed.pose.position.y, goal_pose_transformed.pose.position.z);
 
-//             moveit_msgs::msg::CollisionObject collision_object;
-//             collision_object.id = object_name;
-//             collision_object.header.frame_id = "world"; // Default frame
+  // Compute the box center and dimensions
+  geometry_msgs::msg::Pose box_pose;
+  box_pose.position.x = (current_pose_transformed.pose.position.x + goal_pose_transformed.pose.position.x) / 2.0;
+  box_pose.position.y = (current_pose_transformed.pose.position.y + goal_pose_transformed.pose.position.y) / 2.0;
+  box_pose.position.z = (current_pose_transformed.pose.position.z + goal_pose_transformed.pose.position.z) / 2.0;
+  box_pose.orientation.w = 1.0; // Identity quaternion for box orientation
 
-//             // Read the next lines for the object block
-//             std::string pos_line, ori_line, shape_line, dim_line, unused_line;
-//             double x, y, z, qx, qy, qz, qw, dx, dy, dz;
+  shape_msgs::msg::SolidPrimitive box;
+  box.type = shape_msgs::msg::SolidPrimitive::BOX;
+  box.dimensions = {
+      fabs(goal_pose_transformed.pose.position.x - current_pose_transformed.pose.position.x),  // Length (x)
+      fabs(goal_pose_transformed.pose.position.y - current_pose_transformed.pose.position.y),  // Width (y)
+      fabs(goal_pose_transformed.pose.position.z - current_pose_transformed.pose.position.z)   // Height (z)
+  };
 
-//             // Read position
-//             if (!std::getline(fin, pos_line) || !(std::istringstream(pos_line) >> x >> y >> z))
-//                 throw std::runtime_error("Invalid position line for object: " + object_name);
+  // Create position constraint
+  moveit_msgs::msg::PositionConstraint box_constraint;
+  box_constraint.header.frame_id = "world"; // Replace with the appropriate reference frame
+  box_constraint.link_name = "right_panda_hand"; // Replace with the relevant link name
+  box_constraint.constraint_region.primitives.emplace_back(box);
+  box_constraint.constraint_region.primitive_poses.emplace_back(box_pose);
+  box_constraint.weight = 1.0;
 
-//             // Read orientation
-//             if (!std::getline(fin, ori_line) || !(std::istringstream(ori_line) >> qx >> qy >> qz >> qw))
-//                 throw std::runtime_error("Invalid orientation line for object: " + object_name);
+  // Visualize the box constraint
+  Eigen::Vector3d box_point_1(
+      box_pose.position.x - box.dimensions[0] / 2.0,
+      box_pose.position.y - box.dimensions[1] / 2.0,
+      box_pose.position.z - box.dimensions[2] / 2.0
+  );
+  Eigen::Vector3d box_point_2(
+      box_pose.position.x + box.dimensions[0] / 2.0,
+      box_pose.position.y + box.dimensions[1] / 2.0,
+      box_pose.position.z + box.dimensions[2] / 2.0
+  );
+  visual_tools_.publishCuboid(box_point_1, box_point_2, rviz_visual_tools::TRANSLUCENT_DARK);
+  visual_tools_.trigger();
 
-//             // Skip one line (the "1" marker)
-//             if (!std::getline(fin, unused_line))
-//                 throw std::runtime_error("Unexpected end of file after orientation for object: " + object_name);
+  // Wrap in a generic Constraints message
+  moveit_msgs::msg::Constraints box_constraints;
+  box_constraints.position_constraints.emplace_back(box_constraint);
 
-//             // Read shape type (assuming it's always "box")
-//             if (!std::getline(fin, shape_line) || shape_line != "box")
-//                 throw std::runtime_error("Invalid or unsupported shape type for object: " + object_name);
-
-//             // Read dimensions
-//             if (!std::getline(fin, dim_line) || !(std::istringstream(dim_line) >> dx >> dy >> dz))
-//                 throw std::runtime_error("Invalid dimensions line for object: " + object_name);
-
-//             // Skip the remaining unused lines in the block
-//             for (int i = 0; i < 4; ++i)
-//             {
-//                 if (!std::getline(fin, unused_line))
-//                     throw std::runtime_error("Unexpected end of file in unused block for object: " + object_name);
-//             }
-            
-//             shape_msgs::msg::SolidPrimitive primitive;
-//             primitive.type = primitive.BOX;
-//             primitive.dimensions.resize(3);
-//             primitive.dimensions[primitive.BOX_X] = dx;
-//             primitive.dimensions[primitive.BOX_Y] = dy;
-//             primitive.dimensions[primitive.BOX_Z] = dz;
-
-//             // Create pose
-//             geometry_msgs::msg::Pose pose;
-//             pose.position.x = x;
-//             pose.position.y = y;
-//             pose.position.z = z;
-//             pose.orientation.x = qx;
-//             pose.orientation.y = qy;
-//             pose.orientation.z = qz;
-//             pose.orientation.w = qw;
-
-//             collision_object.primitives.push_back(primitive);
-//             collision_object.primitive_poses.push_back(pose);
-//             collision_object.operation = collision_object.ADD;
-
-//             collision_objects.push_back(collision_object);
-//         }
-        
-//     }
-//     // Add object to planning scene
-    
-//     psi.addCollisionObjects(collision_objects);
-
-//     // Show text in RViz of status and wait for MoveGroup to receive and process the collision object message
-//     visual_tools.trigger();
-
-//     RCLCPP_INFO(LOGGER, "Scene loaded successfully from %s", path.c_str());
-// }
+  return box_constraints;
+}
 
 void MTCTaskNode::doTask(std::string& goal_clip_id)
 {
@@ -225,6 +228,14 @@ mtc::Task MTCTaskNode::createTask(std::string& goal_frame_name)
   task.setProperty("group", arm_group_name);
   task.setProperty("eef", hand_group_name);
   task.setProperty("ik_frame", hand_frame);
+
+  // delete markers
+  visual_tools_.deleteAllMarkers();
+  visual_tools_.trigger();
+
+  // set target pose
+  geometry_msgs::msg::PoseStamped target_pose;
+  target_pose = createClipGoal(goal_frame_name, leader_pre_clip);
 
 // Disable warnings for this line, as it's a variable that's set but not used in this example
 #pragma GCC diagnostic push
@@ -280,6 +291,28 @@ mtc::Task MTCTaskNode::createTask(std::string& goal_frame_name)
         mtc::stages::Connect::GroupPlannerVector{ { arm_group_name, sampling_planner } });
     stage_move_to_pick->setTimeout(5.0);
     stage_move_to_pick->properties().configureInitFrom(mtc::Stage::PARENT);
+
+    moveit_msgs::msg::Constraints path_constraints = createBoxConstraints("right_panda_hand", target_pose);
+    
+    // // Visualize the box constraint
+    // geometry_msgs::msg::Pose box_pose = path_constraints.position_constraints[0].constraint_region.primitive_poses[0];
+    // shape_msgs::msg::SolidPrimitive box = path_constraints.position_constraints[0].constraint_region.primitives[0];
+    // Eigen::Vector3d box_point_1(
+    //     box_pose.position.x - box.dimensions[0] / 2.0,
+    //     box_pose.position.y - box.dimensions[1] / 2.0,
+    //     box_pose.position.z - box.dimensions[2] / 2.0
+    // );
+    // Eigen::Vector3d box_point_2(
+    //     box_pose.position.x + box.dimensions[0] / 2.0,
+    //     box_pose.position.y + box.dimensions[1] / 2.0,
+    //     box_pose.position.z + box.dimensions[2] / 2.0
+    // );
+    // visual_tools_.publishCuboid(box_point_1, box_point_2, rviz_visual_tools::TRANSLUCENT_DARK);
+    // visual_tools_.trigger();
+    
+    stage_move_to_pick->setPathConstraints(path_constraints);
+    RCLCPP_INFO(LOGGER, "Path constraints set");
+
     task.add(std::move(stage_move_to_pick));
   }
   
@@ -328,8 +361,8 @@ mtc::Task MTCTaskNode::createTask(std::string& goal_frame_name)
     
       // Fixed grasp pose
       auto stage = std::make_unique<mtc::stages::FixedCartesianPoses>("fixed clipping pose");
-      geometry_msgs::msg::PoseStamped target_pose;
-      target_pose = createClipGoal(goal_frame_name, leader_pre_clip);
+      // geometry_msgs::msg::PoseStamped target_pose;
+      // target_pose = createClipGoal(goal_frame_name, leader_pre_clip);
       stage->addPose(target_pose);
       stage->setMonitoredStage(pre_move_stage_ptr);  // Hook into pre_move_stage_ptr
 
@@ -394,17 +427,19 @@ int main(int argc, char** argv)
   // Create a publisher to start the follower tracking
   auto tracking_start_pub = mtc_task_node->getNode()->create_publisher<std_msgs::msg::Bool>("/start_tracking", 10);
 
-  moveit::planning_interface::MoveGroupInterface move_group(mtc_task_node->getNode(), "right_panda_arm");
-  namespace rvt = rviz_visual_tools;
-  moveit_visual_tools::MoveItVisualTools visual_tools(mtc_task_node->getNode(), "right_panda_link0", "dual_mtc_routing",
-                                                      move_group.getRobotModel());
-  visual_tools.loadRemoteControl();
+  // moveit::planning_interface::MoveGroupInterface move_group(mtc_task_node->getNode(), "right_panda_arm");
+  // moveit_visual_tools::MoveItVisualTools visual_tools(mtc_task_node->getNode(), "right_panda_link0", "dual_mtc_routing",
+  //                                                     move_group.getRobotModel());
+  // visual_tools.loadRemoteControl();
 
   auto spin_thread = std::make_unique<std::thread>([&executor, &mtc_task_node]() {
     executor.add_node(mtc_task_node->getNodeBaseInterface());
     executor.spin();
     executor.remove_node(mtc_task_node->getNodeBaseInterface());
   });
+
+  // Use visul tools to control the movement from one clip to another
+  mtc_task_node->getVisualTools().prompt("After objects are loaded, press 'next' in the RvizVisualToolsGui window to start the demo");
 
   // initial clip
   std::string clip_id = "clip5";
@@ -416,7 +451,7 @@ int main(int argc, char** argv)
   tracking_start_pub->publish(start_tracking_msg);
 
   // Use visul tools to control the movement from one clip to another
-  visual_tools.prompt("Press 'next' in the RvizVisualToolsGui window to start the demo");
+  mtc_task_node->getVisualTools().prompt("Press 'next' in the RvizVisualToolsGui window to contiune the next task");
 
   // the next clip
   clip_id = "clip6";
