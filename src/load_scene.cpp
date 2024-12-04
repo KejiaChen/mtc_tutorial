@@ -9,6 +9,7 @@
 #include <vector>
 #include <string>
 #include <moveit_visual_tools/moveit_visual_tools.h>
+#include <tf2_ros/transform_broadcaster.h>
 
 void disableCollisions(const std::string &object_name, const std::string &base_name,
                        moveit::planning_interface::PlanningSceneInterface &planning_scene_interface)
@@ -50,6 +51,27 @@ void disableCollisions(const std::string &object_name, const std::string &base_n
     planning_scene_interface.applyPlanningScene(planning_scene);
 
     RCLCPP_INFO(rclcpp::get_logger("disable_collisions"), "Disabled collision between '%s' and '%s'", object_name.c_str(), base_name.c_str());
+}
+
+void publishObjectTF(const std::string& object_name, const geometry_msgs::msg::Pose& object_pose, rclcpp::Node::SharedPtr node)
+{
+    static tf2_ros::TransformBroadcaster tf_broadcaster(node);
+
+    geometry_msgs::msg::TransformStamped transform;
+    transform.header.stamp = node->now();
+    transform.header.frame_id = "world";  // Replace with the appropriate parent frame
+    transform.child_frame_id = object_name;
+
+    // Set translation
+    transform.transform.translation.x = object_pose.position.x;
+    transform.transform.translation.y = object_pose.position.y;
+    transform.transform.translation.z = object_pose.position.z;
+
+    // Set rotation
+    transform.transform.rotation = object_pose.orientation;
+
+    // Broadcast the transform
+    tf_broadcaster.sendTransform(transform);
 }
 
 void loadCustomScene(const std::string &path, rclcpp::Node::SharedPtr move_group_node)
@@ -147,11 +169,13 @@ void loadCustomScene(const std::string &path, rclcpp::Node::SharedPtr move_group
 
             // Disable collision with base
             // disableCollisions(object_name, "base", planning_scene_interface);
+
+            // Publish the object's TF
+            publishObjectTF(collision_object.id, pose, move_group_node);
         }
-        
     }
+
     // Add object to planning scene
-    
     planning_scene_interface.addCollisionObjects(collision_objects);
 
     // Show text in RViz of status and wait for MoveGroup to receive and process the collision object message
