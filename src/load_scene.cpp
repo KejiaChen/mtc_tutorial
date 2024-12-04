@@ -10,6 +10,40 @@
 #include <string>
 #include <moveit_visual_tools/moveit_visual_tools.h>
 #include <tf2_ros/transform_broadcaster.h>
+#include <tf2_ros/static_transform_broadcaster.h>
+
+class ObjectTFBroadcaster
+{
+public:
+    ObjectTFBroadcaster(rclcpp::Node::SharedPtr node) : tf_broadcaster_(node), static_tf_broadcaster_(node)
+    {
+    }
+
+    void publishObjectTF(const std::string& object_name, const geometry_msgs::msg::Pose& object_pose)
+    {
+        geometry_msgs::msg::TransformStamped transform;
+        transform.header.stamp = rclcpp::Clock().now();  // Use the node's clock
+        transform.header.frame_id = "world";
+        transform.child_frame_id = object_name;
+
+        // Set translation
+        transform.transform.translation.x = object_pose.position.x;
+        transform.transform.translation.y = object_pose.position.y;
+        transform.transform.translation.z = object_pose.position.z;
+
+        // Set rotation
+        transform.transform.rotation = object_pose.orientation;
+
+        // Broadcast the transform
+        // tf_broadcaster_.sendTransform(transform);
+        static_tf_broadcaster_.sendTransform(transform);
+    }
+
+private:
+    tf2_ros::TransformBroadcaster tf_broadcaster_;
+    tf2_ros::StaticTransformBroadcaster static_tf_broadcaster_;
+};
+
 
 void disableCollisions(const std::string &object_name, const std::string &base_name,
                        moveit::planning_interface::PlanningSceneInterface &planning_scene_interface)
@@ -53,27 +87,6 @@ void disableCollisions(const std::string &object_name, const std::string &base_n
     RCLCPP_INFO(rclcpp::get_logger("disable_collisions"), "Disabled collision between '%s' and '%s'", object_name.c_str(), base_name.c_str());
 }
 
-void publishObjectTF(const std::string& object_name, const geometry_msgs::msg::Pose& object_pose, rclcpp::Node::SharedPtr node)
-{
-    static tf2_ros::TransformBroadcaster tf_broadcaster(node);
-
-    geometry_msgs::msg::TransformStamped transform;
-    transform.header.stamp = node->now();
-    transform.header.frame_id = "world";  // Replace with the appropriate parent frame
-    transform.child_frame_id = object_name;
-
-    // Set translation
-    transform.transform.translation.x = object_pose.position.x;
-    transform.transform.translation.y = object_pose.position.y;
-    transform.transform.translation.z = object_pose.position.z;
-
-    // Set rotation
-    transform.transform.rotation = object_pose.orientation;
-
-    // Broadcast the transform
-    tf_broadcaster.sendTransform(transform);
-}
-
 void loadCustomScene(const std::string &path, rclcpp::Node::SharedPtr move_group_node)
 {
     // planning_scene_monitor::LockedPlanningSceneRW ps(planning_scene_monitor);
@@ -89,6 +102,8 @@ void loadCustomScene(const std::string &path, rclcpp::Node::SharedPtr move_group
 
     moveit_visual_tools::MoveItVisualTools visual_tools(move_group_node, "right_panda_link0", rviz_visual_tools::RVIZ_MARKER_TOPIC,
                                                       move_group_interface.getRobotModel());
+
+    ObjectTFBroadcaster object_tf_broadcaster(move_group_node);
 
     std::vector<moveit_msgs::msg::CollisionObject> collision_objects;
     std::ifstream fin(path);
@@ -171,12 +186,20 @@ void loadCustomScene(const std::string &path, rclcpp::Node::SharedPtr move_group
             // disableCollisions(object_name, "base", planning_scene_interface);
 
             // Publish the object's TF
-            publishObjectTF(collision_object.id, pose, move_group_node);
+            // publishObjectTF(collision_object.id, pose, move_group_node);
+            // object_tf_broadcaster.publishObjectTF(collision_object.id, pose);
         }
     }
 
     // Add object to planning scene
     planning_scene_interface.addCollisionObjects(collision_objects);
+
+    // publish tf
+    for (const auto &collision_object : collision_objects)
+    {
+        object_tf_broadcaster.publishObjectTF(collision_object.id, collision_object.primitive_poses[0]);
+    }
+    RCLCPP_INFO(rclcpp::get_logger("load_scene"), "Published %d object TFs", collision_objects.size());
 
     // Show text in RViz of status and wait for MoveGroup to receive and process the collision object message
     visual_tools.trigger();
@@ -207,6 +230,6 @@ int main(int argc, char **argv)
     }
 
     rclcpp::spin(node);
-    rclcpp::shutdown();
+    // rclcpp::shutdown();
     return 0;
 }
