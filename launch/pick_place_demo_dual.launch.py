@@ -12,6 +12,13 @@ def generate_launch_description():
     #                                         description="Path to the .scene file to be loaded",
     #                                     )
     
+    # # Declare the path constraints argument
+    # path_constraints_arg = DeclareLaunchArgument(
+    #     "constraints",
+    #     default_value="false",  # Default file path
+    #     description="Whether to use path constraints",
+    # )  
+    
     moveit_config = (
         MoveItConfigsBuilder("dual_arm_panda")
         .robot_description(file_path="config/panda.urdf.xacro",
@@ -38,8 +45,18 @@ def generate_launch_description():
         parameters=[
             moveit_config.to_dict(),
         ],
-        # arguments=[LaunchConfiguration("scene_file")],
+        # arguments=[LaunchConfiguration("constraints")],
+    )
+    
+    # Distance Monitor node
+    distance_monitor = Node(
+        package="mtc_tutorial",
+        executable="monitor_tracking",
+        output="screen",
+        # parameters=[
+        #     moveit_config.to_dict(),
+        # ],
     )
     
     # return LaunchDescription([exe_arg, scene_file_arg, pick_place_demo])
-    return LaunchDescription([exe_arg, pick_place_demo])
+    return LaunchDescription([exe_arg, pick_place_demo, distance_monitor])
