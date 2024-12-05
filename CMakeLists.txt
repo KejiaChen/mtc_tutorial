@@ -16,6 +16,7 @@ find_package(geometry_msgs REQUIRED)
 find_package(moveit_core REQUIRED)
 find_package(moveit_ros_planning_interface REQUIRED)
 find_package(moveit_visual_tools REQUIRED)
+find_package(tf2_ros REQUIRED)
 
 # declare a demo consisting of a single cpp file
 function(demo name)
@@ -46,6 +47,15 @@ ament_target_dependencies(load_scene
   moveit_visual_tools
 )
 install(TARGETS load_scene DESTINATION lib/${PROJECT_NAME})
+
+add_executable(monitor_tracking src/monitor_tracking.cpp)
+ament_target_dependencies(monitor_tracking
+  rclcpp
+  geometry_msgs
+  std_msgs
+  tf2_ros
+)
+install(TARGETS monitor_tracking DESTINATION lib/${PROJECT_NAME})
 
 install(DIRECTORY launch DESTINATION share/${PROJECT_NAME})
 
