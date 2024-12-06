@@ -61,6 +61,8 @@ public:
 
   void doTask(std::string& goal_clip_id);
 
+  void updatePlanningScene();
+
   // void loadCustomScene(const std::string &path);
 
 private:
@@ -75,9 +77,15 @@ private:
   // interfaces
   moveit::planning_interface::MoveGroupInterface move_group_;
   moveit_visual_tools::MoveItVisualTools visual_tools_;
+
   // TF2 components
   tf2_ros::Buffer tf_buffer_;
   tf2_ros::TransformListener tf_listener_;
+
+  // Joint state subscriber
+  rclcpp::Subscription<sensor_msgs::msg::JointState>::SharedPtr joint_state_sub_;
+  sensor_msgs::msg::JointState::SharedPtr current_joint_state_;
+  void jointStateCallback(const sensor_msgs::msg::JointState::SharedPtr msg);
 };
 
 rclcpp::node_interfaces::NodeBaseInterface::SharedPtr MTCTaskNode::getNodeBaseInterface()
@@ -93,6 +101,50 @@ MTCTaskNode::MTCTaskNode(const rclcpp::NodeOptions& options)
     tf_listener_(tf_buffer_)       // Initialize TF Listener with TF Buffer
 {
   visual_tools_.loadRemoteControl();
+
+  // Subscription to the joint states
+  joint_state_sub_ = node_->create_subscription<sensor_msgs::msg::JointState>(
+      "/joint_states", 10, std::bind(&MTCTaskNode::jointStateCallback, this, std::placeholders::_1));
+
+  // Wait until joint states are received
+  RCLCPP_INFO(LOGGER, "Waiting for joint states...");
+  while (!current_joint_state_)
+  {
+    rclcpp::spin_some(node_);
+    rclcpp::sleep_for(std::chrono::milliseconds(100));
+  }
+  RCLCPP_INFO(LOGGER, "Joint states received.");
+
+}
+
+ void MTCTaskNode::jointStateCallback(const sensor_msgs::msg::JointState::SharedPtr msg)
+{
+  current_joint_state_ = msg; // Cache the latest joint state
+}
+
+void MTCTaskNode::updatePlanningScene()
+{
+  if (!current_joint_state_)
+  {
+    RCLCPP_WARN(LOGGER, "Joint state not yet received, cannot update planning scene.");
+    return;
+  }
+
+  // Retrieve the current robot state from MoveGroup
+  moveit::core::RobotStatePtr robot_state = move_group_.getCurrentState();
+
+  // Update robot state with the latest joint positions
+  const std::vector<std::string>& joint_names = current_joint_state_->name;
+  const std::vector<double>& joint_positions = current_joint_state_->position;
+
+  for (size_t i = 0; i < joint_names.size(); ++i)
+  {
+    robot_state->setJointPositions(joint_names[i], &joint_positions[i]);
+  }
+
+  // Apply the updated state to the planning scene
+  move_group_.setStartState(*robot_state);
+  RCLCPP_INFO(LOGGER, "Planning scene successfully updated.");
 }
 
 rclcpp::Node::SharedPtr MTCTaskNode::getNode()
@@ -109,6 +161,8 @@ moveit_visual_tools::MoveItVisualTools& MTCTaskNode::getVisualTools()
 {
   return visual_tools_;
 }
+
+
 
 geometry_msgs::msg::PoseStamped MTCTaskNode::getPoseTransform(const geometry_msgs::msg::PoseStamped& pose, const std::string& target_frame)
 {   
@@ -149,9 +203,9 @@ moveit_msgs::msg::Constraints MTCTaskNode::createBoxConstraints(const std::strin
   shape_msgs::msg::SolidPrimitive box;
   box.type = shape_msgs::msg::SolidPrimitive::BOX;
   box.dimensions = {
-      fabs(goal_pose_transformed.pose.position.x - current_pose_transformed.pose.position.x),  // Length (x)
-      fabs(goal_pose_transformed.pose.position.y - current_pose_transformed.pose.position.y),  // Width (y)
-      fabs(goal_pose_transformed.pose.position.z - current_pose_transformed.pose.position.z)   // Height (z)
+      fabs(goal_pose_transformed.pose.position.x - current_pose_transformed.pose.position.x)+0.1,  // Length (x)
+      fabs(goal_pose_transformed.pose.position.y - current_pose_transformed.pose.position.y)+0.1,  // Width (y)
+      fabs(goal_pose_transformed.pose.position.z - current_pose_transformed.pose.position.z)+0.3   // Height (z)
   };
 
   // Create position constraint
@@ -292,24 +346,8 @@ mtc::Task MTCTaskNode::createTask(std::string& goal_frame_name)
     stage_move_to_pick->setTimeout(5.0);
     stage_move_to_pick->properties().configureInitFrom(mtc::Stage::PARENT);
 
+    // add path constraints
     moveit_msgs::msg::Constraints path_constraints = createBoxConstraints("right_panda_hand", target_pose);
-    
-    // // Visualize the box constraint
-    // geometry_msgs::msg::Pose box_pose = path_constraints.position_constraints[0].constraint_region.primitive_poses[0];
-    // shape_msgs::msg::SolidPrimitive box = path_constraints.position_constraints[0].constraint_region.primitives[0];
-    // Eigen::Vector3d box_point_1(
-    //     box_pose.position.x - box.dimensions[0] / 2.0,
-    //     box_pose.position.y - box.dimensions[1] / 2.0,
-    //     box_pose.position.z - box.dimensions[2] / 2.0
-    // );
-    // Eigen::Vector3d box_point_2(
-    //     box_pose.position.x + box.dimensions[0] / 2.0,
-    //     box_pose.position.y + box.dimensions[1] / 2.0,
-    //     box_pose.position.z + box.dimensions[2] / 2.0
-    // );
-    // visual_tools_.publishCuboid(box_point_1, box_point_2, rviz_visual_tools::TRANSLUCENT_DARK);
-    // visual_tools_.trigger();
-    
     stage_move_to_pick->setPathConstraints(path_constraints);
     RCLCPP_INFO(LOGGER, "Path constraints set");
 
@@ -452,6 +490,10 @@ int main(int argc, char** argv)
 
   // Use visul tools to control the movement from one clip to another
   mtc_task_node->getVisualTools().prompt("Press 'next' in the RvizVisualToolsGui window to contiune the next task");
+
+  // Update planning scene after execution
+  RCLCPP_INFO(LOGGER, "Updating planning scene after MTC execution.");
+  mtc_task_node->updatePlanningScene();
 
   // the next clip
   clip_id = "clip6";
