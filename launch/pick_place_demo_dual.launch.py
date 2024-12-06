@@ -59,4 +59,4 @@ def generate_launch_description():
     )
     
     # return LaunchDescription([exe_arg, scene_file_arg, pick_place_demo])
-    return LaunchDescription([exe_arg, pick_place_demo, distance_monitor])
+    return LaunchDescription([exe_arg, distance_monitor, pick_place_demo])
