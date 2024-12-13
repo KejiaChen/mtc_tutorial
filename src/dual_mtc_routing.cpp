@@ -51,6 +51,7 @@ class MTCTaskNode
 {
 public:
   MTCTaskNode(const rclcpp::NodeOptions& options);
+  ~MTCTaskNode();
 
   rclcpp::node_interfaces::NodeBaseInterface::SharedPtr getNodeBaseInterface();
 
@@ -59,8 +60,7 @@ public:
   moveit::planning_interface::MoveGroupInterface& getMoveGroup();
   moveit_visual_tools::MoveItVisualTools& getVisualTools();
 
-  void doTask(std::string& goal_clip_id);
-
+  void doTask(std::string& goal_clip_id, bool execute=false);
   void updatePlanningScene();
 
   // void loadCustomScene(const std::string &path);
@@ -86,6 +86,12 @@ private:
   rclcpp::Subscription<sensor_msgs::msg::JointState>::SharedPtr joint_state_sub_;
   sensor_msgs::msg::JointState::SharedPtr current_joint_state_;
   void jointStateCallback(const sensor_msgs::msg::JointState::SharedPtr msg);
+  void periodicUpdate(); // Background thread function
+  
+  // Threading for periodic updates
+  std::thread update_thread_;
+  std::atomic<bool> stop_thread_;
+
 };
 
 rclcpp::node_interfaces::NodeBaseInterface::SharedPtr MTCTaskNode::getNodeBaseInterface()
@@ -115,6 +121,19 @@ MTCTaskNode::MTCTaskNode(const rclcpp::NodeOptions& options)
   }
   RCLCPP_INFO(LOGGER, "Joint states received.");
 
+  // Start the periodic update thread
+  // update_thread_ = std::thread(&MTCTaskNode::periodicUpdate, this);
+
+}
+
+// Destructor
+MTCTaskNode::~MTCTaskNode()
+{
+  stop_thread_ = true; // Signal the thread to stop
+  if (update_thread_.joinable())
+  {
+    update_thread_.join(); // Wait for the thread to finish
+  }
 }
 
  void MTCTaskNode::jointStateCallback(const sensor_msgs::msg::JointState::SharedPtr msg)
@@ -145,6 +164,17 @@ void MTCTaskNode::updatePlanningScene()
   // Apply the updated state to the planning scene
   move_group_.setStartState(*robot_state);
   RCLCPP_INFO(LOGGER, "Planning scene successfully updated.");
+}
+
+// Periodic Update Thread
+void MTCTaskNode::periodicUpdate()
+{
+  rclcpp::Rate rate(1.0); // 1 Hz update rate
+  while (!stop_thread_ && rclcpp::ok())
+  {
+    updatePlanningScene();
+    rate.sleep();
+  }
 }
 
 rclcpp::Node::SharedPtr MTCTaskNode::getNode()
@@ -237,9 +267,12 @@ moveit_msgs::msg::Constraints MTCTaskNode::createBoxConstraints(const std::strin
   return box_constraints;
 }
 
-void MTCTaskNode::doTask(std::string& goal_clip_id)
+void MTCTaskNode::doTask(std::string& goal_clip_id, bool execute)
 {
   task_ = createTask(goal_clip_id);
+
+  // publish solution for moveit servo
+  bool publish_mtc_trajectory = !execute;
 
   try
   {
@@ -256,15 +289,50 @@ void MTCTaskNode::doTask(std::string& goal_clip_id)
     RCLCPP_ERROR_STREAM(LOGGER, "Task planning failed");
     return;
   }
-  task_.introspection().publishSolution(*task_.solutions().front());
 
-  auto result = task_.execute(*task_.solutions().front());
-  if (result.val != moveit_msgs::msg::MoveItErrorCodes::SUCCESS)
-  {
-    RCLCPP_ERROR_STREAM(LOGGER, "Task execution failed");
-    return;
+  RCLCPP_INFO_STREAM(LOGGER, "Task planned successfully");
+  task_.introspection().publishSolution(*task_.solutions().front(), publish_mtc_trajectory);
+
+//   // Access the first solution
+//   const auto& solution = solutions.front();
+
+//   // Cast SolutionBase to SubTrajectory to access the trajectory
+//   auto sub_trajectory = std::dynamic_pointer_cast<const mtc::SubTrajectory>(solution);
+//   if (!sub_trajectory)
+//   {
+//     RCLCPP_ERROR(rclcpp::get_logger("MTC"), "Failed to cast SolutionBase to SubTrajectory.");
+//     return;
+//   }
+
+//   // Access the trajectory
+//   const robot_trajectory::RobotTrajectoryConstPtr& trajectory = sub_trajectory->trajectory();
+//   if (!trajectory)
+//   {
+//     RCLCPP_ERROR(rclcpp::get_logger("MTC"), "No trajectory available in the solution.");
+//     return;
+//   }
+ 
+//  // Iterate through waypoints and extract joint positions
+//   for (size_t i = 0; i < trajectory->getWayPointCount(); ++i)
+//   {
+//     const robot_state::RobotState& waypoint = trajectory->getWayPoint(i);
+
+//     std::vector<double> joint_positions;
+//     waypoint.copyJointGroupPositions(trajectory->getGroupName(), joint_positions);
+
+//     RCLCPP_INFO(rclcpp::get_logger("MTC"), "Waypoint %zu: %s", i,
+//                 std::to_string(joint_positions.size()).c_str());
+//   }
+
+  if (execute){
+    auto result = task_.execute(*task_.solutions().front());
+    if (result.val != moveit_msgs::msg::MoveItErrorCodes::SUCCESS)
+    {
+      RCLCPP_ERROR_STREAM(LOGGER, "Task execution failed");
+      return;
+    }
   }
-
+  
   return;
 }
 
@@ -321,7 +389,7 @@ mtc::Task MTCTaskNode::createTask(std::string& goal_frame_name)
   auto cartesian_planner = std::make_shared<mtc::solvers::CartesianPath>();
   cartesian_planner->setMaxVelocityScalingFactor(0.05);
   cartesian_planner->setMaxAccelerationScalingFactor(0.05);
-  cartesian_planner->setStepSize(.01);
+  cartesian_planner->setStepSize(.001);
 
   /****************************************************
   ---- *               Close Hand                      *
@@ -481,7 +549,7 @@ int main(int argc, char** argv)
 
   // initial clip
   std::string clip_id = "clip5";
-  mtc_task_node->doTask(clip_id);
+  mtc_task_node->doTask(clip_id, true);
 
   // start follower tracking
   std_msgs::msg::Bool start_tracking_msg;
@@ -497,7 +565,7 @@ int main(int argc, char** argv)
 
   // the next clip
   clip_id = "clip6";
-  mtc_task_node->doTask(clip_id);
+  mtc_task_node->doTask(clip_id, false);
 
   spin_thread->join();
   rclcpp::shutdown();

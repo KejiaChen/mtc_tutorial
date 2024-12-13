@@ -182,6 +182,9 @@ void loadCustomScene(const std::string &path, rclcpp::Node::SharedPtr move_group
 
             collision_objects.push_back(collision_object);
 
+            // sleep for a while
+            rclcpp::sleep_for(std::chrono::milliseconds(100));
+
             // Disable collision with base
             // disableCollisions(object_name, "base", planning_scene_interface);
 
