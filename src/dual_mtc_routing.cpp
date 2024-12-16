@@ -25,6 +25,10 @@
 
 static const rclcpp::Logger LOGGER = rclcpp::get_logger("mtc_tutorial");
 namespace mtc = moveit::task_constructor;
+using GroupPoseDict = std::map<std::string, geometry_msgs::msg::PoseStamped>;
+using GroupPoseMatrixDict = std::map<std::string, Eigen::Isometry3d>;
+using GroupStringDict = std::map<std::string, std::string>;
+using GroupVectorDict = std::map<std::string, std::vector<double>>;
 
 // scene configuration
 std::vector<double> clip_size = {0.04, 0.04, 0.06};
@@ -351,10 +355,12 @@ mtc::Task MTCTaskNode::createTask(std::string& goal_frame_name)
   const auto& follow_hand_group_name = "left_hand";
   const auto& follow_hand_frame = "left_panda_hand";
 
+  const auto& dual_arm_group_name = "dual_arm";
+
   // Set task properties (only valid for single arm)
-  task.setProperty("group", lead_arm_group_name);
-  task.setProperty("eef", lead_hand_group_name);
-  task.setProperty("ik_frame", lead_hand_frame);
+  // task.setProperty("group", lead_arm_group_name);
+  // task.setProperty("eef", lead_hand_group_name);
+  // task.setProperty("ik_frame", lead_hand_frame);
 
   // delete markers
   visual_tools_.deleteAllMarkers();
@@ -384,23 +390,33 @@ mtc::Task MTCTaskNode::createTask(std::string& goal_frame_name)
   }
 
   // Set up planners
-  
-  auto sampling_planner = std::make_shared<mtc::solvers::PipelinePlanner>(node_);
-  sampling_planner->setMaxVelocityScalingFactor(0.05);
-  sampling_planner->setMaxAccelerationScalingFactor(0.05);
+  auto lead_sampling_planner = std::make_shared<mtc::solvers::PipelinePlanner>(node_);
+  lead_sampling_planner->setMaxVelocityScalingFactor(0.05);
+  lead_sampling_planner->setMaxAccelerationScalingFactor(0.05);
 
-  auto interpolation_planner = std::make_shared<mtc::solvers::JointInterpolationPlanner>();
+  auto lead_interpolation_planner = std::make_shared<mtc::solvers::JointInterpolationPlanner>();
 
-  auto cartesian_planner = std::make_shared<mtc::solvers::CartesianPath>();
-  cartesian_planner->setMaxVelocityScalingFactor(0.05);
-  cartesian_planner->setMaxAccelerationScalingFactor(0.05);
-  cartesian_planner->setStepSize(.001);
+  auto lead_cartesian_planner = std::make_shared<mtc::solvers::CartesianPath>();
+  lead_cartesian_planner->setMaxVelocityScalingFactor(0.05);
+  lead_cartesian_planner->setMaxAccelerationScalingFactor(0.05);
+  lead_cartesian_planner->setStepSize(.001);
+
+  auto follow_sampling_planner = std::make_shared<mtc::solvers::PipelinePlanner>(node_);
+  follow_sampling_planner->setMaxVelocityScalingFactor(0.05);
+  follow_sampling_planner->setMaxAccelerationScalingFactor(0.05);
+
+  auto follow_interpolation_planner = std::make_shared<mtc::solvers::JointInterpolationPlanner>();
+
+  auto follow_cartesian_planner = std::make_shared<mtc::solvers::CartesianPath>();
+  follow_cartesian_planner->setMaxVelocityScalingFactor(0.05);
+  follow_cartesian_planner->setMaxAccelerationScalingFactor(0.05);
+  follow_cartesian_planner->setStepSize(.001);
 
   /****************************************************
   ---- *               Close Hand                      *
   ***************************************************/
  {
-    auto stage = std::make_unique<mtc::stages::MoveTo>("close hand", interpolation_planner);
+    auto stage = std::make_unique<mtc::stages::MoveTo>("close hand", lead_interpolation_planner);
     stage->setGroup(lead_hand_group_name);
     stage->setGoal("close");
 
@@ -414,8 +430,8 @@ mtc::Task MTCTaskNode::createTask(std::string& goal_frame_name)
 	 *                                                  *
 	 ***************************************************/
   {
-    auto stage_move_to_pick = std::make_unique<mtc::stages::Connect>("move to pick", 
-        mtc::stages::Connect::GroupPlannerVector{ { lead_arm_group_name, sampling_planner } });
+    mtc::stages::Connect::GroupPlannerVector planners = {{lead_arm_group_name, lead_sampling_planner}, {follow_arm_group_name, follow_sampling_planner}};
+    auto stage_move_to_pick = std::make_unique<mtc::stages::Connect>("move to pick", planners);
     stage_move_to_pick->setTimeout(5.0);
     stage_move_to_pick->properties().configureInitFrom(mtc::Stage::PARENT);
 
@@ -435,100 +451,102 @@ mtc::Task MTCTaskNode::createTask(std::string& goal_frame_name)
   mtc::Stage* attach_object_stage = nullptr;  // Forward attach_object_stage to place pose generator
   {
     auto grasp = std::make_unique<mtc::SerialContainer>("pick object");
-    task.properties().exposeTo(grasp->properties(), { "eef", "group", "ik_frame" });
-    grasp->properties().configureInitFrom(mtc::Stage::PARENT,
-                                          { "eef", "group", "ik_frame" });
+    // task.properties().exposeTo(grasp->properties(), { "eef", "group", "ik_frame" });
+    // grasp->properties().configureInitFrom(mtc::Stage::PARENT,
+    //                                       { "eef", "group", "ik_frame" });
 
     /****************************************************
   ---- *               Insertion in EE-z                *
     ***************************************************/
-    {
-      auto stage =
-          std::make_unique<mtc::stages::MoveRelative>("insertion", cartesian_planner);
-      stage->properties().set("marker_ns", "insertion");
-      stage->properties().set("link", lead_hand_frame);
-      stage->properties().configureInitFrom(mtc::Stage::PARENT, { "group" });
-      stage->setMinMaxDistance(0.1, 0.15);
+    // {
+    //   auto stage =
+    //       std::make_unique<mtc::stages::MoveRelative>("insertion", cartesian_planner);
+    //   stage->properties().set("marker_ns", "insertion");
+    //   stage->properties().set("link", lead_hand_frame);
+    //   stage->properties().configureInitFrom(mtc::Stage::PARENT, { "group" });
+    //   stage->setMinMaxDistance(0.1, 0.15);
 
-      // Set hand forward direction
-      geometry_msgs::msg::Vector3Stamped vec;
-      vec.header.frame_id = lead_hand_frame;
-      vec.vector.z = 0.5;
-      stage->setDirection(vec);
-      grasp->insert(std::move(stage));
-    }
+    //   // Set hand forward direction
+    //   geometry_msgs::msg::Vector3Stamped vec;
+    //   vec.header.frame_id = lead_hand_frame;
+    //   vec.vector.z = 0.5;
+    //   stage->setDirection(vec);
+    //   grasp->insert(std::move(stage));
+    // }
     /****************************************************
   ---- *      Generate Fixed Grasp Pose for single arm *
 	***************************************************/
-    {
-      // Sample grasp pose
-    //   auto stage = std::make_unique<mtc::stages::GenerateGraspPose>("generate grasp pose");
-    //   stage->properties().configureInitFrom(mtc::Stage::PARENT);
-    //   stage->properties().set("marker_ns", "grasp_pose");
-    //   stage->setPreGraspPose("close");
-    //   stage->setObject(goal_frame_name);
-    //   stage->setAngleDelta(M_PI / 12);
-    //   stage->setMonitoredStage(current_state_ptr);  // Hook into current state
+    // {
+    //   // Sample grasp pose
+    // //   auto stage = std::make_unique<mtc::stages::GenerateGraspPose>("generate grasp pose");
+    // //   stage->properties().configureInitFrom(mtc::Stage::PARENT);
+    // //   stage->properties().set("marker_ns", "grasp_pose");
+    // //   stage->setPreGraspPose("close");
+    // //   stage->setObject(goal_frame_name);
+    // //   stage->setAngleDelta(M_PI / 12);
+    // //   stage->setMonitoredStage(current_state_ptr);  // Hook into current state
     
+    //   // Fixed grasp pose
+    //   auto stage = std::make_unique<mtc::stages::FixedCartesianPoses>("fixed clipping pose");
+    //   stage->addPose(lead_target_pose);
+    //   stage->setMonitoredStage(pre_move_stage_ptr);  // Hook into pre_move_stage_ptr
+
+    //   // IK frame at TCP
+    //   Eigen::Isometry3d grasp_frame_transform = Eigen::Isometry3d::Identity();
+    // //   Eigen::Quaterniond q = Eigen::AngleAxisd(M_PI / 2, Eigen::Vector3d::UnitX()) *
+    // //                         Eigen::AngleAxisd(M_PI / 2, Eigen::Vector3d::UnitY()) *
+    // //                         Eigen::AngleAxisd(M_PI / 2, Eigen::Vector3d::UnitZ());
+    // //   grasp_frame_transform.linear() = q.matrix();
+    //   grasp_frame_transform.translation().z() = 0.1034;
+
+    //   // Compute IK
+    //   auto wrapper =
+    //       std::make_unique<mtc::stages::ComputeIK>("clipping pose IK", std::move(stage));
+    //   wrapper->setMaxIKSolutions(8);
+    //   wrapper->setMinSolutionDistance(1.0);
+    //   wrapper->setIKFrame(grasp_frame_transform, lead_hand_frame);
+    //   wrapper->properties().configureInitFrom(mtc::Stage::PARENT, { "eef", "group" });
+    //   wrapper->properties().configureInitFrom(mtc::Stage::INTERFACE, { "target_pose" });
+    //   grasp->insert(std::move(wrapper));
+    // }
+    /****************************************************
+  ---- *    Generate Fixed Grasp Pose for dual arm *
+	***************************************************/
+    {
       // Fixed grasp pose
-      auto stage = std::make_unique<mtc::stages::FixedCartesianPoses>("fixed clipping pose");
-      // geometry_msgs::msg::PoseStamped target_pose;
-      // target_pose = createClipGoal(goal_frame_name, leader_pre_clip);
-      stage->addPose(lead_target_pose);
-      stage->setMonitoredStage(pre_move_stage_ptr);  // Hook into pre_move_stage_ptr
+      auto dual_fixed_pose = std::make_unique<mtc::stages::FixedCartesianPosesMultiple>("dual fixed clipping pose");
+      GroupPoseDict pose_pairs = {{follow_arm_group_name, follow_target_pose}, {lead_arm_group_name, lead_target_pose}};
+      dual_fixed_pose->addPosePair(pose_pairs);
+      dual_fixed_pose->setMonitoredStage(pre_move_stage_ptr);
 
       // IK frame at TCP
-      Eigen::Isometry3d grasp_frame_transform = Eigen::Isometry3d::Identity();
-    //   Eigen::Quaterniond q = Eigen::AngleAxisd(M_PI / 2, Eigen::Vector3d::UnitX()) *
-    //                         Eigen::AngleAxisd(M_PI / 2, Eigen::Vector3d::UnitY()) *
-    //                         Eigen::AngleAxisd(M_PI / 2, Eigen::Vector3d::UnitZ());
-    //   grasp_frame_transform.linear() = q.matrix();
-      grasp_frame_transform.translation().z() = 0.1034;
+      Eigen::Isometry3d lead_grasp_frame_transform = Eigen::Isometry3d::Identity();
+      lead_grasp_frame_transform.translation().z() = 0.1034;
+      Eigen::Isometry3d follow_grasp_frame_transform = Eigen::Isometry3d::Identity();
+      follow_grasp_frame_transform.translation().z() = 0.1034;
+
+      // IK groups
+      std::vector<std::string> ik_groups = {follow_arm_group_name, lead_arm_group_name};
+      GroupStringDict ik_endeffectors = {{follow_arm_group_name, follow_hand_group_name}, {lead_arm_group_name, lead_hand_group_name}};
+      GroupStringDict ik_hand_frames = {{follow_arm_group_name, follow_hand_frame}, {lead_arm_group_name, lead_hand_frame}, };
+      // GroupStringDict ik_links = {{lead_arm_group, "right_arm_hand"}, {follow_arm_group, "left_arm_hand"}};
+      GroupPoseMatrixDict ik_frame_transforms = {{follow_arm_group_name, follow_grasp_frame_transform}, {lead_arm_group_name, lead_grasp_frame_transform}};
 
       // Compute IK
-      auto wrapper =
-          std::make_unique<mtc::stages::ComputeIK>("clipping pose IK", std::move(stage));
-      wrapper->setMaxIKSolutions(8);
-      wrapper->setMinSolutionDistance(1.0);
-      wrapper->setIKFrame(grasp_frame_transform, lead_hand_frame);
-      wrapper->properties().configureInitFrom(mtc::Stage::PARENT, { "eef", "group" });
-      wrapper->properties().configureInitFrom(mtc::Stage::INTERFACE, { "target_pose" });
-      grasp->insert(std::move(wrapper));
+      auto ik_wrapper = std::make_unique<mtc::stages::ComputeIKMultiple>("clipping pose IK", std::move(dual_fixed_pose), ik_groups, dual_arm_group_name);
+      ik_wrapper->setSubGroups(ik_groups);
+      ik_wrapper->setGroup(dual_arm_group_name);
+      ik_wrapper->setEndEffector(ik_endeffectors);
+      // ik_wrapper->properties().configureInitFrom(Stage::PARENT, { "eef", "group" });
+      ik_wrapper->properties().configureInitFrom(mtc::Stage::INTERFACE, {"target_poses"});
+      // ik_wrapper->properties().set("object", "object");
+      ik_wrapper->setMaxIKSolutions(5);
+      ik_wrapper->setMinSolutionDistance(1.0);
+      ik_wrapper->setIKFrame(ik_frame_transforms, ik_hand_frames);
+
+      grasp->insert(std::move(ik_wrapper));
+
     }
-  //   /****************************************************
-  // ---- *    Generate Fixed Grasp Pose for dual arm *
-	// ***************************************************/
-  //   {
-  //     // Fixed grasp pose
-  //     auto stage = std::make_unique<mtc::stages::FixedCartesianPoses>("fixed clipping pose");
-  //     // geometry_msgs::msg::PoseStamped target_pose;
-  //     // target_pose = createClipGoal(goal_frame_name, leader_pre_clip);
-  //     stage->addPose(target_pose);
-  //     stage->setMonitoredStage(pre_move_stage_ptr);  // Hook into pre_move_stage_ptr
-
-  //     auto dual_fixed_pose = std::make_unique<stages::FixedCartesianPosesMultiple>("dual fixed clipping pose");
-  //     GroupPoseDict pose_pairs = {{lead_arm_group, lead_goal_pose}, {follow_arm_group, follow_goal_pose}};
-  //     dual_fixed_pose->addPosePair(pose_pairs);
-  //     dual_fixed_pose->setMonitoredStage(pre_move_stage_ptr);
-
-  //     // IK frame at TCP
-  //     Eigen::Isometry3d grasp_frame_transform = Eigen::Isometry3d::Identity();
-  //   //   Eigen::Quaterniond q = Eigen::AngleAxisd(M_PI / 2, Eigen::Vector3d::UnitX()) *
-  //   //                         Eigen::AngleAxisd(M_PI / 2, Eigen::Vector3d::UnitY()) *
-  //   //                         Eigen::AngleAxisd(M_PI / 2, Eigen::Vector3d::UnitZ());
-  //   //   grasp_frame_transform.linear() = q.matrix();
-  //     grasp_frame_transform.translation().z() = 0.1034;
-
-  //     // Compute IK
-  //     auto wrapper =
-  //         std::make_unique<mtc::stages::ComputeIK>("clipping pose IK", std::move(stage));
-  //     wrapper->setMaxIKSolutions(8);
-  //     wrapper->setMinSolutionDistance(1.0);
-  //     wrapper->setIKFrame(grasp_frame_transform, hand_frame);
-  //     wrapper->properties().configureInitFrom(mtc::Stage::PARENT, { "eef", "group" });
-  //     wrapper->properties().configureInitFrom(mtc::Stage::INTERFACE, { "target_pose" });
-  //     grasp->insert(std::move(wrapper));
-  //   }
     /****************************************************
   ---- *               Allow Collision (hand object)   *
 	***************************************************/
@@ -546,7 +564,7 @@ mtc::Task MTCTaskNode::createTask(std::string& goal_frame_name)
   ---- *               Close Hand                      *
 	***************************************************/
     {
-      auto stage = std::make_unique<mtc::stages::MoveTo>("close hand", interpolation_planner);
+      auto stage = std::make_unique<mtc::stages::MoveTo>("close hand", lead_interpolation_planner);
       stage->setGroup(lead_hand_group_name);
       stage->setGoal("close");
       grasp->insert(std::move(stage));
