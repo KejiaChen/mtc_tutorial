@@ -451,6 +451,7 @@ mtc::Task MTCTaskNode::createTask(std::string& goal_frame_name)
   mtc::Stage* attach_object_stage = nullptr;  // Forward attach_object_stage to place pose generator
   {
     auto grasp = std::make_unique<mtc::SerialContainer>("pick object");
+    // only valid for single arm
     // task.properties().exposeTo(grasp->properties(), { "eef", "group", "ik_frame" });
     // grasp->properties().configureInitFrom(mtc::Stage::PARENT,
     //                                       { "eef", "group", "ik_frame" });
@@ -509,15 +510,57 @@ mtc::Task MTCTaskNode::createTask(std::string& goal_frame_name)
     //   wrapper->properties().configureInitFrom(mtc::Stage::INTERFACE, { "target_pose" });
     //   grasp->insert(std::move(wrapper));
     // }
-    /****************************************************
-  ---- *    Generate Fixed Grasp Pose for dual arm *
+  //   /****************************************************
+  // ---- *    Generate Fixed Grasp Pose for dual arm *
+	// ***************************************************/
+  //   {
+  //     // Fixed grasp pose
+  //     auto dual_fixed_pose = std::make_unique<mtc::stages::FixedCartesianPosesMultiple>("dual fixed clipping pose");
+  //     GroupPoseDict pose_pairs = {{follow_arm_group_name, follow_target_pose}, {lead_arm_group_name, lead_target_pose}};
+  //     dual_fixed_pose->addPosePair(pose_pairs);
+  //     dual_fixed_pose->setMonitoredStage(pre_move_stage_ptr);
+
+  //     // IK frame at TCP
+  //     Eigen::Isometry3d lead_grasp_frame_transform = Eigen::Isometry3d::Identity();
+  //     lead_grasp_frame_transform.translation().z() = 0.1034;
+  //     Eigen::Isometry3d follow_grasp_frame_transform = Eigen::Isometry3d::Identity();
+  //     follow_grasp_frame_transform.translation().z() = 0.1034;
+
+  //     // IK groups
+  //     std::vector<std::string> ik_groups = {follow_arm_group_name, lead_arm_group_name};
+  //     GroupStringDict ik_endeffectors = {{follow_arm_group_name, follow_hand_group_name}, {lead_arm_group_name, lead_hand_group_name}};
+  //     GroupStringDict ik_hand_frames = {{follow_arm_group_name, follow_hand_frame}, {lead_arm_group_name, lead_hand_frame}, };
+  //     // GroupStringDict ik_links = {{lead_arm_group, "right_arm_hand"}, {follow_arm_group, "left_arm_hand"}};
+  //     GroupPoseMatrixDict ik_frame_transforms = {{follow_arm_group_name, follow_grasp_frame_transform}, {lead_arm_group_name, lead_grasp_frame_transform}};
+
+  //     // Compute IK
+  //     auto ik_wrapper = std::make_unique<mtc::stages::ComputeIKMultiple>("clipping pose IK", std::move(dual_fixed_pose), ik_groups, dual_arm_group_name);
+  //     ik_wrapper->setSubGroups(ik_groups);
+  //     ik_wrapper->setGroup(dual_arm_group_name);
+  //     ik_wrapper->setEndEffector(ik_endeffectors);
+  //     // ik_wrapper->properties().configureInitFrom(Stage::PARENT, { "eef", "group" });
+  //     ik_wrapper->properties().configureInitFrom(mtc::Stage::INTERFACE, {"target_poses"});
+  //     // ik_wrapper->properties().set("object", "object");
+  //     ik_wrapper->setMaxIKSolutions(5);
+  //     ik_wrapper->setMinSolutionDistance(1.0);
+  //     ik_wrapper->setIKFrame(ik_frame_transforms, ik_hand_frames);
+
+  //     grasp->insert(std::move(ik_wrapper));
+
+  //   }
+  /****************************************************
+  ---- *    Generate Grasp Pose for dual arm *
 	***************************************************/
     {
-      // Fixed grasp pose
-      auto dual_fixed_pose = std::make_unique<mtc::stages::FixedCartesianPosesMultiple>("dual fixed clipping pose");
-      GroupPoseDict pose_pairs = {{follow_arm_group_name, follow_target_pose}, {lead_arm_group_name, lead_target_pose}};
-      dual_fixed_pose->addPosePair(pose_pairs);
-      dual_fixed_pose->setMonitoredStage(pre_move_stage_ptr);
+      // Target positions in clip frame
+      GroupStringDict goal_frames = {{lead_arm_group_name, goal_frame_name}, {follow_arm_group_name, goal_frame_name}};
+
+      std::vector<double> lead_goal_delta_vector = {lead_target_pose.pose.position.x, lead_target_pose.pose.position.y, lead_target_pose.pose.position.z};
+      std::vector<double> follow_goal_delta_vector = {follow_target_pose.pose.position.x, follow_target_pose.pose.position.y, follow_target_pose.pose.position.z};
+      std::vector<double> lead_goal_orient_vector = {lead_target_pose.pose.orientation.x, lead_target_pose.pose.orientation.y, lead_target_pose.pose.position.z, lead_target_pose.pose.orientation.w};
+      std::vector<double> follow_goal_orient_vector = {follow_target_pose.pose.orientation.x, follow_target_pose.pose.orientation.y, follow_target_pose.pose.position.z, follow_target_pose.pose.orientation.w};
+      GroupVectorDict delta_pairs = {{lead_arm_group_name, lead_goal_delta_vector}, {follow_arm_group_name, follow_goal_delta_vector}};
+      GroupVectorDict orient_pairs = {{lead_arm_group_name, lead_goal_orient_vector}, {follow_arm_group_name, follow_goal_orient_vector}};
 
       // IK frame at TCP
       Eigen::Isometry3d lead_grasp_frame_transform = Eigen::Isometry3d::Identity();
@@ -531,9 +574,25 @@ mtc::Task MTCTaskNode::createTask(std::string& goal_frame_name)
       GroupStringDict ik_hand_frames = {{follow_arm_group_name, follow_hand_frame}, {lead_arm_group_name, lead_hand_frame}, };
       // GroupStringDict ik_links = {{lead_arm_group, "right_arm_hand"}, {follow_arm_group, "left_arm_hand"}};
       GroupPoseMatrixDict ik_frame_transforms = {{follow_arm_group_name, follow_grasp_frame_transform}, {lead_arm_group_name, lead_grasp_frame_transform}};
+      GroupStringDict pre_grasp_pose = {{follow_arm_group_name, "close"}, {lead_arm_group_name, "close"}};
+
+      // generate grasp pose, randomize for follower
+      auto grasp_generator = std::make_unique<mtc::stages::GenerateGraspPoseDual>("generate grasp pose dual", ik_groups);
+      grasp_generator->setEndEffector(ik_endeffectors);
+      grasp_generator->properties().set("marker_ns", "grasp_pose");
+      grasp_generator->properties().set("explr_axis", "y");
+      grasp_generator->setAngleDelta(0.2); // enumerate over angles from 0 to 6.4 (less then 2 PI)
+      grasp_generator->setPreGraspPose(pre_grasp_pose);
+      grasp_generator->setGraspPose("close");
+      grasp_generator->setObject(goal_frames); // object sets target pose frame
+      grasp_generator->setTargetDelta(delta_pairs);
+      grasp_generator->setTargetOrient(orient_pairs);
+      grasp_generator->setMonitoredStage(pre_move_stage_ptr);
+      grasp_generator->properties().set("generate_group", follow_arm_group_name);
+      grasp_generator->properties().set("planning_frame", goal_frame_name);
 
       // Compute IK
-      auto ik_wrapper = std::make_unique<mtc::stages::ComputeIKMultiple>("clipping pose IK", std::move(dual_fixed_pose), ik_groups, dual_arm_group_name);
+      auto ik_wrapper = std::make_unique<mtc::stages::ComputeIKMultiple>("clipping pose IK", std::move(grasp_generator), ik_groups, dual_arm_group_name);
       ik_wrapper->setSubGroups(ik_groups);
       ik_wrapper->setGroup(dual_arm_group_name);
       ik_wrapper->setEndEffector(ik_endeffectors);
@@ -606,8 +665,10 @@ int main(int argc, char** argv)
 
   // initial clip
   std::string clip_id = "clip5";
-  mtc_task_node->doTask(clip_id, true);
+  mtc_task_node->doTask(clip_id, false);
 
+  // // Use visul tools to control the movement from one clip to another
+  // mtc_task_node->getVisualTools().prompt("After moving to initial positions, press 'next' in the RvizVisualToolsGui window to start servo");
   // start follower tracking
   std_msgs::msg::Bool start_tracking_msg;
   start_tracking_msg.data = true;
@@ -622,7 +683,18 @@ int main(int argc, char** argv)
 
   // the next clip
   clip_id = "clip6";
-  mtc_task_node->doTask(clip_id, true);
+  mtc_task_node->doTask(clip_id, false);
+
+  // Use visul tools to control the movement from one clip to another
+  mtc_task_node->getVisualTools().prompt("Press 'next' in the RvizVisualToolsGui window to contiune the next task");
+
+  // Update planning scene after execution
+  RCLCPP_INFO(LOGGER, "Updating planning scene after MTC execution.");
+  mtc_task_node->updatePlanningScene();
+
+  // the next clip
+  clip_id = "clip8";
+  mtc_task_node->doTask(clip_id, false);
 
   spin_thread->join();
   rclcpp::shutdown();
