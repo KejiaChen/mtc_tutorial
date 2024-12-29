@@ -5,14 +5,7 @@ from launch_ros.actions import Node
 from moveit_configs_utils import MoveItConfigsBuilder
 
 
-def generate_launch_description():
-    # Declare the scene file argument
-    scene_file_arg = DeclareLaunchArgument(
-        "scene_file",
-        default_value="/home/tp2/ws_humble/scene/mongodb_8.scene",  # Default file path
-        description="Path to the .scene file to be loaded",
-    )  
-    
+def generate_launch_description():    
     moveit_config = (
         MoveItConfigsBuilder("dual_arm_panda")
         .robot_description(file_path="config/panda.urdf.xacro",
@@ -29,19 +22,7 @@ def generate_launch_description():
     )
 
 
-    # MTC Demo node
-    load_scene= Node(
-        package="mtc_tutorial",
-        executable="load_scene",
-        # package="moveit2_tutorials",
-        # executable="mtc_tutorial",
-        output="screen",
-        parameters=[
-            moveit_config.to_dict(),
-        ],
-        arguments=[LaunchConfiguration("scene_file")],
-    )
-    
+    # DLO Demo node
     dlo_model = Node(
     package="mtc_tutorial",
     executable="dlo_line_model",
@@ -51,4 +32,4 @@ def generate_launch_description():
     ],
     )
     
-    return LaunchDescription([scene_file_arg, load_scene])
+    return LaunchDescription([dlo_model])

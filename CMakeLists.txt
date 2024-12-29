@@ -57,6 +57,19 @@ ament_target_dependencies(monitor_tracking
 )
 install(TARGETS monitor_tracking DESTINATION lib/${PROJECT_NAME})
 
+add_executable(dlo_line_model src/dlo_line_model.cpp)
+ament_target_dependencies(dlo_line_model
+  rclcpp
+  moveit_core
+  moveit_task_constructor_core
+  moveit_ros_planning
+  moveit_ros_planning_interface
+  moveit_visual_tools
+  # rviz_visual_tools
+  geometry_msgs
+)
+install(TARGETS dlo_line_model DESTINATION lib/${PROJECT_NAME})
+
 install(DIRECTORY launch DESTINATION share/${PROJECT_NAME})
 
 if(BUILD_TESTING)
