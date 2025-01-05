@@ -74,7 +74,12 @@ public:
   moveit::planning_interface::MoveGroupInterface& getMoveGroup();
   moveit_visual_tools::MoveItVisualTools& getVisualTools();
 
-  void doTask(std::string& goal_clip_id, bool execute=false, bool plan_for_dual=true);
+  // Compose an MTC task from a series of stages.
+  mtc::Task createTask(std::string& goal_frame_name, bool use_dual, bool split_plan);
+  mtc::Task createPostTask(std::string& goal_frame_name, bool use_dual, bool split_plan);
+
+  void doTask(std::string& goal_clip_id, bool execute, bool plan_for_dual,
+              std::function<mtc::Task(std::string&, bool, bool)> createTaskFn);
   void updatePlanningScene();
 
   // void loadCustomScene(const std::string &path);
@@ -83,10 +88,11 @@ private:
   geometry_msgs::msg::PoseStamped getPoseTransform(const geometry_msgs::msg::PoseStamped& pose, const std::string& target_frame);
   moveit_msgs::msg::Constraints createBoxConstraints(const std::string& link_name, geometry_msgs::msg::PoseStamped& goal_pose);
 
-  // Compose an MTC task from a series of stages.
-  mtc::Task createTask(std::string& goal_frame_name, bool use_dual, bool split_plan);
-  mtc::Task createPostTask(std::string& goal_frame_name, bool use_dual, bool split_plan);
+  // // Compose an MTC task from a series of stages.
+  // mtc::Task createTask(std::string& goal_frame_name, bool use_dual, bool split_plan);
+  // mtc::Task createPostTask(std::string& goal_frame_name, bool use_dual, bool split_plan);
   rclcpp::Node::SharedPtr node_;
+  mtc::Task task_;
 
   // interfaces
   moveit::planning_interface::MoveGroupInterface move_group_;
@@ -282,7 +288,7 @@ moveit_msgs::msg::Constraints MTCTaskNode::createBoxConstraints(const std::strin
 }
 
 void MTCTaskNode::doTask(std::string& goal_clip_id, bool execute, bool plan_for_dual,
-                        std::function<mtc::Task(const std::string&, bool, bool)> createTaskFn)
+                        std::function<mtc::Task(std::string&, bool, bool)> createTaskFn)
 {
   task_ = createTaskFn(goal_clip_id, plan_for_dual, false);
 
@@ -444,7 +450,7 @@ mtc::Task MTCTaskNode::createTask(std::string& goal_frame_name, bool use_dual, b
   ***************************************************/
  {
     auto stage = std::make_unique<mtc::stages::MoveTo>("close hand", follow_interpolation_planner);
-    stage->setGroup(_hand_group_name);
+    stage->setGroup(follow_hand_group_name);
     stage->setGoal("close");
 
     pre_move_stage_ptr = stage.get();
@@ -899,17 +905,37 @@ int main(int argc, char** argv)
     executor.remove_node(mtc_task_node->getNodeBaseInterface());
   });
 
-  // Use visul tools to control the movement from one clip to another
-  mtc_task_node->getVisualTools().prompt("After objects are loaded, press 'next' in the RvizVisualToolsGui window to start the demo");
 
   // Variables for synchronization
   std::mutex mutex;
   std::condition_variable cv;
   bool response_received = false;
 
+  // List of clip IDs to process
+  std::vector<std::string> clip_ids = {"clip5", "clip6"};
+
   // initial clip
-  std::string clip_id = "clip5";
-  mtc_task_node->doTask(clip_id, false, true);
+  for (auto& clip_id : clip_ids)
+  {
+  // Use visul tools to control the movement from one clip to another
+  mtc_task_node->getVisualTools().prompt("After objects are loaded, press 'next' in the RvizVisualToolsGui window to continue the next task");
+
+  // Update planning scene after execution
+  RCLCPP_INFO(LOGGER, "Updating planning scene after MTC execution.");
+  mtc_task_node->updatePlanningScene();
+
+  mtc_task_node->doTask(clip_id, false, true,
+                      [mtc_task_node](std::string& goal, bool dual, bool split) {
+                      return mtc_task_node->createTask(goal, dual, split);
+                      });
+
+  mtc_task_node->getVisualTools().prompt("After objects are loaded, press 'next' in the RvizVisualToolsGui window to continue the next task");
+
+  mtc_task_node->doTask(clip_id, false, true,
+                      [mtc_task_node](std::string& goal, bool dual, bool split) {
+                      return mtc_task_node->createPostTask(goal, dual, split);
+                      });
+  
   clip_names.push_back(clip_id);
 
   // Send the request
@@ -946,69 +972,15 @@ int main(int argc, char** argv)
   // Reset the response flag for the next request
   response_received = false;
 
+  if (clip_id == "clip5")
+  {
   // // Use visul tools to control the movement from one clip to another
   mtc_task_node->getVisualTools().prompt("After moving to initial positions, press 'next' in the RvizVisualToolsGui window to start servo");
   // start follower tracking
   std_msgs::msg::Bool start_tracking_msg;
   start_tracking_msg.data = true;
   tracking_start_pub->publish(start_tracking_msg);
-
-  // Use visul tools to control the movement from one clip to another
-  mtc_task_node->getVisualTools().prompt("Press 'next' in the RvizVisualToolsGui window to contiune the next task");
-
-  // Update planning scene after execution
-  RCLCPP_INFO(LOGGER, "Updating planning scene after MTC execution.");
-  mtc_task_node->updatePlanningScene();
-
-  // the next clip
-  clip_id = "clip6";
-  mtc_task_node->doTask(clip_id, false, true);
-  clip_names.push_back(clip_id);
-
-  // Send the request
-  request->clip_names = clip_names;
-  // Send the request asynchronously
-  RCLCPP_INFO(LOGGER, "Sending service request...");
-  clip_names_client->async_send_request(request, 
-                          [&](rclcpp::Client<moveit_task_constructor_msgs::srv::GetClipNames>::SharedFuture future) 
-  {
-    auto response = future.get();
-    if (response)
-    {
-      RCLCPP_INFO(LOGGER, "Service response: %s", response->success ? "true" : "false");
-    }
-    else
-    {
-      RCLCPP_ERROR(LOGGER, "Service call failed!");
-    }
-
-    // Signal that the response has been received
-    {
-      std::lock_guard<std::mutex> lock(mutex);
-      response_received = true;
-    }
-    cv.notify_one();
-  });
-
-  // Wait for the service response before continuing
-  {
-    std::unique_lock<std::mutex> lock(mutex);
-    cv.wait(lock, [&] { return response_received; });
   }
-
-  // Reset the response flag for the next request
-  response_received = false;
-
-  // Use visul tools to control the movement from one clip to another
-  mtc_task_node->getVisualTools().prompt("Press 'next' in the RvizVisualToolsGui window to contiune the next task");
-
-  // Update planning scene after execution
-  RCLCPP_INFO(LOGGER, "Updating planning scene after MTC execution.");
-  mtc_task_node->updatePlanningScene();
-
-  // the next clip
-  clip_id = "clip6";
-  mtc_task_node->doTask(clip_id, false, true);
 
   spin_thread->join();
   rclcpp::shutdown();
