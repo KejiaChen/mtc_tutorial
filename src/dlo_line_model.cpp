@@ -20,7 +20,7 @@ static const rclcpp::Logger LOGGER = rclcpp::get_logger("dlo_tracker");
 using namespace moveit::task_constructor;
 
 std::mutex clip_names_mutex;
-std::vector<std::string> clip_names;
+std::vector<std::string> clip_names = {};
 bool clip_names_changed = false;  // Signal flag for clip names changes
 
 Eigen::Isometry3d poseToIsometry(const geometry_msgs::msg::Pose& pose_msg) {
@@ -45,7 +45,9 @@ void handle_service(const std::shared_ptr<moveit_task_constructor_msgs::srv::Get
     RCLCPP_INFO(LOGGER, "Received request to update clip names.");
 
     // Clear and update clip_names
-    clip_names = request->clip_names;
+    clip_names = {"clip0"};
+    clip_names.insert(clip_names.end(), request->clip_names.begin(), request->clip_names.end());
+    // clip_names = request->clip_names;
     clip_names_changed = true;
 
     // Log the received clip names
@@ -97,28 +99,29 @@ int main(int argc, char** argv) {
     Eigen::Isometry3d line_end_pose;
 
     // Line marker starts from a certain point
-    std::vector<std::string> clip_names = {"clip5", "clip6"};
+    // std::vector<std::string> clip_names = {"clip0"};
+    
+    // // TODO: why there has to be more than one segements to show the line?
+    // std::string clip_name = clip_names[0];
+    // std::map<std::string, geometry_msgs::msg::Pose> clip_poses = psi.getObjectPoses(clip_names);
+    // RCLCPP_INFO(LOGGER, " Clip5 pose: %f, %f, %f", clip_poses[clip_name].position.x, clip_poses[clip_name].position.y, clip_poses[clip_name].position.z);
+    // line_start_pose = poseToIsometry(clip_poses[clip_name]);
+    // line_starts.push_back(line_start_pose.translation());
 
-    std::string clip_name = clip_names[0];
-    std::map<std::string, geometry_msgs::msg::Pose> clip_poses = psi.getObjectPoses(clip_names);
-    RCLCPP_INFO(LOGGER, " Clip5 pose: %f, %f, %f", clip_poses[clip_name].position.x, clip_poses[clip_name].position.y, clip_poses[clip_name].position.z);
-    line_start_pose = poseToIsometry(clip_poses[clip_name]);
-    line_starts.push_back(line_start_pose.translation());
+    // clip_name = clip_names[1];
+    // clip_poses = psi.getObjectPoses(clip_names);
+    // RCLCPP_INFO(LOGGER, " Clip6 pose: %f, %f, %f", clip_poses[clip_name].position.x, clip_poses[clip_name].position.y, clip_poses[clip_name].position.z);
+    // line_end_pose = poseToIsometry(clip_poses[clip_name]);
+    // line_ends.push_back(line_end_pose.translation());
 
-    clip_name = clip_names[1];
-    clip_poses = psi.getObjectPoses(clip_names);
-    RCLCPP_INFO(LOGGER, " Clip6 pose: %f, %f, %f", clip_poses[clip_name].position.x, clip_poses[clip_name].position.y, clip_poses[clip_name].position.z);
-    line_end_pose = poseToIsometry(clip_poses[clip_name]);
-    line_ends.push_back(line_end_pose.translation());
+    // clip_name = clip_names[1];
+    // clip_poses = psi.getObjectPoses(clip_names);
+    // line_start_pose = poseToIsometry(clip_poses[clip_name]);
+    // // line_marker_start = line_start_pose.translation();
+    // line_starts.push_back(line_start_pose.translation());
 
-    clip_name = clip_names[1];
-    clip_poses = psi.getObjectPoses(clip_names);
-    line_start_pose = poseToIsometry(clip_poses[clip_name]);
-    // line_marker_start = line_start_pose.translation();
-    line_starts.push_back(line_start_pose.translation());
-
-    // place holder
-    line_ends.push_back(line_start_pose.translation());
+    // // place holder
+    // line_ends.push_back(line_start_pose.translation());
 
     // // initialize
     // robot_state::RobotStatePtr current_state = move_group_interface.getCurrentState();
@@ -140,39 +143,41 @@ int main(int argc, char** argv) {
         rclcpp::spin_some(node);
 
         try{
-            // if (clip_names_changed){
-            //     std::lock_guard<std::mutex> lock(clip_names_mutex);
-            //     clip_names_changed = false;  // Reset the signal flag
+            if (clip_names_changed){
+                std::lock_guard<std::mutex> lock(clip_names_mutex);
+                clip_names_changed = false;  // Reset the signal flag
                 
-            //     // Clear existing lines
-            //     line_starts.clear();
-            //     line_ends.clear();
+                // Clear existing lines
+                line_starts.clear();
+                line_ends.clear();
 
-            //     // Get clip poses
-            //     std::map<std::string, geometry_msgs::msg::Pose> clip_poses = psi.getObjectPoses(clip_names);
+                // Get clip poses
+                std::map<std::string, geometry_msgs::msg::Pose> clip_poses = psi.getObjectPoses(clip_names);
 
-            //     // Compute lines between neighboring clips
-            //     for (size_t i = 0; i < clip_names.size(); ++i) {
-            //         const auto& start_clip = clip_names[i];
-            //         if (clip_poses.count(start_clip)){
-            //             line_start_pose = poseToIsometry(clip_poses[start_clip]);
-            //             line_starts.push_back(line_start_pose.translation());
-            //         }
+                // Compute lines between neighboring clips
+                for (size_t i = 0; i < clip_names.size(); ++i) {
+                    const auto& start_clip = clip_names[i];
+                    if (clip_poses.count(start_clip)){
+                        line_start_pose = poseToIsometry(clip_poses[start_clip]);
+                        line_starts.push_back(line_start_pose.translation());
+                    }
 
-            //         // except the last clip
-            //         if (i < clip_names.size() - 1) {
-            //             const auto& end_clip = clip_names[i + 1];
-            //             if (clip_poses.count(end_clip)) {
-            //                 line_end_pose = poseToIsometry(clip_poses[end_clip]);
-            //                 line_ends.push_back(line_end_pose.translation());
-            //             }
-            //         }else{
-            //             // place holder, will be updated later with transform
-            //             line_ends.push_back(line_start_pose.translation());
-            //         }
-            //     }
+                    // except the last clip
+                    if (i < clip_names.size() - 1) {
+                        const auto& end_clip = clip_names[i + 1];
+                        if (clip_poses.count(end_clip)) {
+                            line_end_pose = poseToIsometry(clip_poses[end_clip]);
+                            line_ends.push_back(line_end_pose.translation());
+                        }
+                    }else{
+                        // place holder, will be updated later with transform
+                        line_ends.push_back(line_start_pose.translation());
+                    }
+                }
 
-            // }
+                clip_names_changed = false;
+
+            }
         // Get the current state of the robot
         // moveit::core::RobotStatePtr current_state = move_group_interface.getCurrentState();
         // RCLCPP_INFO(LOGGER, "Waiting for robot states...");
@@ -184,7 +189,7 @@ int main(int argc, char** argv) {
         // RCLCPP_INFO(LOGGER, "Robot states received.");
 
         // Lookup transform
-        // if (clip_names.size() != 0){
+        if (clip_names.size() > 0){
         geometry_msgs::msg::TransformStamped transform_stamped =
             tf_buffer->lookupTransform(reference_frame, target_frame, rclcpp::Time(0));
 
@@ -208,9 +213,12 @@ int main(int argc, char** argv) {
         // bool publishing = visual_tools->publishLine(line_marker_start, line_marker_end, line_marker_color, line_marker_scale, 1);
         for (size_t i = 0; i < line_starts.size(); ++i) {
             visual_tools.publishLine(line_starts[i], line_ends[i], line_marker_color, line_marker_scale, i); // Pass 'i' as the ID
+            // RCLCPP_INFO(LOGGER, "Published line marker %zu", i);
         }
+
         visual_tools.trigger();
-        // }   
+        
+        }   
         }catch (const tf2::TransformException& ex) {
             RCLCPP_WARN(LOGGER, "Could not transform '%s' to '%s': %s", 
                         target_frame.c_str(), reference_frame.c_str(), ex.what());
