@@ -24,6 +24,32 @@ std::vector<std::string> clip_names = {};
 bool clip_names_changed = false;  // Signal flag for clip names changes
 bool follow_hand_closed = false;  // Signal flag for gripper state
 
+#include <Eigen/Geometry>
+#include <geometry_msgs/msg/transform_stamped.hpp>
+
+// Function to convert TransformStamped to Eigen::Isometry3d
+Eigen::Isometry3d transformStampedToEigen(const geometry_msgs::msg::TransformStamped& transform_msg)
+{
+  Eigen::Isometry3d transform = Eigen::Isometry3d::Identity();
+
+  // Extract translation
+  transform.translation() << transform_msg.transform.translation.x,
+                              transform_msg.transform.translation.y,
+                              transform_msg.transform.translation.z;
+
+  // Extract rotation (quaternion) and convert to Eigen
+  Eigen::Quaterniond rotation(transform_msg.transform.rotation.w,
+                              transform_msg.transform.rotation.x,
+                              transform_msg.transform.rotation.y,
+                              transform_msg.transform.rotation.z);
+
+  // Set rotation
+  transform.rotate(rotation);
+
+  return transform;
+}
+
+
 Eigen::Isometry3d poseToIsometry(const geometry_msgs::msg::Pose& pose_msg) {
     Eigen::Isometry3d isometry = Eigen::Isometry3d::Identity();
     
@@ -193,34 +219,32 @@ int main(int argc, char** argv) {
 
         // Lookup transform to lead hand
         if (clip_names.size() > 0){
+            // Define the offset in the z-axis
+            double z_offset = 0.1034;
             geometry_msgs::msg::TransformStamped lead_hand_transform =
                 tf_buffer->lookupTransform(reference_frame, lead_hand_frame, rclcpp::Time(0));
+            // Apply the offset to the lead hand frame to get the fingertip position
+            Eigen::Isometry3d lead_hand_pose = transformStampedToEigen(lead_hand_transform);
+            Eigen::Isometry3d lead_fingertip_pose = lead_hand_pose * Eigen::Translation3d(0, 0, z_offset);
             
             geometry_msgs::msg::TransformStamped follow_hand_transform = tf_buffer->lookupTransform(
                     reference_frame, follow_hand_frame, rclcpp::Time(0));
-
+            // Apply the offset to the follow hand frame to get the fingertip position
+            Eigen::Isometry3d follow_hand_pose = transformStampedToEigen(follow_hand_transform);
+            Eigen::Isometry3d follow_fingertip_pose = follow_hand_pose * Eigen::Translation3d(0, 0, z_offset);
 
             // Lookup transform to follow hand
             if (follow_hand_closed){
-                line_ends[line_starts.size()-2] = Eigen::Vector3d(follow_hand_transform.transform.translation.x,
-                                        follow_hand_transform.transform.translation.y,
-                                        follow_hand_transform.transform.translation.z);    
-                
-                line_starts[line_starts.size()-1] = Eigen::Vector3d(follow_hand_transform.transform.translation.x,
-                                            follow_hand_transform.transform.translation.y,
-                                            follow_hand_transform.transform.translation.z);
+                line_ends[line_starts.size()-2] = follow_fingertip_pose.translation();
+
+                line_starts[line_starts.size()-1] = follow_fingertip_pose.translation();
             }else{
-                line_ends[line_starts.size()-2] = Eigen::Vector3d(lead_hand_transform.transform.translation.x,
-                                            lead_hand_transform.transform.translation.y,
-                                            lead_hand_transform.transform.translation.z);
-                line_starts[line_starts.size()-1] = Eigen::Vector3d(lead_hand_transform.transform.translation.x,
-                                            lead_hand_transform.transform.translation.y,
-                                            lead_hand_transform.transform.translation.z);
+                line_ends[line_starts.size()-2] = lead_fingertip_pose.translation();
+
+                line_starts[line_starts.size()-1] = lead_fingertip_pose.translation();
             }
 
-            line_ends[line_starts.size()-1] = Eigen::Vector3d(lead_hand_transform.transform.translation.x,
-                                            lead_hand_transform.transform.translation.y,
-                                            lead_hand_transform.transform.translation.z);
+            line_ends[line_starts.size()-1] = lead_fingertip_pose.translation();
 
             // bool publishing = visual_tools->publishLine(line_marker_start, line_marker_end, line_marker_color, line_marker_scale, 1);
             for (size_t i = 0; i < line_starts.size(); ++i) {
