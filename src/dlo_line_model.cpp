@@ -22,6 +22,7 @@ using namespace moveit::task_constructor;
 std::mutex clip_names_mutex;
 std::vector<std::string> clip_names = {};
 bool clip_names_changed = false;  // Signal flag for clip names changes
+bool follow_hand_closed = false;  // Signal flag for gripper state
 
 Eigen::Isometry3d poseToIsometry(const geometry_msgs::msg::Pose& pose_msg) {
     Eigen::Isometry3d isometry = Eigen::Isometry3d::Identity();
@@ -60,6 +61,23 @@ void handle_service(const std::shared_ptr<moveit_task_constructor_msgs::srv::Get
     RCLCPP_INFO(LOGGER, "Service response: %s", response->success ? "true" : "false");
 }
 
+void follow_hand_callback(const sensor_msgs::msg::JointState::SharedPtr msg)
+{
+    auto it = std::find(msg->name.begin(), msg->name.end(), "left_panda_finger_joint1");
+    if (it != msg->name.end())
+    {
+        size_t index = std::distance(msg->name.begin(), it);
+        double position = msg->position[index];
+        // RCLCPP_INFO(LOGGER, "Gripper position: %f", position);
+
+        // Check if the gripper is closed
+        follow_hand_closed = (position < 0.01);  // Adjust the threshold based on your robot
+        if (follow_hand_closed) {
+            RCLCPP_INFO(LOGGER, "Gripper is CLOSED");
+        }
+    }
+}
+
 int main(int argc, char** argv) {
 
     rclcpp::init(argc, argv);
@@ -86,9 +104,14 @@ int main(int argc, char** argv) {
     // Create a service server for clip_names
     auto clip_service = node->create_service<moveit_task_constructor_msgs::srv::GetClipNames>(
       "get_clip_names", handle_service);
+    
+    // Create a subscriber to follow hand gripper's joint position
+    auto follow_hand_sub = node->create_subscription<sensor_msgs::msg::JointState>(
+        "joint_states", 10, follow_hand_callback);
 
     // Initialize marker properties
-    std::string target_frame = "right_panda_hand";  // Replace with your TF frame name
+    std::string lead_hand_frame = "right_panda_hand";  // Replace with your TF frame name
+    std::string follow_hand_frame = "left_panda_hand";  // Replace with your TF frame name
     std::string reference_frame = "world";      // Replace with your reference frame name
     std::vector<Eigen::Vector3d> line_starts;
     std::vector<Eigen::Vector3d> line_ends; 
@@ -122,19 +145,6 @@ int main(int argc, char** argv) {
 
     // // place holder
     // line_ends.push_back(line_start_pose.translation());
-
-    // // initialize
-    // robot_state::RobotStatePtr current_state = move_group_interface.getCurrentState();
-
-    // // Get the global transform of a specific link with respect to the world frame
-    // Eigen::Isometry3d tip_pose_in_hand = Eigen::Isometry3d::Identity();
-    // tip_pose_in_hand.translation().z() = 0.1034;
-    //  const Eigen::Isometry3d& gripper_tip_pose = current_state->getGlobalLinkTransform("panda_1_hand")*tip_pose_in_hand;
-    // line_marker_end = gripper_tip_pose.translation();
-
-    // bool publishing = visual_tools->publishLine(line_marker_start,  line_marker_end, line_marker_color, line_marker_scale, 1);
-    // visual_tools->trigger();
-    // ros::Duration(0.1).sleep();
     
     rclcpp::WallRate loop_rate(10);
     // Main loop to continuously update the line marker
@@ -170,7 +180,9 @@ int main(int argc, char** argv) {
                             line_ends.push_back(line_end_pose.translation());
                         }
                     }else{
-                        // place holder, will be updated later with transform
+                        // place holder for the last clip, will be updated later with transform
+                        line_ends.push_back(line_start_pose.translation());
+                        line_starts.push_back(line_start_pose.translation());
                         line_ends.push_back(line_start_pose.translation());
                     }
                 }
@@ -178,50 +190,49 @@ int main(int argc, char** argv) {
                 clip_names_changed = false;
 
             }
-        // Get the current state of the robot
-        // moveit::core::RobotStatePtr current_state = move_group_interface.getCurrentState();
-        // RCLCPP_INFO(LOGGER, "Waiting for robot states...");
-        // while (!current_state)
-        // {
-        //     rclcpp::spin_some(node);
-        //     rclcpp::sleep_for(std::chrono::milliseconds(100));
-        // }
-        // RCLCPP_INFO(LOGGER, "Robot states received.");
 
-        // Lookup transform
+        // Lookup transform to lead hand
         if (clip_names.size() > 0){
-        geometry_msgs::msg::TransformStamped transform_stamped =
-            tf_buffer->lookupTransform(reference_frame, target_frame, rclcpp::Time(0));
+            geometry_msgs::msg::TransformStamped lead_hand_transform =
+                tf_buffer->lookupTransform(reference_frame, lead_hand_frame, rclcpp::Time(0));
+            
+            geometry_msgs::msg::TransformStamped follow_hand_transform = tf_buffer->lookupTransform(
+                    reference_frame, follow_hand_frame, rclcpp::Time(0));
 
-        // // Get the global transform of a specific link with respect to the world frame
-        // Eigen::Isometry3d tip_pose_in_hand = Eigen::Isometry3d::Identity();
-        // tip_pose_in_hand.translation().z() = 0.1034; // Franka TCP configuration
-        // const Eigen::Isometry3d& gripper_tip_pose = current_state->getGlobalLinkTransform("right_panda_hand")*tip_pose_in_hand;
-        // // line_marker_end = gripper_tip_pose.translation();
-        // line_ends[1] = gripper_tip_pose.translation();
 
-        line_ends[clip_names.size()-1] = Eigen::Vector3d(transform_stamped.transform.translation.x,
-                                        transform_stamped.transform.translation.y,
-                                        transform_stamped.transform.translation.z);
+            // Lookup transform to follow hand
+            if (follow_hand_closed){
+                line_ends[line_starts.size()-2] = Eigen::Vector3d(follow_hand_transform.transform.translation.x,
+                                        follow_hand_transform.transform.translation.y,
+                                        follow_hand_transform.transform.translation.z);    
+                
+                line_starts[line_starts.size()-1] = Eigen::Vector3d(follow_hand_transform.transform.translation.x,
+                                            follow_hand_transform.transform.translation.y,
+                                            follow_hand_transform.transform.translation.z);
+            }else{
+                line_ends[line_starts.size()-2] = Eigen::Vector3d(lead_hand_transform.transform.translation.x,
+                                            lead_hand_transform.transform.translation.y,
+                                            lead_hand_transform.transform.translation.z);
+                line_starts[line_starts.size()-1] = Eigen::Vector3d(lead_hand_transform.transform.translation.x,
+                                            lead_hand_transform.transform.translation.y,
+                                            lead_hand_transform.transform.translation.z);
+            }
 
-        // Extract the position components
-        // gripper_tip_position = gripper_tip_pose.translation();
-        // ROS_INFO_STREAM("Gripper tip position: " << gripper_tip_position.x() << ", "
-        //                                             << gripper_tip_position.y() << ", "
-        //                                             << gripper_tip_position.z());
+            line_ends[line_starts.size()-1] = Eigen::Vector3d(lead_hand_transform.transform.translation.x,
+                                            lead_hand_transform.transform.translation.y,
+                                            lead_hand_transform.transform.translation.z);
 
-        // bool publishing = visual_tools->publishLine(line_marker_start, line_marker_end, line_marker_color, line_marker_scale, 1);
-        for (size_t i = 0; i < line_starts.size(); ++i) {
-            visual_tools.publishLine(line_starts[i], line_ends[i], line_marker_color, line_marker_scale, i); // Pass 'i' as the ID
-            // RCLCPP_INFO(LOGGER, "Published line marker %zu", i);
-        }
+            // bool publishing = visual_tools->publishLine(line_marker_start, line_marker_end, line_marker_color, line_marker_scale, 1);
+            for (size_t i = 0; i < line_starts.size(); ++i) {
+                visual_tools.publishLine(line_starts[i], line_ends[i], line_marker_color, line_marker_scale, i); // Pass 'i' as the ID
+                // RCLCPP_INFO(LOGGER, "Published line marker %zu", i);
+            }
 
-        visual_tools.trigger();
-        
+            visual_tools.trigger();
         }   
         }catch (const tf2::TransformException& ex) {
             RCLCPP_WARN(LOGGER, "Could not transform '%s' to '%s': %s", 
-                        target_frame.c_str(), reference_frame.c_str(), ex.what());
+                        lead_hand_frame.c_str(), reference_frame.c_str(), ex.what());
         }
 
         // Optionally, add a delay to control the update frequency
