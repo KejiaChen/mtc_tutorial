@@ -20,6 +20,8 @@
 #include <geometry_msgs/msg/pose_stamped.hpp>
 #include <moveit_visual_tools/moveit_visual_tools.h>
 #include <std_msgs/msg/bool.hpp>
+#include <moveit_task_constructor_msgs/srv/get_clip_names.hpp>
+// #include <moveit_task_constructor_msgs/msg/clip_names.hpp>
 // #include <moveit_msgs>
 
 
@@ -83,7 +85,7 @@ private:
 
   // Compose an MTC task from a series of stages.
   mtc::Task createTask(std::string& goal_frame_name, bool use_dual, bool split_plan);
-  mtc::Task task_;
+  mtc::Task createPostTask(std::string& goal_frame_name, bool use_dual, bool split_plan);
   rclcpp::Node::SharedPtr node_;
 
   // interfaces
@@ -279,9 +281,10 @@ moveit_msgs::msg::Constraints MTCTaskNode::createBoxConstraints(const std::strin
   return box_constraints;
 }
 
-void MTCTaskNode::doTask(std::string& goal_clip_id, bool execute, bool plan_for_dual)
+void MTCTaskNode::doTask(std::string& goal_clip_id, bool execute, bool plan_for_dual,
+                        std::function<mtc::Task(const std::string&, bool, bool)> createTaskFn)
 {
-  task_ = createTask(goal_clip_id, plan_for_dual, false);
+  task_ = createTaskFn(goal_clip_id, plan_for_dual, false);
 
   // publish solution for moveit servo
   bool publish_mtc_trajectory = !execute;
@@ -423,12 +426,25 @@ mtc::Task MTCTaskNode::createTask(std::string& goal_frame_name, bool use_dual, b
   follow_cartesian_planner->setMaxAccelerationScalingFactor(0.05);
   follow_cartesian_planner->setStepSize(.001);
 
+//   /****************************************************
+//   ---- *               Open Hand                      *
+//   ***************************************************/
+//  {
+//     auto stage = std::make_unique<mtc::stages::MoveTo>("open hand", lead_interpolation_planner);
+//     stage->setGroup(lead_hand_group_name);
+//     stage->setGoal("open");
+
+//     // pre_move_stage_ptr = stage.get();
+
+//     task.add(std::move(stage));
+//  }
+
   /****************************************************
   ---- *               Close Hand                      *
   ***************************************************/
  {
-    auto stage = std::make_unique<mtc::stages::MoveTo>("close hand", lead_interpolation_planner);
-    stage->setGroup(lead_hand_group_name);
+    auto stage = std::make_unique<mtc::stages::MoveTo>("close hand", follow_interpolation_planner);
+    stage->setGroup(_hand_group_name);
     stage->setGoal("close");
 
     pre_move_stage_ptr = stage.get();
@@ -714,6 +730,116 @@ mtc::Task MTCTaskNode::createTask(std::string& goal_frame_name, bool use_dual, b
     task.add(std::move(grasp));
   }
 
+  //    /****************************************************
+  // ---- *               Open Hand                      *
+	// ***************************************************/
+  // {
+  //   auto stage = std::make_unique<mtc::stages::MoveTo>("open hand", follow_interpolation_planner);
+  //   stage->setGroup(follow_hand_group_name);
+  //   stage->setGoal("open");
+  //   task.add(std::move(stage));
+  // }
+
+  //  /****************************************************
+  // ---- *               Retrieve in EE-z                *
+  //   ***************************************************/
+  // {
+  //   auto stage =
+  //       std::make_unique<mtc::stages::MoveRelative>("insertion", follow_cartesian_planner);
+  //   stage->properties().set("marker_ns", "insertion");
+  //   stage->properties().set("link", follow_hand_frame);
+  //   // stage->properties().configureInitFrom(mtc::Stage::PARENT, { "group" });
+  //   stage->setGroup(follow_arm_group_name);
+  //   stage->setMinMaxDistance(0.1, 0.15);
+
+  //   // Set hand forward direction
+  //   geometry_msgs::msg::Vector3Stamped vec;
+  //   // vec.header.frame_id = follow_hand_frame;
+  //   vec.header.frame_id = goal_frame_name;
+  //   vec.vector.z = 0.03;
+  //   stage->setDirection(vec);
+  //   task.add(std::move(stage));
+  // }
+
+
+  return task;
+}
+
+mtc::Task MTCTaskNode::createPostTask(std::string& goal_frame_name, bool use_dual, bool split_plan)
+{
+  mtc::Task task;
+  task.stages()->setName("routing task");
+  task.loadRobotModel(node_);
+
+  const auto& lead_arm_group_name = "right_panda_arm";
+  const auto& lead_hand_group_name = "right_hand";
+  const auto& lead_hand_frame = "right_panda_hand";
+
+  const auto& follow_arm_group_name = "left_panda_arm";
+  const auto& follow_hand_group_name = "left_hand";
+  const auto& follow_hand_frame = "left_panda_hand";
+
+  const auto& dual_arm_group_name = "dual_arm";
+  // delete markers
+  visual_tools_.deleteAllMarkers();
+  visual_tools_.trigger();
+
+  // set target pose
+  geometry_msgs::msg::PoseStamped lead_target_pose = createClipGoal(goal_frame_name, leader_pre_clip);
+  geometry_msgs::msg::PoseStamped follow_target_pose = createClipGoal(goal_frame_name, follower_pre_clip);
+
+// Disable warnings for this line, as it's a variable that's set but not used in this example
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wunused-but-set-variable"
+  mtc::Stage* current_state_ptr = nullptr;  // Forward current_state on to grasp pose generator
+#pragma GCC diagnostic pop
+
+  /****************************************************
+	 *                                                  *
+	 *               Current State                      *
+	 *                                                  *
+	 ***************************************************/
+  {
+    auto stage_state_current = std::make_unique<mtc::stages::CurrentState>("current");
+    current_state_ptr = stage_state_current.get();
+    task.add(std::move(stage_state_current));
+
+    // pre_move_stage_ptr = stage_state_current.get();
+  }
+
+  // Set up planners
+  auto lead_sampling_planner = std::make_shared<mtc::solvers::PipelinePlanner>(node_);
+  lead_sampling_planner->setMaxVelocityScalingFactor(0.05);
+  lead_sampling_planner->setMaxAccelerationScalingFactor(0.05);
+
+  auto lead_interpolation_planner = std::make_shared<mtc::solvers::JointInterpolationPlanner>();
+
+  auto lead_cartesian_planner = std::make_shared<mtc::solvers::CartesianPath>();
+  lead_cartesian_planner->setMaxVelocityScalingFactor(0.05);
+  lead_cartesian_planner->setMaxAccelerationScalingFactor(0.05);
+  lead_cartesian_planner->setStepSize(.001);
+
+  auto follow_sampling_planner = std::make_shared<mtc::solvers::PipelinePlanner>(node_);
+  follow_sampling_planner->setMaxVelocityScalingFactor(0.05);
+  follow_sampling_planner->setMaxAccelerationScalingFactor(0.05);
+
+  auto follow_interpolation_planner = std::make_shared<mtc::solvers::JointInterpolationPlanner>();
+
+  auto follow_cartesian_planner = std::make_shared<mtc::solvers::CartesianPath>();
+  follow_cartesian_planner->setMaxVelocityScalingFactor(0.05);
+  follow_cartesian_planner->setMaxAccelerationScalingFactor(0.05);
+  follow_cartesian_planner->setStepSize(.001);
+
+       /****************************************************
+  ---- *               Open Hand                      *
+	***************************************************/
+  {
+    auto stage = std::make_unique<mtc::stages::MoveTo>("open hand", follow_interpolation_planner);
+    stage->setGroup(follow_hand_group_name);
+    stage->setGoal("open");
+    task.add(std::move(stage));
+  }
+
    /****************************************************
   ---- *               Retrieve in EE-z                *
     ***************************************************/
@@ -735,7 +861,6 @@ mtc::Task MTCTaskNode::createTask(std::string& goal_frame_name, bool use_dual, b
     task.add(std::move(stage));
   }
 
-
   return task;
 }
 
@@ -752,6 +877,17 @@ int main(int argc, char** argv)
   // Create a publisher to start the follower tracking
   auto tracking_start_pub = mtc_task_node->getNode()->create_publisher<std_msgs::msg::Bool>("/start_tracking", 10);
 
+  std::vector<std::string> clip_names;
+
+  // Service client to get clip names
+  auto clip_names_client = mtc_task_node->getNode()->create_client<moveit_task_constructor_msgs::srv::GetClipNames>("get_clip_names");
+  auto request = std::make_shared<moveit_task_constructor_msgs::srv::GetClipNames::Request>();
+
+  // Wait for the service to become available
+  while (!clip_names_client->wait_for_service(std::chrono::seconds(1))) {
+      RCLCPP_INFO(LOGGER, "Waiting for the service...");
+  }
+
   // moveit::planning_interface::MoveGroupInterface move_group(mtc_task_node->getNode(), "right_panda_arm");
   // moveit_visual_tools::MoveItVisualTools visual_tools(mtc_task_node->getNode(), "right_panda_link0", "dual_mtc_routing",
   //                                                     move_group.getRobotModel());
@@ -766,9 +902,49 @@ int main(int argc, char** argv)
   // Use visul tools to control the movement from one clip to another
   mtc_task_node->getVisualTools().prompt("After objects are loaded, press 'next' in the RvizVisualToolsGui window to start the demo");
 
+  // Variables for synchronization
+  std::mutex mutex;
+  std::condition_variable cv;
+  bool response_received = false;
+
   // initial clip
   std::string clip_id = "clip5";
   mtc_task_node->doTask(clip_id, false, true);
+  clip_names.push_back(clip_id);
+
+  // Send the request
+  request->clip_names = clip_names;
+  // Send the request asynchronously
+  RCLCPP_INFO(LOGGER, "Sending service request...");
+  clip_names_client->async_send_request(request, 
+                          [&](rclcpp::Client<moveit_task_constructor_msgs::srv::GetClipNames>::SharedFuture future) 
+  {
+    auto response = future.get();
+    if (response)
+    {
+      RCLCPP_INFO(LOGGER, "Service response: %s", response->success ? "true" : "false");
+    }
+    else
+    {
+      RCLCPP_ERROR(LOGGER, "Service call failed!");
+    }
+
+    // Signal that the response has been received
+    {
+      std::lock_guard<std::mutex> lock(mutex);
+      response_received = true;
+    }
+    cv.notify_one();
+  });
+
+  // Wait for the service response before continuing
+  {
+    std::unique_lock<std::mutex> lock(mutex);
+    cv.wait(lock, [&] { return response_received; });
+  }
+
+  // Reset the response flag for the next request
+  response_received = false;
 
   // // Use visul tools to control the movement from one clip to another
   mtc_task_node->getVisualTools().prompt("After moving to initial positions, press 'next' in the RvizVisualToolsGui window to start servo");
@@ -787,6 +963,41 @@ int main(int argc, char** argv)
   // the next clip
   clip_id = "clip6";
   mtc_task_node->doTask(clip_id, false, true);
+  clip_names.push_back(clip_id);
+
+  // Send the request
+  request->clip_names = clip_names;
+  // Send the request asynchronously
+  RCLCPP_INFO(LOGGER, "Sending service request...");
+  clip_names_client->async_send_request(request, 
+                          [&](rclcpp::Client<moveit_task_constructor_msgs::srv::GetClipNames>::SharedFuture future) 
+  {
+    auto response = future.get();
+    if (response)
+    {
+      RCLCPP_INFO(LOGGER, "Service response: %s", response->success ? "true" : "false");
+    }
+    else
+    {
+      RCLCPP_ERROR(LOGGER, "Service call failed!");
+    }
+
+    // Signal that the response has been received
+    {
+      std::lock_guard<std::mutex> lock(mutex);
+      response_received = true;
+    }
+    cv.notify_one();
+  });
+
+  // Wait for the service response before continuing
+  {
+    std::unique_lock<std::mutex> lock(mutex);
+    cv.wait(lock, [&] { return response_received; });
+  }
+
+  // Reset the response flag for the next request
+  response_received = false;
 
   // Use visul tools to control the movement from one clip to another
   mtc_task_node->getVisualTools().prompt("Press 'next' in the RvizVisualToolsGui window to contiune the next task");
