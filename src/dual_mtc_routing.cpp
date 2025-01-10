@@ -36,6 +36,7 @@ using GroupVectorDict = std::map<std::string, std::vector<double>>;
 std::vector<double> clip_size = {0.04, 0.04, 0.06};
 double insertion_offset = 0.02;
 double hold_y_offset = 0.03;
+double hold_z_offset = 0.01;
 // std::vector<double> leader_pre_clip = {-(clip_size[0]/2+hold_x_offset), -clip_size[1]/2, clip_size[2]/2};
 // std::vector<double> follower_pre_clip = {clip_size[0]/2+hold_x_offset, -clip_size[1]/2, clip_size[2]/2};
 
@@ -44,8 +45,8 @@ double hold_y_offset = 0.03;
 // std::vector<double> follower_pre_clip = {0, clip_size[1]/2+hold_y_offset, clip_size[2]/2}; 
 
 // C-type Clip
-std::vector<double> leader_pre_clip = {(insertion_offset+clip_size[0]/2), -(clip_size[1]/2+hold_y_offset), clip_size[2]/2};
-std::vector<double> follower_pre_clip = {(insertion_offset+clip_size[0]/2), clip_size[1]/2+hold_y_offset, clip_size[2]/2}; 
+std::vector<double> leader_pre_clip = {(insertion_offset+clip_size[0]/2), -(clip_size[1]/2+hold_y_offset), clip_size[2]/2+hold_z_offset};
+std::vector<double> follower_pre_clip = {(insertion_offset+clip_size[0]/2), clip_size[1]/2+hold_y_offset, clip_size[2]/2+hold_z_offset}; 
 
 class MTCTaskNode
 {
