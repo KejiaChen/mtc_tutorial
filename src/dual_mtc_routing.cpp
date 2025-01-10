@@ -21,6 +21,8 @@
 #include <moveit_visual_tools/moveit_visual_tools.h>
 #include <std_msgs/msg/bool.hpp>
 #include <moveit_task_constructor_msgs/srv/get_clip_names.hpp>
+#include <moveit/task_constructor/storage.h>
+// #include <moveit/task_constructor/task_routing.h>
 // #include <moveit_task_constructor_msgs/msg/clip_names.hpp>
 // #include <moveit_msgs>
 
@@ -41,12 +43,12 @@ double hold_z_offset = 0.01;
 // std::vector<double> follower_pre_clip = {clip_size[0]/2+hold_x_offset, -clip_size[1]/2, clip_size[2]/2};
 
 // U-type Clip
-// std::vector<double> leader_pre_clip = {0, -(clip_size[1]/2+hold_y_offset), clip_size[2]/2};
-// std::vector<double> follower_pre_clip = {0, clip_size[1]/2+hold_y_offset, clip_size[2]/2}; 
+std::vector<double> leader_pre_clip = {0, -(clip_size[1]/2+hold_y_offset), clip_size[2]/2+hold_z_offset};
+std::vector<double> follower_pre_clip = {0, clip_size[1]/2+hold_y_offset, clip_size[2]/2+hold_z_offset}; 
 
 // C-type Clip
-std::vector<double> leader_pre_clip = {(insertion_offset+clip_size[0]/2), -(clip_size[1]/2+hold_y_offset), clip_size[2]/2+hold_z_offset};
-std::vector<double> follower_pre_clip = {(insertion_offset+clip_size[0]/2), clip_size[1]/2+hold_y_offset, clip_size[2]/2+hold_z_offset}; 
+// std::vector<double> leader_pre_clip = {(insertion_offset+clip_size[0]/2), -(clip_size[1]/2+hold_y_offset), clip_size[2]/2+hold_z_offset};
+// std::vector<double> follower_pre_clip = {(insertion_offset+clip_size[0]/2), clip_size[1]/2+hold_y_offset, clip_size[2]/2+hold_z_offset}; 
 
 class MTCTaskNode
 {
@@ -64,6 +66,9 @@ public:
   // Compose an MTC task from a series of stages.
   mtc::Task createTask(std::string& goal_frame_name, bool use_dual, bool split_plan);
   mtc::Task createPostTask(std::string& goal_frame_name, bool use_dual, bool split_plan);
+
+  // publish mtc sub_trajectory
+  void publishSolutionSubTraj(const moveit_task_constructor_msgs::msg::Solution& msg);
 
   void doTask(std::string& goal_clip_id, bool execute, bool plan_for_dual,
               std::function<mtc::Task(std::string&, bool, bool)> createTaskFn);
@@ -95,6 +100,9 @@ private:
   tf2_ros::Buffer tf_buffer_;
   tf2_ros::TransformListener tf_listener_;
 
+  // publish mtc sub_trajectory
+	rclcpp::Publisher<moveit_task_constructor_msgs::msg::SubTrajectory>::SharedPtr subtrajectory_publisher_;
+
   // Joint state subscriber
   rclcpp::Subscription<sensor_msgs::msg::JointState>::SharedPtr joint_state_sub_;
   sensor_msgs::msg::JointState::SharedPtr current_joint_state_;
@@ -122,6 +130,10 @@ MTCTaskNode::MTCTaskNode(const rclcpp::NodeOptions& options)
     tf_listener_(tf_buffer_)       // Initialize TF Listener with TF Buffer
 {
   visual_tools_.loadRemoteControl();
+
+  // Subtrajectory publisher
+  subtrajectory_publisher_ = node_->create_publisher<moveit_task_constructor_msgs::msg::SubTrajectory>(
+		    "/mtc_sub_trajectory", rclcpp::QoS(1).transient_local());
 
   // Subscription to the joint states
   joint_state_sub_ = node_->create_subscription<sensor_msgs::msg::JointState>(
@@ -207,6 +219,30 @@ moveit_visual_tools::MoveItVisualTools& MTCTaskNode::getVisualTools()
   return visual_tools_;
 }
 
+void MTCTaskNode::publishSolutionSubTraj(const moveit_task_constructor_msgs::msg::Solution& msg) {
+	
+  for (const moveit_task_constructor_msgs::msg::SubTrajectory& sub_trajectory : msg.sub_trajectory) {
+    if (sub_trajectory.trajectory.joint_trajectory.points.empty())
+      continue;
+
+    // visualize trajectories
+    moveit_msgs::msg::RobotTrajectory robot_trajectory;
+    robot_trajectory.joint_trajectory = sub_trajectory.trajectory.joint_trajectory;
+
+    visual_tools_.publishTrajectoryLine(robot_trajectory, move_group_.getCurrentState()->getJointModelGroup("right_panda_arm"));
+
+    // publish trajectories
+    subtrajectory_publisher_->publish(sub_trajectory);
+    RCLCPP_INFO_STREAM(LOGGER, "Published trajectory id " << sub_trajectory.info.id 
+                              << " for stage " << sub_trajectory.info.stage_id
+                              << " with "<< sub_trajectory.trajectory.joint_trajectory.points.size()
+                              << " waypoints");
+    visual_tools_.prompt("[Publishing] Press 'next' to publishing the next subtrajectory");
+    rclcpp::sleep_for(std::chrono::milliseconds(100));
+  }
+  return;
+	
+}
 
 geometry_msgs::msg::PoseStamped MTCTaskNode::getPoseTransform(const geometry_msgs::msg::PoseStamped& pose, const std::string& target_frame)
 {   
@@ -380,7 +416,12 @@ void MTCTaskNode::doTask(std::string& goal_clip_id, bool execute, bool plan_for_
   }
 
   RCLCPP_INFO_STREAM(LOGGER, "Task planned successfully");
-  task_.introspection().publishSolution(*task_.solutions().front(), publish_mtc_trajectory);
+
+  // Publish the solution
+  // task_.introspection().publishSolution(*task_.solutions().front(), publish_mtc_trajectory);
+  moveit_task_constructor_msgs::msg::Solution msg;
+	task_.introspection().fillSolution(msg, *task_.solutions().front());
+  publishSolutionSubTraj(msg);
 
 //   // Access the first solution
 //   const auto& solution = solutions.front();
@@ -832,7 +873,8 @@ mtc::Task MTCTaskNode::createTask(std::string& goal_frame_name, bool use_dual, b
       geometry_msgs::msg::Vector3Stamped vec; 
       vec.header.frame_id = goal_frame_name;
       // vec.vector.z = -0.05;
-      vec.vector.x = -(insertion_offset+0.02);
+      vec.vector.z = -(insertion_offset+0.02);
+      // vec.vector.x = -(insertion_offset+0.02);
       stage->setDirection(vec);
       // task.add(std::move(stage));
       grasp->insert(std::move(stage));
@@ -961,8 +1003,7 @@ mtc::Task MTCTaskNode::createPostTask(std::string& goal_frame_name, bool use_dua
     stage->properties().set("link", follow_hand_frame);
     // stage->properties().configureInitFrom(mtc::Stage::PARENT, { "group" });
     stage->setGroup(follow_arm_group_name);
-    stage->setMinMaxDistance(0.1, 0.15);
-
+    // stage->setMinMaxDistance(0.1, 0.15); //this will override the moving distance
     // Set hand forward direction
     geometry_msgs::msg::Vector3Stamped vec;
     // vec.header.frame_id = follow_hand_frame;
@@ -1022,75 +1063,75 @@ int main(int argc, char** argv)
   // initial clip
   for (auto i = 0; i < clip_ids.size(); i++)
   {
-  auto clip_id = clip_ids[i];
-  // Use visul tools to control the movement from one clip to another
-  mtc_task_node->getVisualTools().prompt("After objects are loaded, press 'next' in the RvizVisualToolsGui window to continue the next task");
+    auto clip_id = clip_ids[i];
+    // Use visul tools to control the movement from one clip to another
+    mtc_task_node->getVisualTools().prompt("[Planning] Press 'next' in the RvizVisualToolsGui window to continue the next task");
 
-  // Update planning scene after execution
-  RCLCPP_INFO(LOGGER, "Updating planning scene after MTC execution.");
-  mtc_task_node->updatePlanningScene();
+    // Update planning scene after execution
+    RCLCPP_INFO(LOGGER, "Updating planning scene after MTC execution.");
+    mtc_task_node->updatePlanningScene();
 
-  if (i>0){
-    mtc_task_node->setSelectOrientation(true);
-  }
-
-  mtc_task_node->doTask(clip_id, false, true,
-                      [mtc_task_node](std::string& goal, bool dual, bool split) {
-                      return mtc_task_node->createTask(goal, dual, split);
-                      });
-                      
-  mtc_task_node->getVisualTools().prompt("After objects are loaded, press 'next' in the RvizVisualToolsGui window to continue the next task");
-
-  mtc_task_node->doTask(clip_id, false, true,
-                      [mtc_task_node](std::string& goal, bool dual, bool split) {
-                      return mtc_task_node->createPostTask(goal, dual, split);
-                      });
-  
-  clip_names.push_back(clip_id);
-
-  // Send the request
-  request->clip_names = clip_names;
-  // Send the request asynchronously
-  RCLCPP_INFO(LOGGER, "Sending service request...");
-  clip_names_client->async_send_request(request, 
-                          [&](rclcpp::Client<moveit_task_constructor_msgs::srv::GetClipNames>::SharedFuture future) 
-  {
-    auto response = future.get();
-    if (response)
-    {
-      RCLCPP_INFO(LOGGER, "Service response: %s", response->success ? "true" : "false");
-    }
-    else
-    {
-      RCLCPP_ERROR(LOGGER, "Service call failed!");
+    if (i>0){
+      mtc_task_node->setSelectOrientation(true);
     }
 
-    // Signal that the response has been received
+    mtc_task_node->doTask(clip_id, false, true,
+                        [mtc_task_node](std::string& goal, bool dual, bool split) {
+                        return mtc_task_node->createTask(goal, dual, split);
+                        });
+                        
+    mtc_task_node->getVisualTools().prompt("[Planning] Press 'next' in the RvizVisualToolsGui window to continue the next task");
+
+    mtc_task_node->doTask(clip_id, false, true,
+                        [mtc_task_node](std::string& goal, bool dual, bool split) {
+                        return mtc_task_node->createPostTask(goal, dual, split);
+                        });
+    
+    clip_names.push_back(clip_id);
+
+    // Send the request
+    request->clip_names = clip_names;
+    // Send the request asynchronously
+    RCLCPP_INFO(LOGGER, "Sending service request...");
+    clip_names_client->async_send_request(request, 
+                            [&](rclcpp::Client<moveit_task_constructor_msgs::srv::GetClipNames>::SharedFuture future) 
     {
-      std::lock_guard<std::mutex> lock(mutex);
-      response_received = true;
+      auto response = future.get();
+      if (response)
+      {
+        RCLCPP_INFO(LOGGER, "Service response: %s", response->success ? "true" : "false");
+      }
+      else
+      {
+        RCLCPP_ERROR(LOGGER, "Service call failed!");
+      }
+
+      // Signal that the response has been received
+      {
+        std::lock_guard<std::mutex> lock(mutex);
+        response_received = true;
+      }
+      cv.notify_one();
+    });
+
+    // Wait for the service response before continuing
+    {
+      std::unique_lock<std::mutex> lock(mutex);
+      cv.wait(lock, [&] { return response_received; });
     }
-    cv.notify_one();
-  });
 
-  // Wait for the service response before continuing
-  {
-    std::unique_lock<std::mutex> lock(mutex);
-    cv.wait(lock, [&] { return response_received; });
-  }
+    // Reset the response flag for the next request
+    response_received = false;
 
-  // Reset the response flag for the next request
-  response_received = false;
-
-  if (clip_id == "clip5")
-  {
-  // // Use visul tools to control the movement from one clip to another
-  mtc_task_node->getVisualTools().prompt("After moving to initial positions, press 'next' in the RvizVisualToolsGui window to start servo");
-  // start follower tracking
-  std_msgs::msg::Bool start_tracking_msg;
-  start_tracking_msg.data = true;
-  tracking_start_pub->publish(start_tracking_msg);
-  }
+    if (clip_id == "clip5")
+    {
+    // // Use visul tools to control the movement from one clip to another
+    mtc_task_node->getVisualTools().prompt("After moving to initial positions, press 'next' in the RvizVisualToolsGui window to start servo");
+    // start follower tracking
+    std_msgs::msg::Bool start_tracking_msg;
+    start_tracking_msg.data = true;
+    tracking_start_pub->publish(start_tracking_msg);
+    }
 
   }
 
