@@ -94,6 +94,47 @@ MTCTaskNode::~MTCTaskNode()
   }
 }
 
+void MTCTaskNode::initializeGroups()
+{
+    // Define robot group names
+    lead_arm_group_name = "right_panda_arm";
+    lead_hand_group_name = "right_hand";
+    lead_hand_frame = "right_panda_hand";
+
+    follow_arm_group_name = "left_panda_arm";
+    follow_hand_group_name = "left_hand";
+    follow_hand_frame = "left_panda_hand";
+
+    dual_arm_group_name = "dual_arm";
+}
+
+void MTCTaskNode::initializePlanners()
+{
+    // Lead arm planners
+    lead_sampling_planner = std::make_shared<mtc::solvers::PipelinePlanner>(node_);
+    lead_sampling_planner->setMaxVelocityScalingFactor(0.05);
+    lead_sampling_planner->setMaxAccelerationScalingFactor(0.05);
+
+    lead_interpolation_planner = std::make_shared<mtc::solvers::JointInterpolationPlanner>();
+
+    lead_cartesian_planner = std::make_shared<mtc::solvers::CartesianPath>();
+    lead_cartesian_planner->setMaxVelocityScalingFactor(0.05);
+    lead_cartesian_planner->setMaxAccelerationScalingFactor(0.05);
+    lead_cartesian_planner->setStepSize(0.001);
+
+    // Follow arm planners
+    follow_sampling_planner = std::make_shared<mtc::solvers::PipelinePlanner>(node_);
+    follow_sampling_planner->setMaxVelocityScalingFactor(0.05);
+    follow_sampling_planner->setMaxAccelerationScalingFactor(0.05);
+
+    follow_interpolation_planner = std::make_shared<mtc::solvers::JointInterpolationPlanner>();
+
+    follow_cartesian_planner = std::make_shared<mtc::solvers::CartesianPath>();
+    follow_cartesian_planner->setMaxVelocityScalingFactor(0.05);
+    follow_cartesian_planner->setMaxAccelerationScalingFactor(0.05);
+    follow_cartesian_planner->setStepSize(0.001);
+}
+
  void MTCTaskNode::jointStateCallback(const sensor_msgs::msg::JointState::SharedPtr msg)
 {
   current_joint_state_ = msg; // Cache the latest joint state
@@ -403,15 +444,8 @@ mtc::Task MTCTaskNode::createTask(std::string& goal_frame_name, bool use_dual, b
   task.stages()->setName("routing task");
   task.loadRobotModel(node_);
 
-  const auto& lead_arm_group_name = "right_panda_arm";
-  const auto& lead_hand_group_name = "right_hand";
-  const auto& lead_hand_frame = "right_panda_hand";
-
-  const auto& follow_arm_group_name = "left_panda_arm";
-  const auto& follow_hand_group_name = "left_hand";
-  const auto& follow_hand_frame = "left_panda_hand";
-
-  const auto& dual_arm_group_name = "dual_arm";
+  // Initialize robot groups
+  initializeGroups();
 
   // Set task properties (only valid for single arm)
   // if (!use_dual){
@@ -451,27 +485,7 @@ mtc::Task MTCTaskNode::createTask(std::string& goal_frame_name, bool use_dual, b
   }
 
   // Set up planners
-  auto lead_sampling_planner = std::make_shared<mtc::solvers::PipelinePlanner>(node_);
-  lead_sampling_planner->setMaxVelocityScalingFactor(0.05);
-  lead_sampling_planner->setMaxAccelerationScalingFactor(0.05);
-
-  auto lead_interpolation_planner = std::make_shared<mtc::solvers::JointInterpolationPlanner>();
-
-  auto lead_cartesian_planner = std::make_shared<mtc::solvers::CartesianPath>();
-  lead_cartesian_planner->setMaxVelocityScalingFactor(0.05);
-  lead_cartesian_planner->setMaxAccelerationScalingFactor(0.05);
-  lead_cartesian_planner->setStepSize(.001);
-
-  auto follow_sampling_planner = std::make_shared<mtc::solvers::PipelinePlanner>(node_);
-  follow_sampling_planner->setMaxVelocityScalingFactor(0.05);
-  follow_sampling_planner->setMaxAccelerationScalingFactor(0.05);
-
-  auto follow_interpolation_planner = std::make_shared<mtc::solvers::JointInterpolationPlanner>();
-
-  auto follow_cartesian_planner = std::make_shared<mtc::solvers::CartesianPath>();
-  follow_cartesian_planner->setMaxVelocityScalingFactor(0.05);
-  follow_cartesian_planner->setMaxAccelerationScalingFactor(0.05);
-  follow_cartesian_planner->setStepSize(.001);
+  initializePlanners();
 
 //   /****************************************************
 //   ---- *               Open Hand                      *
@@ -855,15 +869,9 @@ mtc::Task MTCTaskNode::createPostTask(std::string& goal_frame_name, bool use_dua
   task.stages()->setName("routing task");
   task.loadRobotModel(node_);
 
-  const auto& lead_arm_group_name = "right_panda_arm";
-  const auto& lead_hand_group_name = "right_hand";
-  const auto& lead_hand_frame = "right_panda_hand";
+  // Initialize robot groups
+  initializeGroups();
 
-  const auto& follow_arm_group_name = "left_panda_arm";
-  const auto& follow_hand_group_name = "left_hand";
-  const auto& follow_hand_frame = "left_panda_hand";
-
-  const auto& dual_arm_group_name = "dual_arm";
   // delete markers
   visual_tools_.deleteAllMarkers();
   visual_tools_.trigger();
@@ -892,27 +900,7 @@ mtc::Task MTCTaskNode::createPostTask(std::string& goal_frame_name, bool use_dua
   }
 
   // Set up planners
-  auto lead_sampling_planner = std::make_shared<mtc::solvers::PipelinePlanner>(node_);
-  lead_sampling_planner->setMaxVelocityScalingFactor(0.05);
-  lead_sampling_planner->setMaxAccelerationScalingFactor(0.05);
-
-  auto lead_interpolation_planner = std::make_shared<mtc::solvers::JointInterpolationPlanner>();
-
-  auto lead_cartesian_planner = std::make_shared<mtc::solvers::CartesianPath>();
-  lead_cartesian_planner->setMaxVelocityScalingFactor(0.05);
-  lead_cartesian_planner->setMaxAccelerationScalingFactor(0.05);
-  lead_cartesian_planner->setStepSize(.001);
-
-  auto follow_sampling_planner = std::make_shared<mtc::solvers::PipelinePlanner>(node_);
-  follow_sampling_planner->setMaxVelocityScalingFactor(0.05);
-  follow_sampling_planner->setMaxAccelerationScalingFactor(0.05);
-
-  auto follow_interpolation_planner = std::make_shared<mtc::solvers::JointInterpolationPlanner>();
-
-  auto follow_cartesian_planner = std::make_shared<mtc::solvers::CartesianPath>();
-  follow_cartesian_planner->setMaxVelocityScalingFactor(0.05);
-  follow_cartesian_planner->setMaxAccelerationScalingFactor(0.05);
-  follow_cartesian_planner->setStepSize(.001);
+  initializePlanners();
 
        /****************************************************
   ---- *               Open Hand                      *

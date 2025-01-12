@@ -63,6 +63,26 @@ public:
 
   // void loadCustomScene(const std::string &path);
 
+  // Robot group names
+  std::string lead_arm_group_name;
+  std::string lead_hand_group_name;
+  std::string lead_hand_frame;
+
+  std::string follow_arm_group_name;
+  std::string follow_hand_group_name;
+  std::string follow_hand_frame;
+
+  std::string dual_arm_group_name;
+
+  // Planners
+  std::shared_ptr<mtc::solvers::PipelinePlanner> lead_sampling_planner;
+  std::shared_ptr<mtc::solvers::JointInterpolationPlanner> lead_interpolation_planner;
+  std::shared_ptr<mtc::solvers::CartesianPath> lead_cartesian_planner;
+
+  std::shared_ptr<mtc::solvers::PipelinePlanner> follow_sampling_planner;
+  std::shared_ptr<mtc::solvers::JointInterpolationPlanner> follow_interpolation_planner;
+  std::shared_ptr<mtc::solvers::CartesianPath> follow_cartesian_planner;
+
 private:
   geometry_msgs::msg::PoseStamped getPoseTransform(const geometry_msgs::msg::PoseStamped& pose, const std::string& target_frame);
   moveit_msgs::msg::Constraints createBoxConstraints(const std::string& link_name, geometry_msgs::msg::PoseStamped& goal_pose);
@@ -100,6 +120,10 @@ private:
 
   // Select Goal Orientation
   bool select_orientation_ = false;
+
+  // Helper methods for internal setup
+  void initializeGroups();
+  void initializePlanners();
 };
 
 #endif  // MTC_TASK_NODE_H
