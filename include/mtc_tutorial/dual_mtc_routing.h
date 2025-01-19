@@ -51,6 +51,7 @@ public:
   // Compose an MTC task from a series of stages.
   mtc::Task createTask(std::string& goal_frame_name, bool use_dual, bool split_plan);
   mtc::Task createPostTask(std::string& goal_frame_name, bool use_dual, bool split_plan);
+  mtc::Task createTestWaypointTask(std::string& goal_frame_name, bool use_dual, bool split_plan);
 
   // publish mtc sub_trajectory
   void publishSolutionSubTraj(const moveit_task_constructor_msgs::msg::Solution& msg);

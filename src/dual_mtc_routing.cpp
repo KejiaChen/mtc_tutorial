@@ -29,7 +29,7 @@
 // #include <moveit_msgs>
 
 
-static const rclcpp::Logger LOGGER = rclcpp::get_logger("mtc_tutorial");
+static const rclcpp::Logger LOGGER = rclcpp::get_logger("mtc_node");
 
 // scene configuration
 std::vector<double> clip_size = {0.04, 0.04, 0.06};
@@ -55,8 +55,8 @@ rclcpp::node_interfaces::NodeBaseInterface::SharedPtr MTCTaskNode::getNodeBaseIn
 
 MTCTaskNode::MTCTaskNode(const rclcpp::NodeOptions& options)
   : node_{ std::make_shared<rclcpp::Node>("mtc_node", options) },
-    move_group_(node_, "right_panda_arm"),
-    visual_tools_(node_, "world", rviz_visual_tools::RVIZ_MARKER_TOPIC, move_group_.getRobotModel()),
+    move_group_(node_, "dual_arm"),  // for dual arm or single arm
+    visual_tools_(node_, "world", rviz_visual_tools::RVIZ_MARKER_TOPIC, move_group_.getRobotModel(), true),
     tf_buffer_(node_->get_clock()), // Initialize TF Buffer with node clock
     tf_listener_(tf_buffer_)       // Initialize TF Listener with TF Buffer
 {
@@ -82,6 +82,8 @@ MTCTaskNode::MTCTaskNode(const rclcpp::NodeOptions& options)
   // Start the periodic update thread
   // update_thread_ = std::thread(&MTCTaskNode::periodicUpdate, this);
 
+  // Initialize Planning Groups
+  initializeGroups();
 }
 
 // Destructor
@@ -201,7 +203,14 @@ void MTCTaskNode::publishSolutionSubTraj(const moveit_task_constructor_msgs::msg
     moveit_msgs::msg::RobotTrajectory robot_trajectory;
     robot_trajectory.joint_trajectory = sub_trajectory.trajectory.joint_trajectory;
 
-    visual_tools_.publishTrajectoryLine(robot_trajectory, move_group_.getCurrentState()->getJointModelGroup("right_panda_arm"));
+    // Translation for Fingertips
+    Eigen::Isometry3d z_translation = Eigen::Isometry3d::Identity();
+    z_translation.translation().z() = 0.1034; // Adjust this value based on the actual offset
+
+    visual_tools_.publishTrajectoryLine(robot_trajectory, move_group_.getCurrentState()->getJointModelGroup(lead_arm_group_name),
+                                        z_translation, sub_trajectory.info.stage_id, rviz_visual_tools::BLUE);
+    // visual_tools_.publishTrajectoryLine(robot_trajectory, move_group_.getCurrentState()->getLinkModel(lead_hand_frame));
+    visual_tools_.trigger();
 
     // publish trajectories
     subtrajectory_publisher_->publish(sub_trajectory);
@@ -257,7 +266,7 @@ moveit_msgs::msg::Constraints MTCTaskNode::createBoxConstraints(const std::strin
   box.dimensions = {
       fabs(goal_pose_transformed.pose.position.x - current_pose_transformed.pose.position.x)+0.1,  // Length (x)
       fabs(goal_pose_transformed.pose.position.y - current_pose_transformed.pose.position.y)+0.1,  // Width (y)
-      fabs(goal_pose_transformed.pose.position.z - current_pose_transformed.pose.position.z)+0.3   // Height (z)
+      fabs(goal_pose_transformed.pose.position.z - current_pose_transformed.pose.position.z)+0.1   // Height (z)
   };
 
   // Create position constraint
@@ -863,10 +872,105 @@ mtc::Task MTCTaskNode::createTask(std::string& goal_frame_name, bool use_dual, b
   return task;
 }
 
+mtc::Task MTCTaskNode::createTestWaypointTask(std::string& goal_frame_name, bool use_dual, bool split_plan)
+{
+  mtc::Task task;
+  task.stages()->setName("test waypoint task");
+  task.loadRobotModel(node_);
+
+  // Initialize robot groups
+  initializeGroups();
+
+  // delete markers
+  visual_tools_.deleteAllMarkers();
+  visual_tools_.trigger();
+
+  // set target pose
+  geometry_msgs::msg::PoseStamped lead_target_pose = createClipGoal(goal_frame_name, leader_pre_clip);
+  geometry_msgs::msg::PoseStamped follow_target_pose = createClipGoal(goal_frame_name, follower_pre_clip);
+
+// Disable warnings for this line, as it's a variable that's set but not used in this example
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wunused-but-set-variable"
+  mtc::Stage* current_state_ptr = nullptr;  // Forward current_state on to grasp pose generator
+#pragma GCC diagnostic pop
+
+mtc::Stage* pre_move_stage_ptr = nullptr;
+
+  /****************************************************
+	 *                                                  *
+	 *               Current State                      *
+	 *                                                  *
+	 ***************************************************/
+  {
+    auto stage_state_current = std::make_unique<mtc::stages::CurrentState>("current");
+    current_state_ptr = stage_state_current.get();
+    task.add(std::move(stage_state_current));
+
+    // pre_move_stage_ptr = stage_state_current.get();
+  }
+
+  // Set up planners
+  initializePlanners();
+
+  /****************************************************
+  ---- *               Close Hand                      *
+  ***************************************************/
+  {
+    auto stage = std::make_unique<mtc::stages::MoveTo>("close hand", follow_interpolation_planner);
+    stage->setGroup(follow_hand_group_name);
+    stage->setGoal("close");
+
+    pre_move_stage_ptr = stage.get();
+
+    task.add(std::move(stage));
+  }
+
+  /****************************************************
+  ---- *  Compute Cartesian Waypoints for single arm *
+	***************************************************/
+  {
+    moveit::planning_interface::MoveGroupInterfacePtr lead_move_group_interface = std::make_shared<moveit::planning_interface::MoveGroupInterface>(node_, lead_arm_group_name);
+    auto cartesian_stage = std::make_unique<mtc::stages::CartesianWaypointStage>("Cartesian Waypoints", lead_cartesian_planner, lead_move_group_interface);
+
+    std::vector<geometry_msgs::msg::PoseStamped> waypoints;
+    geometry_msgs::msg::PoseStamped waypoint1;
+    waypoint1.header.frame_id = "world";
+    waypoint1.pose.position.x = 0.3855;
+    waypoint1.pose.position.y = -0.0025;
+    waypoint1.pose.position.z = 1.2840;
+    waypoint1.pose.orientation = lead_target_pose.pose.orientation;
+    waypoints.push_back(waypoint1);
+
+    waypoints.push_back(lead_target_pose);
+
+    std::vector<geometry_msgs::msg::Pose> waypoints_in_world;
+    for (auto& waypoint : waypoints)
+    {
+      // transform to world frame
+      geometry_msgs::msg::Pose waypoint_transformed = getPoseTransform(waypoint, "world").pose;
+      waypoints_in_world.push_back(waypoint_transformed);
+    }
+
+    // IK frame at TCP
+    Eigen::Isometry3d grasp_frame_transform = Eigen::Isometry3d::Identity();
+    grasp_frame_transform.translation().z() = 0.1034;
+
+    cartesian_stage->setWaypoints(waypoints_in_world);
+    cartesian_stage->setGroup(lead_arm_group_name);
+    cartesian_stage->setIKFrame(grasp_frame_transform, lead_hand_frame);
+    // cartesian_stage->setPathConstraints(path_constraints);
+
+    task.stages()->add(std::move(cartesian_stage));
+  }
+
+  return task;
+}
+
 mtc::Task MTCTaskNode::createPostTask(std::string& goal_frame_name, bool use_dual, bool split_plan)
 {
   mtc::Task task;
-  task.stages()->setName("routing task");
+  task.stages()->setName("post routing task");
   task.loadRobotModel(node_);
 
   // Initialize robot groups
@@ -977,7 +1081,7 @@ int main(int argc, char** argv)
   bool response_received = false;
 
   // List of clip IDs to process
-  std::vector<std::string> clip_ids = {"clip5", "clip6", "clip8"};
+  std::vector<std::string> clip_ids = {"clip5", "clip6", "clip8"}; //"clip5", "clip6", "clip8"
 
   // initial clip
   for (auto i = 0; i < clip_ids.size(); i++)
@@ -996,15 +1100,20 @@ int main(int argc, char** argv)
 
     mtc_task_node->doTask(clip_id, false, true,
                         [mtc_task_node](std::string& goal, bool dual, bool split) {
-                        return mtc_task_node->createTask(goal, dual, split);
+                        return mtc_task_node->createTestWaypointTask(goal, dual, split);
                         });
-                        
-    mtc_task_node->getVisualTools().prompt("[Planning] Press 'next' in the RvizVisualToolsGui window to continue the next task");
 
-    mtc_task_node->doTask(clip_id, false, true,
-                        [mtc_task_node](std::string& goal, bool dual, bool split) {
-                        return mtc_task_node->createPostTask(goal, dual, split);
-                        });
+    // mtc_task_node->doTask(clip_id, false, true,
+    //                     [mtc_task_node](std::string& goal, bool dual, bool split) {
+    //                     return mtc_task_node->createTask(goal, dual, split);
+    //                     });
+                        
+    // mtc_task_node->getVisualTools().prompt("[Planning] Press 'next' in the RvizVisualToolsGui window to continue the next task");
+
+    // mtc_task_node->doTask(clip_id, false, true,
+    //                     [mtc_task_node](std::string& goal, bool dual, bool split) {
+    //                     return mtc_task_node->createPostTask(goal, dual, split);
+    //                     });
     
     clip_names.push_back(clip_id);
 
