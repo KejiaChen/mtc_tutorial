@@ -5,9 +5,12 @@ if(CMAKE_COMPILER_IS_GNUCXX OR CMAKE_CXX_COMPILER_ID MATCHES "Clang")
 add_compile_options(-Wall -Wextra -Wpedantic)
 endif()
 
+include_directories(include)
+
 # find dependencies
 find_package(ament_cmake REQUIRED)
 find_package(moveit_task_constructor_core REQUIRED)
+find_package(moveit_task_constructor_msgs REQUIRED)
 find_package(rclcpp REQUIRED)
 # uncomment the following section in order to fill in
 # further dependencies manually.
@@ -17,6 +20,9 @@ find_package(moveit_core REQUIRED)
 find_package(moveit_ros_planning_interface REQUIRED)
 find_package(moveit_visual_tools REQUIRED)
 find_package(tf2_ros REQUIRED)
+find_package(tf2 REQUIRED)
+find_package(tf2_geometry_msgs REQUIRED)
+find_package(sensor_msgs REQUIRED)
 
 # declare a demo consisting of a single cpp file
 function(demo name)
@@ -54,6 +60,9 @@ ament_target_dependencies(monitor_tracking
   geometry_msgs
   std_msgs
   tf2_ros
+  tf2
+  tf2_geometry_msgs
+  sensor_msgs
 )
 install(TARGETS monitor_tracking DESTINATION lib/${PROJECT_NAME})
 
@@ -62,6 +71,7 @@ ament_target_dependencies(dlo_line_model
   rclcpp
   moveit_core
   moveit_task_constructor_core
+  moveit_task_constructor_msgs
   moveit_ros_planning
   moveit_ros_planning_interface
   moveit_visual_tools
