@@ -49,15 +49,15 @@ public:
   moveit_visual_tools::MoveItVisualTools& getVisualTools();
 
   // Compose an MTC task from a series of stages.
-  mtc::Task createTask(std::string& goal_frame_name, bool use_dual, bool split_plan);
-  mtc::Task createPostTask(std::string& goal_frame_name, bool use_dual, bool split_plan);
-  mtc::Task createTestWaypointTask(std::string& goal_frame_name, bool use_dual, bool split_plan);
+  mtc::Task createTask(std::string& goal_frame_name, bool if_use_dual, bool if_split_plan, bool if_cartesian_connect, bool if_approach);
+  mtc::Task createPostTask(std::string& goal_frame_name, bool if_use_dual, bool if_split_plan, bool if_cartesian_connect, bool if_approach);
+  mtc::Task createTestWaypointTask(std::string& goal_frame_name, bool if_use_dual, bool if_split_plan, bool if_cartesian_connect);
 
   // publish mtc sub_trajectory
   void publishSolutionSubTraj(const moveit_task_constructor_msgs::msg::Solution& msg);
 
-  void doTask(std::string& goal_clip_id, bool execute, bool plan_for_dual,
-              std::function<mtc::Task(std::string&, bool, bool)> createTaskFn);
+  void doTask(std::string& goal_clip_id, bool execute, bool plan_for_dual, bool cartesian_connect, bool approach,
+              std::function<mtc::Task(std::string&, bool, bool, bool, bool)> createTaskFn);
   void updatePlanningScene();
 
   void setSelectOrientation(bool select_orientation) { select_orientation_ = select_orientation; }
@@ -93,8 +93,8 @@ private:
           const std::vector<double>& goal_vector_1, const std::vector<double>& goal_vector_2);
 
   // // Compose an MTC task from a series of stages.
-  // mtc::Task createTask(std::string& goal_frame_name, bool use_dual, bool split_plan);
-  // mtc::Task createPostTask(std::string& goal_frame_name, bool use_dual, bool split_plan);
+  // mtc::Task createTask(std::string& goal_frame_name, bool if_use_dual, bool if_split_plan);
+  // mtc::Task createPostTask(std::string& goal_frame_name, bool if_use_dual, bool if_split_plan);
   rclcpp::Node::SharedPtr node_;
   mtc::Task task_;
 
