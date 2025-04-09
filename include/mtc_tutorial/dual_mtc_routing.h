@@ -51,7 +51,7 @@ public:
   // Compose an MTC task from a series of stages.
   mtc::Task createTask(std::string& goal_frame_name, bool if_use_dual, bool if_split_plan, bool if_cartesian_connect, bool if_approach);
   mtc::Task createPostTask(std::string& goal_frame_name, bool if_use_dual, bool if_split_plan, bool if_cartesian_connect, bool if_approach);
-  mtc::Task createTestWaypointTask(std::string& goal_frame_name, bool if_use_dual, bool if_split_plan, bool if_cartesian_connect);
+  mtc::Task createTestWaypointTask(std::string& goal_frame_name, bool if_use_dual, bool if_split_plan, bool if_cartesian_connect, bool if_approach);
 
   // publish mtc sub_trajectory
   void publishSolutionSubTraj(const moveit_task_constructor_msgs::msg::Solution& msg);

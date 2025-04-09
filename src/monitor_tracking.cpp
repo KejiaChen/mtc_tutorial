@@ -5,11 +5,13 @@
 #include <std_msgs/msg/float64.hpp>
 #include <tf2/LinearMath/Transform.h>
 #include <tf2_geometry_msgs/tf2_geometry_msgs.h>
+#include <sensor_msgs/msg/joint_state.hpp>
+#include <fstream>
 
-class EEDistanceMonitor : public rclcpp::Node
+class RoutingMonitor : public rclcpp::Node
 {
 public:
-  EEDistanceMonitor()
+  RoutingMonitor()
       : Node("ee_distance_monitor"), tf_buffer_(this->get_clock()), tf_listener_(tf_buffer_)
   {
     // Declare parameters for the frame names
@@ -27,9 +29,29 @@ public:
     leader_scaling_pub = this->create_publisher<std_msgs::msg::Float64>("/right_arm_controller/scaling_factor", 10);
     follower_scaling_pub = this->create_publisher<std_msgs::msg::Float64>("/left_arm_controller/scaling_factor", 10);
 
+    // Subscriber for joint states
+    // joint_state_sub_ = this->create_subscription<sensor_msgs::msg::JointState>(
+    //     "/joint_states", 10,
+    //     std::bind(&RoutingMonitor::jointStateCallback, this, std::placeholders::_1));
+
     // Timer for periodic distance computation
     timer_ = this->create_wall_timer(std::chrono::milliseconds(50),
-                                     std::bind(&EEDistanceMonitor::computeDistanceScaling, this));
+                                     std::bind(&RoutingMonitor::computeDistanceScaling, this));
+
+    // Open the log file
+    log_file_.open("franka_velocity_log.txt", std::ios::out);
+    if (!log_file_.is_open())
+    {
+      RCLCPP_ERROR(this->get_logger(), "Failed to open log file!");
+    }
+  }
+
+  ~RoutingMonitor()
+  {
+    if (log_file_.is_open())
+    {
+      log_file_.close();
+    }
   }
 
 private:
@@ -85,10 +107,11 @@ private:
 
       // Publish the scaling factor
       std_msgs::msg::Float64 follow_scaling_msg;
-      double follow_scaling_factor = EEDistanceMonitor::followerScaling(distance, 0.1);
+      // double follow_scaling_factor = RoutingMonitor::followerScaling(distance, 0.1);
+      double follow_scaling_factor = 1.0;
       follow_scaling_msg.data = follow_scaling_factor;
       follower_scaling_pub->publish(follow_scaling_msg);
-      RCLCPP_INFO(this->get_logger(), "Published scaling factor for follower: %.4f", follow_scaling_factor);
+      // RCLCPP_INFO(this->get_logger(), "Published scaling factor for follower: %.4f", follow_scaling_factor);
 
       std_msgs::msg::Float64 lead_scaling_msg;
       lead_scaling_msg.data = 1.0;
@@ -101,6 +124,39 @@ private:
     {
       RCLCPP_WARN(this->get_logger(), "Could not transform: %s", ex.what());
     }
+  }
+
+  void jointStateCallback(const sensor_msgs::msg::JointState::SharedPtr msg)
+  {
+    if (msg->velocity.empty())
+    {
+      RCLCPP_WARN(this->get_logger(), "No velocity data available!");
+      return;
+    }
+
+    // Map to store joint names and velocities, sorted by joint number
+    std::map<int, double> left_joint_velocities;
+
+    // Filter for left Panda joints
+    for (size_t i = 0; i < msg->name.size(); ++i)
+    {
+      // Check if the joint name contains "left_panda"
+      if (msg->name[i].find("left_panda_joint") != std::string::npos)
+      {
+        int joint_number = std::stoi(msg->name[i].substr(16));
+        left_joint_velocities[joint_number] = msg->velocity[i];
+        RCLCPP_INFO(this->get_logger(), "Joint %s: %.4f rad/s", msg->name[i].c_str(), msg->velocity[i]);
+        // log_file_ << msg->name[i] << ": " << msg->velocity[i] << " rad/s ";
+      }
+    }
+
+    log_file_ << this->get_clock()->now().seconds() << "s ";
+    // Log the sorted joint velocities
+    for (const auto &joint : left_joint_velocities)
+    {
+      log_file_ << joint.first << ": " << joint.second << " ";
+    }
+    log_file_ << "\n";
   }
 
   double followerScaling(double current_distance, double desired_distance){
@@ -137,14 +193,20 @@ private:
   rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr leader_scaling_pub;
   rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr follower_scaling_pub;
 
+  // Subscriber for joint states
+  rclcpp::Subscription<sensor_msgs::msg::JointState>::SharedPtr joint_state_sub_;
+
   // Timer for periodic computation
   rclcpp::TimerBase::SharedPtr timer_;
+
+  // File stream for logging velocities
+  std::ofstream log_file_;
 };
 
 int main(int argc, char **argv)
 {
   rclcpp::init(argc, argv);
-  rclcpp::spin(std::make_shared<EEDistanceMonitor>());
+  rclcpp::spin(std::make_shared<RoutingMonitor>());
   rclcpp::shutdown();
   return 0;
 }

@@ -212,9 +212,9 @@ void MTCTaskNode::publishSolutionSubTraj(const moveit_task_constructor_msgs::msg
     z_translation.translation().z() = 0.1034; // Adjust this value based on the actual offset
 
     visual_tools_.publishTrajectoryLine(robot_trajectory, move_group_.getCurrentState()->getJointModelGroup(lead_arm_group_name),
-                                        z_translation, sub_trajectory.info.stage_id, rviz_visual_tools::ORANGE);
+                                        z_translation, sub_trajectory.info.stage_id, "/home/tp2/ws_humble/trajectories_leader", rviz_visual_tools::ORANGE);
     visual_tools_.publishTrajectoryLine(robot_trajectory, move_group_.getCurrentState()->getJointModelGroup(follow_arm_group_name),
-                                        z_translation, sub_trajectory.info.stage_id, rviz_visual_tools::BLUE);
+                                        z_translation, sub_trajectory.info.stage_id, "/home/tp2/ws_humble/trajectories_follower", rviz_visual_tools::BLUE);
     // visual_tools_.publishTrajectoryLine(robot_trajectory, move_group_.getCurrentState()->getLinkModel(lead_hand_frame));
     visual_tools_.trigger();
 
@@ -535,20 +535,23 @@ mtc::Task MTCTaskNode::createTask(std::string& goal_frame_name, bool if_use_dual
   { 
     mtc::stages::Connect::GroupPlannerVector planners;
     mtc::stages::Connect::GroupPlannerVector interpolation_planners;
+    mtc::stages::ConnectMF::GroupCartPlannerVector carteisan_planners;
     if (if_use_dual){
       // The order is important for collision checking!
       planners = {{lead_arm_group_name, lead_sampling_planner}, {follow_arm_group_name, follow_sampling_planner}};
       interpolation_planners = {{lead_arm_group_name, lead_interpolation_planner}, {follow_arm_group_name, follow_interpolation_planner}};
+      carteisan_planners = {{lead_arm_group_name, lead_cartesian_planner}, {follow_arm_group_name, follow_cartesian_planner}};
     }else{
       planners = {{lead_arm_group_name, lead_sampling_planner}};
       interpolation_planners = {{lead_arm_group_name, lead_interpolation_planner}};
+      carteisan_planners = {{lead_arm_group_name, lead_cartesian_planner}};
     }
     
     if (if_cartesian_connect){
       GroupStringDict ik_endeffectors = {{follow_arm_group_name, follow_hand_group_name}, {lead_arm_group_name, lead_hand_group_name}};
 
       moveit::planning_interface::MoveGroupInterfacePtr follow_move_group_interface = std::make_shared<moveit::planning_interface::MoveGroupInterface>(node_, follow_arm_group_name);
-      auto stage_move_to_pick = std::make_unique<mtc::stages::ConnectMF>("move to pick", planners, interpolation_planners, follow_move_group_interface, visual_tools_);
+      auto stage_move_to_pick = std::make_unique<mtc::stages::ConnectMF>("move to pick", planners, interpolation_planners, carteisan_planners, follow_move_group_interface, visual_tools_);
       stage_move_to_pick->setTimeout(5.0);
       stage_move_to_pick->properties().configureInitFrom(mtc::Stage::PARENT);
       stage_move_to_pick->properties().set("lead_group", lead_arm_group_name);
@@ -944,7 +947,7 @@ mtc::Task MTCTaskNode::createTask(std::string& goal_frame_name, bool if_use_dual
   return task;
 }
 
-mtc::Task MTCTaskNode::createTestWaypointTask(std::string& goal_frame_name, bool if_use_dual, bool if_split_plan, bool if_cartesian_connect)
+mtc::Task MTCTaskNode::createTestWaypointTask(std::string& goal_frame_name, bool if_use_dual, bool if_split_plan, bool if_cartesian_connect, bool if_approach)
 {
   mtc::Task task;
   task.stages()->setName("test waypoint task");
@@ -1182,9 +1185,9 @@ int main(int argc, char** argv)
                     });
     }
 
-    // mtc_task_node->doTask(clip_id, false, true,
-    //                     [mtc_task_node](std::string& goal, bool dual, bool split) {
-    //                     return mtc_task_node->createTestWaypointTask(goal, dual, split);
+    // mtc_task_node->doTask(clip_id, false, true, false, false,
+    //                     [mtc_task_node](std::string& goal, bool dual, bool split, bool cartesian, bool approach) {
+    //                     return mtc_task_node->createTestWaypointTask(goal, dual, split, cartesian, approach);
     //                     });
 
     // mtc_task_node->doTask(clip_id, false, true, false,
