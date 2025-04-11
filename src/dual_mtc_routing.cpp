@@ -87,17 +87,24 @@ MTCTaskNode::MTCTaskNode(const rclcpp::NodeOptions& options)
   }
   RCLCPP_INFO(LOGGER, "Joint states received.");
 
+  // adapt flange to TCP transform based on the wrist sensor's height
   if (node_->get_parameter("use_sensone_left").as_bool()){
-    follow_flange_to_tcp_transform_.translation().z() = default_franka_flange_to_tcp_z + sensone_height; // Adjust this value based on the actual offset
+    follow_flange_to_tcp_transform_.translation().z() = default_franka_flange_to_tcp_z + sensone_height;
   }else{
-    follow_flange_to_tcp_transform_.translation().z() = default_franka_flange_to_tcp_z; // Adjust this value based on the actual offset
+    follow_flange_to_tcp_transform_.translation().z() = default_franka_flange_to_tcp_z; 
   }
+  RCLCPP_INFO(LOGGER, "Follower flange to TCP transform z: %f", follow_flange_to_tcp_transform_.translation().z());
 
   if (node_->get_parameter("use_sensone_right").as_bool()){
-    lead_flange_to_tcp_transform_.translation().z() = default_franka_flange_to_tcp_z + sensone_height; // Adjust this value based on the actual offset
+    lead_flange_to_tcp_transform_.translation().z() = default_franka_flange_to_tcp_z + sensone_height; 
   }else{
-    lead_flange_to_tcp_transform_.translation().z() = default_franka_flange_to_tcp_z; // Adjust this value based on the actual offset
+    lead_flange_to_tcp_transform_.translation().z() = default_franka_flange_to_tcp_z; 
   }
+  RCLCPP_INFO(LOGGER, "Leader flange to TCP transform z: %f", lead_flange_to_tcp_transform_.translation().z());
+  
+  // hand_to_TCP transform is different from flange_to_TCP transform, it is usually a fixed value if franka hand is not changed
+  hand_to_tcp_transform_ = Eigen::Isometry3d::Identity();
+  hand_to_tcp_transform_.translation().z() = 0.1034; 
 
   // Start the periodic update thread
   // update_thread_ = std::thread(&MTCTaskNode::periodicUpdate, this);
@@ -568,8 +575,8 @@ mtc::Task MTCTaskNode::createTask(std::string& goal_frame_name, bool if_use_dual
       stage_move_to_pick->properties().configureInitFrom(mtc::Stage::PARENT);
       stage_move_to_pick->properties().set("lead_group", lead_arm_group_name);
       stage_move_to_pick->properties().set("follow_group", follow_arm_group_name);      
-      stage_move_to_pick->properties().set("lead_flange_to_tcp_transform_z", lead_flange_to_tcp_transform_.translation().z());
-      stage_move_to_pick->properties().set("follow_flange_to_tcp_transform_z", follow_flange_to_tcp_transform_.translation().z());
+      stage_move_to_pick->properties().set("lead_hand_to_tcp_transform", hand_to_tcp_transform_);
+      stage_move_to_pick->properties().set("follow_hand_to_tcp_transform", hand_to_tcp_transform_);
       // stage_move_to_pick->properties().set("merge_mode", mtc::stages::ConnectMF::MergeMode::SEQUENTIAL);
       stage_move_to_pick->setEndEffector(ik_endeffectors);
 
@@ -815,7 +822,7 @@ mtc::Task MTCTaskNode::createTask(std::string& goal_frame_name, bool if_use_dual
       GroupStringDict ik_endeffectors = {{follow_arm_group_name, follow_hand_group_name}, {lead_arm_group_name, lead_hand_group_name}};
       GroupStringDict ik_hand_frames = {{follow_arm_group_name, follow_hand_frame}, {lead_arm_group_name, lead_hand_frame}, };
       // GroupStringDict ik_links = {{lead_arm_group, "right_arm_hand"}, {follow_arm_group, "left_arm_hand"}};
-      GroupPoseMatrixDict ik_frame_transforms = {{follow_arm_group_name, follow_flange_to_tcp_transform_}, {lead_arm_group_name, lead_flange_to_tcp_transform_}};
+      GroupPoseMatrixDict ik_frame_transforms = {{follow_arm_group_name, hand_to_tcp_transform_}, {lead_arm_group_name, hand_to_tcp_transform_}};
       GroupStringDict pre_grasp_pose = {{follow_arm_group_name, "close"}, {lead_arm_group_name, "close"}};
 
       // generate grasp pose, randomize for follower
