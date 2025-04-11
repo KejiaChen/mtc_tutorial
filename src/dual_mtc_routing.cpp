@@ -51,6 +51,8 @@ std::vector<double> insertion_vector = {-(insertion_offset+0.02), 0, 0};
 std::vector<double> leader_pre_clip = {(insertion_offset+clip_size[0]/2), -(clip_size[1]/2+hold_y_offset), clip_size[2]/2+hold_z_offset};
 std::vector<double> follower_pre_clip = {(insertion_offset+clip_size[0]/2), clip_size[1]/2+hold_y_offset, clip_size[2]/2+hold_z_offset}; 
 
+double default_franka_flange_to_tcp_z = 0.1034;
+double sensone_height = 0.036; 
 
 rclcpp::node_interfaces::NodeBaseInterface::SharedPtr MTCTaskNode::getNodeBaseInterface()
 {
@@ -62,7 +64,9 @@ MTCTaskNode::MTCTaskNode(const rclcpp::NodeOptions& options)
     move_group_(node_, "dual_arm"),  // for dual arm or single arm
     visual_tools_(node_, "world", rviz_visual_tools::RVIZ_MARKER_TOPIC, move_group_.getRobotModel(), true),
     tf_buffer_(node_->get_clock()), // Initialize TF Buffer with node clock
-    tf_listener_(tf_buffer_)       // Initialize TF Listener with TF Buffer
+    tf_listener_(tf_buffer_),       // Initialize TF Listener with TF Buffer
+    lead_flange_to_tcp_transform_(Eigen::Isometry3d::Identity()),
+    follow_flange_to_tcp_transform_(Eigen::Isometry3d::Identity())
 {
   visual_tools_.loadRemoteControl();
 
@@ -82,6 +86,18 @@ MTCTaskNode::MTCTaskNode(const rclcpp::NodeOptions& options)
     rclcpp::sleep_for(std::chrono::milliseconds(100));
   }
   RCLCPP_INFO(LOGGER, "Joint states received.");
+
+  if (node_->get_parameter("use_sensone_left").as_bool()){
+    follow_flange_to_tcp_transform_.translation().z() = default_franka_flange_to_tcp_z + sensone_height; // Adjust this value based on the actual offset
+  }else{
+    follow_flange_to_tcp_transform_.translation().z() = default_franka_flange_to_tcp_z; // Adjust this value based on the actual offset
+  }
+
+  if (node_->get_parameter("use_sensone_right").as_bool()){
+    lead_flange_to_tcp_transform_.translation().z() = default_franka_flange_to_tcp_z + sensone_height; // Adjust this value based on the actual offset
+  }else{
+    lead_flange_to_tcp_transform_.translation().z() = default_franka_flange_to_tcp_z; // Adjust this value based on the actual offset
+  }
 
   // Start the periodic update thread
   // update_thread_ = std::thread(&MTCTaskNode::periodicUpdate, this);
@@ -208,13 +224,13 @@ void MTCTaskNode::publishSolutionSubTraj(const moveit_task_constructor_msgs::msg
     robot_trajectory.joint_trajectory = sub_trajectory.trajectory.joint_trajectory;
 
     // Translation for Fingertips
-    Eigen::Isometry3d z_translation = Eigen::Isometry3d::Identity();
-    z_translation.translation().z() = 0.1034; // Adjust this value based on the actual offset
+    // Eigen::Isometry3d z_translation = Eigen::Isometry3d::Identity();
+    // z_translation.translation().z() = 0.1034; // Adjust this value based on the actual offset
 
     visual_tools_.publishTrajectoryLine(robot_trajectory, move_group_.getCurrentState()->getJointModelGroup(lead_arm_group_name),
-                                        z_translation, sub_trajectory.info.stage_id, "/home/tp2/ws_humble/trajectories_leader", rviz_visual_tools::ORANGE);
+                                        lead_flange_to_tcp_transform_, sub_trajectory.info.stage_id, "/home/tp2/ws_humble/trajectories_leader", rviz_visual_tools::ORANGE);
     visual_tools_.publishTrajectoryLine(robot_trajectory, move_group_.getCurrentState()->getJointModelGroup(follow_arm_group_name),
-                                        z_translation, sub_trajectory.info.stage_id, "/home/tp2/ws_humble/trajectories_follower", rviz_visual_tools::BLUE);
+                                        follow_flange_to_tcp_transform_, sub_trajectory.info.stage_id, "/home/tp2/ws_humble/trajectories_follower", rviz_visual_tools::BLUE);
     // visual_tools_.publishTrajectoryLine(robot_trajectory, move_group_.getCurrentState()->getLinkModel(lead_hand_frame));
     visual_tools_.trigger();
 
@@ -555,7 +571,9 @@ mtc::Task MTCTaskNode::createTask(std::string& goal_frame_name, bool if_use_dual
       stage_move_to_pick->setTimeout(5.0);
       stage_move_to_pick->properties().configureInitFrom(mtc::Stage::PARENT);
       stage_move_to_pick->properties().set("lead_group", lead_arm_group_name);
-      stage_move_to_pick->properties().set("follow_group", follow_arm_group_name);
+      stage_move_to_pick->properties().set("follow_group", follow_arm_group_name);      
+      stage_move_to_pick->properties().set("lead_flange_to_tcp_transform_z", lead_flange_to_tcp_transform_.translation().z());
+      stage_move_to_pick->properties().set("follow_flange_to_tcp_transform_z", follow_flange_to_tcp_transform_.translation().z());
       // stage_move_to_pick->properties().set("merge_mode", mtc::stages::ConnectMF::MergeMode::SEQUENTIAL);
       stage_move_to_pick->setEndEffector(ik_endeffectors);
 
@@ -661,13 +679,13 @@ mtc::Task MTCTaskNode::createTask(std::string& goal_frame_name, bool if_use_dual
       // stage->properties().set("link", lead_hand_frame);
 
       // IK frame at TCP
-      Eigen::Isometry3d lead_grasp_frame_transform = Eigen::Isometry3d::Identity();
-      lead_grasp_frame_transform.translation().z() = 0.1034;
-      Eigen::Isometry3d follow_grasp_frame_transform = Eigen::Isometry3d::Identity();
-      follow_grasp_frame_transform.translation().z() = 0.1034;
+      // Eigen::Isometry3d lead_grasp_frame_transform = Eigen::Isometry3d::Identity();
+      // lead_grasp_frame_transform.translation().z() = 0.1034;
+      // Eigen::Isometry3d follow_grasp_frame_transform = Eigen::Isometry3d::Identity();
+      // follow_grasp_frame_transform.translation().z() = 0.1034;
 
       GroupStringDict ik_hand_frames = {{follow_arm_group_name, follow_hand_frame}, {lead_arm_group_name, lead_hand_frame}};
-      GroupPoseMatrixDict ik_frame_transforms = {{follow_arm_group_name, follow_grasp_frame_transform}, {lead_arm_group_name, lead_grasp_frame_transform}};
+      GroupPoseMatrixDict ik_frame_transforms = {{follow_arm_group_name, follow_flange_to_tcp_transform_}, {lead_arm_group_name, lead_flange_to_tcp_transform_}};
       
       stage->setIKFrame(ik_frame_transforms, ik_hand_frames);
       stage->setGroup({follow_arm_group_name, lead_arm_group_name});
@@ -803,17 +821,17 @@ mtc::Task MTCTaskNode::createTask(std::string& goal_frame_name, bool if_use_dual
       GroupVectorDict orient_pairs = {{lead_arm_group_name, lead_goal_orient_vector}, {follow_arm_group_name, follow_goal_orient_vector}};
 
       // IK frame at TCP
-      Eigen::Isometry3d lead_grasp_frame_transform = Eigen::Isometry3d::Identity();
-      lead_grasp_frame_transform.translation().z() = 0.1034;
-      Eigen::Isometry3d follow_grasp_frame_transform = Eigen::Isometry3d::Identity();
-      follow_grasp_frame_transform.translation().z() = 0.1034;
+      // Eigen::Isometry3d lead_grasp_frame_transform = Eigen::Isometry3d::Identity();
+      // lead_grasp_frame_transform.translation().z() = 0.1034;
+      // Eigen::Isometry3d follow_grasp_frame_transform = Eigen::Isometry3d::Identity();
+      // follow_grasp_frame_transform.translation().z() = 0.1034;
 
       // IK groups
       std::vector<std::string> ik_groups = {follow_arm_group_name, lead_arm_group_name};
       GroupStringDict ik_endeffectors = {{follow_arm_group_name, follow_hand_group_name}, {lead_arm_group_name, lead_hand_group_name}};
       GroupStringDict ik_hand_frames = {{follow_arm_group_name, follow_hand_frame}, {lead_arm_group_name, lead_hand_frame}, };
       // GroupStringDict ik_links = {{lead_arm_group, "right_arm_hand"}, {follow_arm_group, "left_arm_hand"}};
-      GroupPoseMatrixDict ik_frame_transforms = {{follow_arm_group_name, follow_grasp_frame_transform}, {lead_arm_group_name, lead_grasp_frame_transform}};
+      GroupPoseMatrixDict ik_frame_transforms = {{follow_arm_group_name, follow_flange_to_tcp_transform_}, {lead_arm_group_name, lead_flange_to_tcp_transform_}};
       GroupStringDict pre_grasp_pose = {{follow_arm_group_name, "close"}, {lead_arm_group_name, "close"}};
 
       // generate grasp pose, randomize for follower
