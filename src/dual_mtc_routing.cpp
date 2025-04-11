@@ -223,10 +223,6 @@ void MTCTaskNode::publishSolutionSubTraj(const moveit_task_constructor_msgs::msg
     moveit_msgs::msg::RobotTrajectory robot_trajectory;
     robot_trajectory.joint_trajectory = sub_trajectory.trajectory.joint_trajectory;
 
-    // Translation for Fingertips
-    // Eigen::Isometry3d z_translation = Eigen::Isometry3d::Identity();
-    // z_translation.translation().z() = 0.1034; // Adjust this value based on the actual offset
-
     visual_tools_.publishTrajectoryLine(robot_trajectory, move_group_.getCurrentState()->getJointModelGroup(lead_arm_group_name),
                                         lead_flange_to_tcp_transform_, sub_trajectory.info.stage_id, "/home/tp2/ws_humble/trajectories_leader", rviz_visual_tools::ORANGE);
     visual_tools_.publishTrajectoryLine(robot_trajectory, move_group_.getCurrentState()->getJointModelGroup(follow_arm_group_name),
@@ -678,12 +674,6 @@ mtc::Task MTCTaskNode::createTask(std::string& goal_frame_name, bool if_use_dual
       stage->properties().set("marker_ns", "insertion");
       // stage->properties().set("link", lead_hand_frame);
 
-      // IK frame at TCP
-      // Eigen::Isometry3d lead_grasp_frame_transform = Eigen::Isometry3d::Identity();
-      // lead_grasp_frame_transform.translation().z() = 0.1034;
-      // Eigen::Isometry3d follow_grasp_frame_transform = Eigen::Isometry3d::Identity();
-      // follow_grasp_frame_transform.translation().z() = 0.1034;
-
       GroupStringDict ik_hand_frames = {{follow_arm_group_name, follow_hand_frame}, {lead_arm_group_name, lead_hand_frame}};
       GroupPoseMatrixDict ik_frame_transforms = {{follow_arm_group_name, follow_flange_to_tcp_transform_}, {lead_arm_group_name, lead_flange_to_tcp_transform_}};
       
@@ -819,12 +809,6 @@ mtc::Task MTCTaskNode::createTask(std::string& goal_frame_name, bool if_use_dual
       std::vector<double> follow_goal_orient_vector = {follow_target_pose.pose.orientation.x, follow_target_pose.pose.orientation.y, follow_target_pose.pose.position.z, follow_target_pose.pose.orientation.w};
       GroupVectorDict delta_pairs = {{lead_arm_group_name, lead_goal_delta_vector}, {follow_arm_group_name, follow_goal_delta_vector}};
       GroupVectorDict orient_pairs = {{lead_arm_group_name, lead_goal_orient_vector}, {follow_arm_group_name, follow_goal_orient_vector}};
-
-      // IK frame at TCP
-      // Eigen::Isometry3d lead_grasp_frame_transform = Eigen::Isometry3d::Identity();
-      // lead_grasp_frame_transform.translation().z() = 0.1034;
-      // Eigen::Isometry3d follow_grasp_frame_transform = Eigen::Isometry3d::Identity();
-      // follow_grasp_frame_transform.translation().z() = 0.1034;
 
       // IK groups
       std::vector<std::string> ik_groups = {follow_arm_group_name, lead_arm_group_name};
