@@ -13,6 +13,12 @@ def generate_launch_description():
         description="Path to the .scene file to be loaded",
     )
 
+    clip_file_arg = DeclareLaunchArgument(
+        "clip_file",
+        default_value="",  # Default file path
+        description="Optional path to the clip configuration file to be loaded",
+    )
+
     use_sensone_left = DeclareLaunchArgument(
         "use_sensone_left",
         default_value="false",
@@ -58,7 +64,9 @@ def generate_launch_description():
         parameters=[
             moveit_config.to_dict(),
         ],
-        arguments=[LaunchConfiguration("scene_file")],
+        arguments=[LaunchConfiguration("scene_file"),
+                   LaunchConfiguration("clip_file"),  # Pass clip_file even if it's empty
+        ],
     )
     
     dlo_model = Node(
@@ -70,4 +78,8 @@ def generate_launch_description():
     ],
     )
     
-    return LaunchDescription([use_sensone_left, use_sensone_right, scene_file_arg, load_scene])
+    return LaunchDescription([use_sensone_left, 
+                              use_sensone_right, 
+                              scene_file_arg, 
+                              clip_file_arg,
+                              load_scene])

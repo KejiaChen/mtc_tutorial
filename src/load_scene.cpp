@@ -87,7 +87,53 @@ void disableCollisions(const std::string &object_name, const std::string &base_n
     RCLCPP_INFO(rclcpp::get_logger("disable_collisions"), "Disabled collision between '%s' and '%s'", object_name.c_str(), base_name.c_str());
 }
 
-void loadCustomScene(const std::string &path, rclcpp::Node::SharedPtr move_group_node)
+bool readPosLine(std::string pos_line, bool is_is_clip_file, double &x, double &y, double &z)
+{   
+    double num_x, num_y, num_z;
+    if (!(std::istringstream(pos_line) >> num_x >> num_y >> num_z)){
+        return false;
+    }else{
+        if (is_is_clip_file){  
+            double unit = 0.304/20; // one board has length of 304mm with 20 units
+            double origin_x = 0.49;
+            double origin_y = 0.0;
+            x = (num_x - 0.5) * unit + origin_x;
+            y = (num_y - 0.5) * unit + origin_y;
+        }else{
+            x = num_x;
+            y = num_y;
+        }
+        z = num_z; // z is the height of fixture in mm
+        return true;
+    }
+
+}
+
+bool readOrientLine(std::string ori_line, bool is_is_clip_file, double &qx, double &qy, double &qz, double &qw)
+{
+    double num_x, num_y, num_z, num_w;
+    if (!(std::istringstream(ori_line) >> num_x >> num_y >> num_z >> num_w)){
+        return false;
+    }else{
+        if (is_is_clip_file){  
+            // Only consider num_z, which is the angle in degree
+            double Euler_z = num_z * M_PI / 180.0; // Convert to radians
+            // Obtain quaternion from Euler angles
+            qx = 0.0;
+            qy = 0.0;
+            qz = sin(Euler_z / 2.0);
+            qw = cos(Euler_z / 2.0);
+        }else{
+            qx = num_x;
+            qy = num_y;
+            qz = num_z;
+            qw = num_w;
+        }
+        return true;
+    }
+}
+
+void loadCustomScene(const std::string &path, rclcpp::Node::SharedPtr move_group_node, bool is_clip_file)
 {
     // planning_scene_monitor::LockedPlanningSceneRW ps(planning_scene_monitor);
     // if (!ps)
@@ -104,6 +150,15 @@ void loadCustomScene(const std::string &path, rclcpp::Node::SharedPtr move_group
                                                       move_group_interface.getRobotModel());
 
     ObjectTFBroadcaster object_tf_broadcaster(move_group_node);
+
+    if (is_clip_file)
+    {
+        RCLCPP_INFO(rclcpp::get_logger("load_scene"), "Loading clip file: %s", path.c_str());
+    }
+    else
+    {
+        RCLCPP_INFO(rclcpp::get_logger("load_scene"), "Loading scene file: %s", path.c_str());
+    }
 
     std::vector<moveit_msgs::msg::CollisionObject> collision_objects;
     std::ifstream fin(path);
@@ -133,11 +188,13 @@ void loadCustomScene(const std::string &path, rclcpp::Node::SharedPtr move_group
             double x, y, z, qx, qy, qz, qw, dx, dy, dz;
 
             // Read position
-            if (!std::getline(fin, pos_line) || !(std::istringstream(pos_line) >> x >> y >> z))
+            // if (!std::getline(fin, pos_line) || !(std::istringstream(pos_line) >> x >> y >> z))
+            if (!std::getline(fin, pos_line) || !readPosLine(pos_line, is_clip_file, x, y, z))
                 throw std::runtime_error("Invalid position line for object: " + object_name);
 
             // Read orientation
-            if (!std::getline(fin, ori_line) || !(std::istringstream(ori_line) >> qx >> qy >> qz >> qw))
+            // if (!std::getline(fin, ori_line) || !(std::istringstream(ori_line) >> qx >> qy >> qz >> qw))
+            if (!std::getline(fin, ori_line) || !readOrientLine(ori_line, is_clip_file, qx, qy, qz, qw))
                 throw std::runtime_error("Invalid orientation line for object: " + object_name);
 
             // Skip one line (the "1" marker)
@@ -224,12 +281,36 @@ int main(int argc, char **argv)
     std::string scene_file = argv[1];
     try
     {
-        loadCustomScene(scene_file, node);
+        loadCustomScene(scene_file, node, false);
         RCLCPP_INFO(node->get_logger(), "Scene loaded successfully!");
     }
     catch (const std::exception &e)
     {
         RCLCPP_ERROR(node->get_logger(), "Error loading scene: %s", e.what());
+    }
+
+    // sleep for a while
+    rclcpp::sleep_for(std::chrono::milliseconds(100));
+
+    // Load clip file if provided
+    if (argc > 2 && std::string(argv[2]).empty() == false)
+    {
+        std::string clip_file = argv[2];
+        RCLCPP_INFO(node->get_logger(), "Clip file provided: %s", clip_file.c_str());
+        
+        try
+        {
+            loadCustomScene(clip_file, node, true);
+            RCLCPP_INFO(node->get_logger(), "Clip loaded successfully!");
+        }
+        catch (const std::exception &e)
+        {
+            RCLCPP_ERROR(node->get_logger(), "Error loading clip: %s", e.what());
+        }
+    }   
+    else
+    {
+        RCLCPP_WARN(node->get_logger(), "No clip file provided.");
     }
 
     rclcpp::spin(node);
