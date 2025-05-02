@@ -221,7 +221,7 @@ moveit_visual_tools::MoveItVisualTools& MTCTaskNode::getVisualTools()
 }
 
 void MTCTaskNode::publishSolutionSubTraj(const moveit_task_constructor_msgs::msg::Solution& msg) {
-	
+	int index = 0;
   for (const moveit_task_constructor_msgs::msg::SubTrajectory& sub_trajectory : msg.sub_trajectory) {
     if (sub_trajectory.trajectory.joint_trajectory.points.empty())
       continue;
@@ -231,20 +231,26 @@ void MTCTaskNode::publishSolutionSubTraj(const moveit_task_constructor_msgs::msg
     robot_trajectory.joint_trajectory = sub_trajectory.trajectory.joint_trajectory;
 
     visual_tools_.publishTrajectoryLine(robot_trajectory, move_group_.getCurrentState()->getJointModelGroup(lead_arm_group_name),
-                                        lead_flange_to_tcp_transform_, sub_trajectory.info.stage_id, "/home/tp2/ws_humble/trajectories_leader", rviz_visual_tools::ORANGE);
+                                        lead_flange_to_tcp_transform_, sub_trajectory.info.stage_id, index, "/home/tp2/ws_humble/trajectories_leader", rviz_visual_tools::ORANGE);
     visual_tools_.publishTrajectoryLine(robot_trajectory, move_group_.getCurrentState()->getJointModelGroup(follow_arm_group_name),
-                                        follow_flange_to_tcp_transform_, sub_trajectory.info.stage_id, "/home/tp2/ws_humble/trajectories_follower", rviz_visual_tools::BLUE);
+                                        follow_flange_to_tcp_transform_, sub_trajectory.info.stage_id, index, "/home/tp2/ws_humble/trajectories_follower", rviz_visual_tools::BLUE);
     // visual_tools_.publishTrajectoryLine(robot_trajectory, move_group_.getCurrentState()->getLinkModel(lead_hand_frame));
     visual_tools_.trigger();
 
+    // renumber trajectory id
+    auto new_sub_trajectory = sub_trajectory;
+    new_sub_trajectory.info.id = index;
+
     // publish trajectories
-    subtrajectory_publisher_->publish(sub_trajectory);
-    RCLCPP_INFO_STREAM(LOGGER, "Published trajectory id " << sub_trajectory.info.id 
-                              << " for stage " << sub_trajectory.info.stage_id
-                              << " with "<< sub_trajectory.trajectory.joint_trajectory.points.size()
+    subtrajectory_publisher_->publish(new_sub_trajectory);
+    RCLCPP_INFO_STREAM(LOGGER, "Published subtrajectory id " << new_sub_trajectory.info.id 
+                              << " for stage " << new_sub_trajectory.info.stage_id
+                              << " with " << new_sub_trajectory.trajectory.joint_trajectory.points.size()
                               << " waypoints");
     visual_tools_.prompt("[Publishing] Press 'next' to publishing the next subtrajectory");
     rclcpp::sleep_for(std::chrono::milliseconds(100));
+
+    index++;
   }
   return;
 	

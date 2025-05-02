@@ -125,6 +125,7 @@ private:
   // Transform from flange to TCP
   Eigen::Isometry3d lead_flange_to_tcp_transform_;
   Eigen::Isometry3d follow_flange_to_tcp_transform_;
+  Eigen::Isometry3d hand_to_tcp_transform_;
 
   // Helper methods for internal setup
   void initializeGroups();
