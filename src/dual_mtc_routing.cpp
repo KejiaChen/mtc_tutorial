@@ -38,7 +38,7 @@ double desired_ee_distance = 0.1;
 // scene configuration
 std::vector<double> clip_size = {0.04, 0.04, 0.06};
 double insertion_offset_magnitude = 0.02;
-double grasp_follower_offset_magnitude = 0.02;
+double grasp_follower_offset_magnitude = 0.03;
 double grasp_leader_offset_magnitude = desired_ee_distance + grasp_follower_offset_magnitude;
 double hold_y_offset = 0.03;
 double hold_z_offset = 0.01;
@@ -541,111 +541,114 @@ mtc::Task MTCTaskNode::createTask(std::string& start_frame_name, std::string& go
   // Set up planners
   initializePlanners();
 
-//   /****************************************************
-//   ---- *               Open Hand                      *
-//   ***************************************************/
-//  {
-//     auto stage = std::make_unique<mtc::stages::MoveTo>("open hand", follow_interpolation_planner);
-//     stage->setGroup(follow_hand_group_name);
-//     stage->setGoal("open");
+  if (if_split_plan){
 
-//     pre_grasp_stage_ptr = stage.get();
+    /****************************************************
+    ---- *               Open Hand                      *
+    ***************************************************/
+    {
+        auto stage = std::make_unique<mtc::stages::MoveTo>("open hand", follow_interpolation_planner);
+        stage->setGroup(follow_hand_group_name);
+        stage->setGoal("open");
 
-//     task.add(std::move(stage));
-//  }
+        pre_grasp_stage_ptr = stage.get();
 
-//   // check if the start_frame_name is empty
-//   if (start_frame_name.empty()){
-//     RCLCPP_WARN(LOGGER, "Start frame name is empty, skipping the grasping stage");
-//   }else{
-//     /****************************************************
-//      *                                                  *
-//      *              Connect to Grasp                     *
-//      *                                                  *
-//      ***************************************************/
-//     { 
-//       mtc::stages::Connect::GroupPlannerVector planners;
-//       mtc::stages::Connect::GroupPlannerVector interpolation_planners;
-//       mtc::stages::ConnectMF::GroupCartPlannerVector carteisan_planners;
-//       if (if_use_dual){
-//         // The order is important for collision checking!
-//         planners = {{lead_arm_group_name, lead_sampling_planner}, {follow_arm_group_name, follow_sampling_planner}};
-//         interpolation_planners = {{lead_arm_group_name, lead_interpolation_planner}, {follow_arm_group_name, follow_interpolation_planner}};
-//         carteisan_planners = {{lead_arm_group_name, lead_cartesian_planner}, {follow_arm_group_name, follow_cartesian_planner}};
-//       }else{
-//         planners = {{lead_arm_group_name, lead_sampling_planner}};
-//         interpolation_planners = {{lead_arm_group_name, lead_interpolation_planner}};
-//         carteisan_planners = {{lead_arm_group_name, lead_cartesian_planner}};
-//       }
+        task.add(std::move(stage));
+    }
+
+    // check if the start_frame_name is empty
+    if (start_frame_name.empty()){
+      RCLCPP_WARN(LOGGER, "Start frame name is empty, skipping the grasping stage");
+    }else{
+      /****************************************************
+       *                                                  *
+       *              Connect to Grasp                     *
+       *                                                  *
+       ***************************************************/
+      { 
+        mtc::stages::Connect::GroupPlannerVector planners;
+        mtc::stages::Connect::GroupPlannerVector interpolation_planners;
+        mtc::stages::ConnectMF::GroupCartPlannerVector carteisan_planners;
+        if (if_use_dual){
+          // The order is important for collision checking!
+          planners = {{lead_arm_group_name, lead_sampling_planner}, {follow_arm_group_name, follow_sampling_planner}};
+          interpolation_planners = {{lead_arm_group_name, lead_interpolation_planner}, {follow_arm_group_name, follow_interpolation_planner}};
+          carteisan_planners = {{lead_arm_group_name, lead_cartesian_planner}, {follow_arm_group_name, follow_cartesian_planner}};
+        }else{
+          planners = {{lead_arm_group_name, lead_sampling_planner}};
+          interpolation_planners = {{lead_arm_group_name, lead_interpolation_planner}};
+          carteisan_planners = {{lead_arm_group_name, lead_cartesian_planner}};
+        }
+        
+        auto stage_move_to_align = std::make_unique<mtc::stages::ConnectMFSeq>("move to grasp", planners);
+        stage_move_to_align->setTimeout(5.0);
+        stage_move_to_align->properties().configureInitFrom(mtc::Stage::PARENT);
+        stage_move_to_align->properties().set("lead_group", lead_arm_group_name);
+        stage_move_to_align->properties().set("follow_group", follow_arm_group_name);  
+
+        // add path constraints
+        moveit_msgs::msg::Constraints path_constraints = createBoxConstraints(lead_hand_frame, lead_target_pose);
+        stage_move_to_align->setPathConstraints(path_constraints);
+        RCLCPP_INFO(LOGGER, "Path constraints set");
+
+        // stage_move_to_align->properties().set("merge_mode", mtc::stages::ConnectMF::MergeMode::SEQUENTIAL);
       
-//       auto stage_move_to_align = std::make_unique<mtc::stages::ConnectMFSeq>("move to grasp", planners);
-//       stage_move_to_align->setTimeout(5.0);
-//       stage_move_to_align->properties().configureInitFrom(mtc::Stage::PARENT);
-//       stage_move_to_align->properties().set("lead_group", lead_arm_group_name);
-//       stage_move_to_align->properties().set("follow_group", follow_arm_group_name);  
+        task.add(std::move(stage_move_to_align));
+      }
 
-//       // add path constraints
-//       moveit_msgs::msg::Constraints path_constraints = createBoxConstraints(lead_hand_frame, lead_target_pose);
-//       stage_move_to_align->setPathConstraints(path_constraints);
-//       RCLCPP_INFO(LOGGER, "Path constraints set");
+        /***************************************************
+      ---- * Generate Grasp Pose for dual arm              *
+        ***************************************************/
+      {
+        // Target positions in clip frame
+        GroupStringDict goal_frames = {{lead_arm_group_name, start_frame_name}, {follow_arm_group_name, start_frame_name}};
 
-//       // stage_move_to_align->properties().set("merge_mode", mtc::stages::ConnectMF::MergeMode::SEQUENTIAL);
-    
-//       task.add(std::move(stage_move_to_align));
-//     }
+        std::vector<double> lead_goal_delta_vector = {lead_grasp_pose.pose.position.x, lead_grasp_pose.pose.position.y, lead_grasp_pose.pose.position.z};
+        std::vector<double> follow_goal_delta_vector = {follow_grasp_pose.pose.position.x, follow_grasp_pose.pose.position.y, follow_grasp_pose.pose.position.z};
+        std::vector<double> lead_goal_orient_vector = {lead_grasp_pose.pose.orientation.x, lead_grasp_pose.pose.orientation.y, lead_grasp_pose.pose.position.z, lead_grasp_pose.pose.orientation.w};
+        std::vector<double> follow_goal_orient_vector = {follow_grasp_pose.pose.orientation.x, follow_grasp_pose.pose.orientation.y, follow_grasp_pose.pose.position.z, follow_grasp_pose.pose.orientation.w};
+        GroupVectorDict delta_pairs = {{lead_arm_group_name, lead_goal_delta_vector}, {follow_arm_group_name, follow_goal_delta_vector}};
+        GroupVectorDict orient_pairs = {{lead_arm_group_name, lead_goal_orient_vector}, {follow_arm_group_name, follow_goal_orient_vector}};
 
-//       /***************************************************
-//     ---- * Generate Grasp Pose for dual arm              *
-//       ***************************************************/
-//     {
-//       // Target positions in clip frame
-//       GroupStringDict goal_frames = {{lead_arm_group_name, start_frame_name}, {follow_arm_group_name, start_frame_name}};
+        // IK groups
+        std::vector<std::string> ik_groups = {follow_arm_group_name, lead_arm_group_name};
+        GroupStringDict ik_endeffectors = {{follow_arm_group_name, follow_hand_group_name}, {lead_arm_group_name, lead_hand_group_name}};
+        GroupStringDict ik_hand_frames = {{follow_arm_group_name, follow_hand_frame}, {lead_arm_group_name, lead_hand_frame}, };
+        // GroupStringDict ik_links = {{lead_arm_group, "right_arm_hand"}, {follow_arm_group, "left_arm_hand"}};
+        GroupPoseMatrixDict ik_frame_transforms = {{follow_arm_group_name, hand_to_tcp_transform_}, {lead_arm_group_name, hand_to_tcp_transform_}};
+        GroupStringDict pre_grasp_pose = {{follow_arm_group_name, "open"}, {lead_arm_group_name, "close"}};
 
-//       std::vector<double> lead_goal_delta_vector = {lead_grasp_pose.pose.position.x, lead_grasp_pose.pose.position.y, lead_grasp_pose.pose.position.z};
-//       std::vector<double> follow_goal_delta_vector = {follow_grasp_pose.pose.position.x, follow_grasp_pose.pose.position.y, follow_grasp_pose.pose.position.z};
-//       std::vector<double> lead_goal_orient_vector = {lead_grasp_pose.pose.orientation.x, lead_grasp_pose.pose.orientation.y, lead_grasp_pose.pose.position.z, lead_grasp_pose.pose.orientation.w};
-//       std::vector<double> follow_goal_orient_vector = {follow_grasp_pose.pose.orientation.x, follow_grasp_pose.pose.orientation.y, follow_grasp_pose.pose.position.z, follow_grasp_pose.pose.orientation.w};
-//       GroupVectorDict delta_pairs = {{lead_arm_group_name, lead_goal_delta_vector}, {follow_arm_group_name, follow_goal_delta_vector}};
-//       GroupVectorDict orient_pairs = {{lead_arm_group_name, lead_goal_orient_vector}, {follow_arm_group_name, follow_goal_orient_vector}};
+        // generate grasp pose, randomize for follower
+        auto grasp_generator = std::make_unique<mtc::stages::GenerateGraspPoseDual>("generate grasp pose dual", ik_groups);
+        grasp_generator->setEndEffector(ik_endeffectors);
+        grasp_generator->properties().set("marker_ns", "grasp_pose");
+        grasp_generator->properties().set("explr_axis", "y");
+        grasp_generator->setAngleDelta(0.2); // enumerate over angles from 0 to 6.4 (less then 2 PI)
+        grasp_generator->setPreGraspPose(pre_grasp_pose);
+        grasp_generator->setGraspPose("close");
+        grasp_generator->setObject(goal_frames); // object sets target pose frame
+        grasp_generator->setTargetDelta(delta_pairs);
+        grasp_generator->setTargetOrient(orient_pairs);
+        grasp_generator->setMonitoredStage(pre_grasp_stage_ptr);
+        grasp_generator->properties().set("generate_group", follow_arm_group_name);
+        grasp_generator->properties().set("planning_frame", start_frame_name);
 
-//       // IK groups
-//       std::vector<std::string> ik_groups = {follow_arm_group_name, lead_arm_group_name};
-//       GroupStringDict ik_endeffectors = {{follow_arm_group_name, follow_hand_group_name}, {lead_arm_group_name, lead_hand_group_name}};
-//       GroupStringDict ik_hand_frames = {{follow_arm_group_name, follow_hand_frame}, {lead_arm_group_name, lead_hand_frame}, };
-//       // GroupStringDict ik_links = {{lead_arm_group, "right_arm_hand"}, {follow_arm_group, "left_arm_hand"}};
-//       GroupPoseMatrixDict ik_frame_transforms = {{follow_arm_group_name, hand_to_tcp_transform_}, {lead_arm_group_name, hand_to_tcp_transform_}};
-//       GroupStringDict pre_grasp_pose = {{follow_arm_group_name, "open"}, {lead_arm_group_name, "close"}};
+        // Compute IK
+        auto ik_wrapper = std::make_unique<mtc::stages::ComputeIKMultiple>("grasping pose IK", std::move(grasp_generator), ik_groups, dual_arm_group_name);
+        ik_wrapper->setSubGroups(ik_groups);
+        ik_wrapper->setGroup(dual_arm_group_name);
+        ik_wrapper->setEndEffector(ik_endeffectors);
+        // ik_wrapper->properties().configureInitFrom(Stage::PARENT, { "eef", "group" });
+        ik_wrapper->properties().configureInitFrom(mtc::Stage::INTERFACE, {"target_poses"});
+        // ik_wrapper->properties().set("object", "object");
+        ik_wrapper->setMaxIKSolutions(10);
+        ik_wrapper->setMinSolutionDistance(1.0);
+        ik_wrapper->setIKFrame(ik_frame_transforms, ik_hand_frames);
 
-//       // generate grasp pose, randomize for follower
-//       auto grasp_generator = std::make_unique<mtc::stages::GenerateGraspPoseDual>("generate grasp pose dual", ik_groups);
-//       grasp_generator->setEndEffector(ik_endeffectors);
-//       grasp_generator->properties().set("marker_ns", "grasp_pose");
-//       grasp_generator->properties().set("explr_axis", "y");
-//       grasp_generator->setAngleDelta(0.2); // enumerate over angles from 0 to 6.4 (less then 2 PI)
-//       grasp_generator->setPreGraspPose(pre_grasp_pose);
-//       grasp_generator->setGraspPose("close");
-//       grasp_generator->setObject(goal_frames); // object sets target pose frame
-//       grasp_generator->setTargetDelta(delta_pairs);
-//       grasp_generator->setTargetOrient(orient_pairs);
-//       grasp_generator->setMonitoredStage(pre_grasp_stage_ptr);
-//       grasp_generator->properties().set("generate_group", follow_arm_group_name);
-//       grasp_generator->properties().set("planning_frame", start_frame_name);
-
-//       // Compute IK
-//       auto ik_wrapper = std::make_unique<mtc::stages::ComputeIKMultiple>("grasping pose IK", std::move(grasp_generator), ik_groups, dual_arm_group_name);
-//       ik_wrapper->setSubGroups(ik_groups);
-//       ik_wrapper->setGroup(dual_arm_group_name);
-//       ik_wrapper->setEndEffector(ik_endeffectors);
-//       // ik_wrapper->properties().configureInitFrom(Stage::PARENT, { "eef", "group" });
-//       ik_wrapper->properties().configureInitFrom(mtc::Stage::INTERFACE, {"target_poses"});
-//       // ik_wrapper->properties().set("object", "object");
-//       ik_wrapper->setMaxIKSolutions(10);
-//       ik_wrapper->setMinSolutionDistance(1.0);
-//       ik_wrapper->setIKFrame(ik_frame_transforms, ik_hand_frames);
-
-//       task.add(std::move(ik_wrapper));
-//     }
-//  }
+        task.add(std::move(ik_wrapper));
+      }
+    }
+  }
 
   /****************************************************
   ---- *               Follower Grasping              *
@@ -683,22 +686,42 @@ mtc::Task MTCTaskNode::createTask(std::string& start_frame_name, std::string& go
       GroupStringDict ik_endeffectors = {{follow_arm_group_name, follow_hand_group_name}, {lead_arm_group_name, lead_hand_group_name}};
 
       moveit::planning_interface::MoveGroupInterfacePtr follow_move_group_interface = std::make_shared<moveit::planning_interface::MoveGroupInterface>(node_, follow_arm_group_name);
-      auto stage_move_to_align = std::make_unique<mtc::stages::ConnectMF>("move to align", planners, interpolation_planners, carteisan_planners, follow_move_group_interface, visual_tools_);
-      stage_move_to_align->setTimeout(5.0);
-      stage_move_to_align->properties().configureInitFrom(mtc::Stage::PARENT);
-      stage_move_to_align->properties().set("lead_group", lead_arm_group_name);
-      stage_move_to_align->properties().set("follow_group", follow_arm_group_name);      
-      stage_move_to_align->properties().set("lead_hand_to_tcp_transform", hand_to_tcp_transform_);
-      stage_move_to_align->properties().set("follow_hand_to_tcp_transform", hand_to_tcp_transform_);
-      // stage_move_to_align->properties().set("merge_mode", mtc::stages::ConnectMF::MergeMode::SEQUENTIAL);
-      stage_move_to_align->setEndEffector(ik_endeffectors);
+      
+      if (if_split_plan){
+        auto stage_move_to_align = std::make_unique<mtc::stages::ConnectMFPrl>("move to align", planners, interpolation_planners, carteisan_planners, follow_move_group_interface, visual_tools_);
+        stage_move_to_align->setTimeout(5.0);
+        stage_move_to_align->properties().configureInitFrom(mtc::Stage::PARENT);
+        stage_move_to_align->properties().set("lead_group", lead_arm_group_name);
+        stage_move_to_align->properties().set("follow_group", follow_arm_group_name);      
+        stage_move_to_align->properties().set("lead_hand_to_tcp_transform", hand_to_tcp_transform_);
+        stage_move_to_align->properties().set("follow_hand_to_tcp_transform", hand_to_tcp_transform_);
+        // stage_move_to_align->properties().set("merge_mode", mtc::stages::ConnectMF::MergeMode::SEQUENTIAL);
+        stage_move_to_align->setEndEffector(ik_endeffectors);
 
-      // add path constraints
-      moveit_msgs::msg::Constraints path_constraints = createBoxConstraints(lead_hand_frame, lead_target_pose);
-      stage_move_to_align->setPathConstraints(path_constraints);
-      RCLCPP_INFO(LOGGER, "Path constraints set");
+        // add path constraints
+        moveit_msgs::msg::Constraints path_constraints = createBoxConstraints(lead_hand_frame, lead_target_pose);
+        stage_move_to_align->setPathConstraints(path_constraints);
+        RCLCPP_INFO(LOGGER, "Path constraints set");
 
-      task.add(std::move(stage_move_to_align));
+        task.add(std::move(stage_move_to_align));
+      }else{
+        auto stage_move_to_align = std::make_unique<mtc::stages::ConnectMF>("move to align", planners, interpolation_planners, carteisan_planners, follow_move_group_interface, visual_tools_);
+        stage_move_to_align->setTimeout(5.0);
+        stage_move_to_align->properties().configureInitFrom(mtc::Stage::PARENT);
+        stage_move_to_align->properties().set("lead_group", lead_arm_group_name);
+        stage_move_to_align->properties().set("follow_group", follow_arm_group_name);      
+        stage_move_to_align->properties().set("lead_hand_to_tcp_transform", hand_to_tcp_transform_);
+        stage_move_to_align->properties().set("follow_hand_to_tcp_transform", hand_to_tcp_transform_);
+        // stage_move_to_align->properties().set("merge_mode", mtc::stages::ConnectMF::MergeMode::SEQUENTIAL);
+        stage_move_to_align->setEndEffector(ik_endeffectors);
+
+        // add path constraints
+        moveit_msgs::msg::Constraints path_constraints = createBoxConstraints(lead_hand_frame, lead_target_pose);
+        stage_move_to_align->setPathConstraints(path_constraints);
+        RCLCPP_INFO(LOGGER, "Path constraints set");
+
+        task.add(std::move(stage_move_to_align));
+      }
 
     }else{
       auto stage_move_to_align = std::make_unique<mtc::stages::Connect>("move to align", planners);
@@ -922,7 +945,7 @@ mtc::Task MTCTaskNode::createTask(std::string& start_frame_name, std::string& go
   /****************************************************
   ---- *    Generate Target Pose for dual arm *
 	***************************************************/
-    if (if_use_dual && !if_split_plan){
+    if (if_use_dual){
       // Target positions in clip frame
       GroupStringDict goal_frames = {{lead_arm_group_name, goal_frame_name}, {follow_arm_group_name, goal_frame_name}};
 
@@ -1221,8 +1244,8 @@ mtc::Task MTCTaskNode::createPostTask(std::string& start_frame_name, std::string
     ***************************************************/
   {
     auto stage =
-        std::make_unique<mtc::stages::MoveRelative>("insertion", follow_cartesian_planner);
-    stage->properties().set("marker_ns", "insertion");
+        std::make_unique<mtc::stages::MoveRelative>("lift", follow_cartesian_planner);
+    stage->properties().set("marker_ns", "lift");
     stage->properties().set("link", follow_hand_frame);
     // stage->properties().configureInitFrom(mtc::Stage::PARENT, { "group" });
     stage->setGroup(follow_arm_group_name);
@@ -1299,7 +1322,7 @@ int main(int argc, char** argv)
       // from the second clip on, set the orientation and add approach
       mtc_task_node->setSelectOrientation(true);
 
-      mtc_task_node->doTask(prev_clip_id, clip_id, true, true, false, true, false,
+      mtc_task_node->doTask(prev_clip_id, clip_id, true, true, true, true, true,
                       [mtc_task_node](std::string& start, std::string& goal, bool dual, bool split, bool cartesian, bool approach) {
                       return mtc_task_node->createTask(start, goal, dual, split, cartesian, approach);
                       });

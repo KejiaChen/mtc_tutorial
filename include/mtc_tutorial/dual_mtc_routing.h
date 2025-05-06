@@ -49,15 +49,15 @@ public:
   moveit_visual_tools::MoveItVisualTools& getVisualTools();
 
   // Compose an MTC task from a series of stages.
-  mtc::Task createTask(std::string& goal_frame_name, bool if_use_dual, bool if_split_plan, bool if_cartesian_connect, bool if_approach);
-  mtc::Task createPostTask(std::string& goal_frame_name, bool if_use_dual, bool if_split_plan, bool if_cartesian_connect, bool if_approach);
+  mtc::Task createTask(std::string& start_frame_name, std::string& goal_frame_name, bool if_use_dual, bool if_split_plan, bool if_cartesian_connect, bool if_approach);
+  mtc::Task createPostTask(std::string& start_frame_name, std::string& goal_frame_name, bool if_use_dual, bool if_split_plan, bool if_cartesian_connect, bool if_approach);
   mtc::Task createTestWaypointTask(std::string& goal_frame_name, bool if_use_dual, bool if_split_plan, bool if_cartesian_connect, bool if_approach);
 
   // publish mtc sub_trajectory
   void publishSolutionSubTraj(const moveit_task_constructor_msgs::msg::Solution& msg);
 
-  void doTask(std::string& goal_clip_id, bool execute, bool plan_for_dual, bool cartesian_connect, bool approach,
-              std::function<mtc::Task(std::string&, bool, bool, bool, bool)> createTaskFn);
+  void doTask(std::string& start_clip_id, std::string& goal_clip_id, bool execute, bool plan_for_dual, bool split, bool cartesian_connect, 
+            bool approach, std::function<mtc::Task(std::string&, std::string&, bool, bool, bool, bool)> createTaskFn);
   void updatePlanningScene();
 
   void setSelectOrientation(bool select_orientation) { select_orientation_ = select_orientation; }
@@ -68,10 +68,12 @@ public:
   std::string lead_arm_group_name;
   std::string lead_hand_group_name;
   std::string lead_hand_frame;
+  std::string lead_base_frame;
 
   std::string follow_arm_group_name;
   std::string follow_hand_group_name;
   std::string follow_hand_frame;
+  std::string follow_base_frame;
 
   std::string dual_arm_group_name;
 
