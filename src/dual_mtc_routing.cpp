@@ -38,7 +38,7 @@ double desired_ee_distance = 0.1;
 // scene configuration
 std::vector<double> clip_size = {0.04, 0.04, 0.06};
 double insertion_offset_magnitude = 0.02;
-double grasp_follower_offset_magnitude = 0.03;
+double grasp_follower_offset_magnitude = 0.02;
 double grasp_leader_offset_magnitude = desired_ee_distance + grasp_follower_offset_magnitude;
 double hold_y_offset = 0.03;
 double hold_z_offset = 0.01;
@@ -99,6 +99,8 @@ MTCTaskNode::MTCTaskNode(const rclcpp::NodeOptions& options)
   }else{
     follow_flange_to_tcp_transform_.translation().z() = default_franka_flange_to_tcp_z; 
   }
+  // set rotation to 45 degree around z axis
+  follow_flange_to_tcp_transform_.rotate(Eigen::AngleAxisd(M_PI/2, Eigen::Vector3d::UnitZ())); // link8 rotates 45 degree around z axis to tcp
   RCLCPP_INFO(LOGGER, "Follower flange to TCP transform z: %f", follow_flange_to_tcp_transform_.translation().z());
 
   if (node_->get_parameter("use_sensone_right").as_bool()){
@@ -106,6 +108,7 @@ MTCTaskNode::MTCTaskNode(const rclcpp::NodeOptions& options)
   }else{
     lead_flange_to_tcp_transform_.translation().z() = default_franka_flange_to_tcp_z; 
   }
+  lead_flange_to_tcp_transform_.rotate(Eigen::AngleAxisd(M_PI/2, Eigen::Vector3d::UnitZ())); // link8 rotates 45 degree around z axis to tcp
   RCLCPP_INFO(LOGGER, "Leader flange to TCP transform z: %f", lead_flange_to_tcp_transform_.translation().z());
   
   // hand_to_TCP transform is different from flange_to_TCP transform, it is usually a fixed value if franka hand is not changed
