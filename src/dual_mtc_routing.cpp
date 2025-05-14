@@ -38,7 +38,7 @@ double desired_ee_distance = 0.1;
 // scene configuration
 std::vector<double> clip_size = {0.04, 0.04, 0.06};
 double insertion_offset_magnitude = 0.02;
-double grasp_follower_offset_magnitude = 0.02;
+double grasp_follower_offset_magnitude = 0.03;
 double grasp_leader_offset_magnitude = desired_ee_distance + grasp_follower_offset_magnitude;
 double hold_y_offset = 0.03;
 double hold_z_offset = 0.01;
@@ -100,7 +100,7 @@ MTCTaskNode::MTCTaskNode(const rclcpp::NodeOptions& options)
     follow_flange_to_tcp_transform_.translation().z() = default_franka_flange_to_tcp_z; 
   }
   // set rotation to 45 degree around z axis
-  follow_flange_to_tcp_transform_.rotate(Eigen::AngleAxisd(M_PI/2, Eigen::Vector3d::UnitZ())); // link8 rotates 45 degree around z axis to tcp
+  follow_flange_to_tcp_transform_.rotate(Eigen::AngleAxisd(-M_PI/4, Eigen::Vector3d::UnitZ())); // link8 rotates 45 degree around z axis to tcp
   RCLCPP_INFO(LOGGER, "Follower flange to TCP transform z: %f", follow_flange_to_tcp_transform_.translation().z());
 
   if (node_->get_parameter("use_sensone_right").as_bool()){
@@ -108,7 +108,7 @@ MTCTaskNode::MTCTaskNode(const rclcpp::NodeOptions& options)
   }else{
     lead_flange_to_tcp_transform_.translation().z() = default_franka_flange_to_tcp_z; 
   }
-  lead_flange_to_tcp_transform_.rotate(Eigen::AngleAxisd(M_PI/2, Eigen::Vector3d::UnitZ())); // link8 rotates 45 degree around z axis to tcp
+  lead_flange_to_tcp_transform_.rotate(Eigen::AngleAxisd(-M_PI/4, Eigen::Vector3d::UnitZ())); // link8 rotates 45 degree around z axis to tcp
   RCLCPP_INFO(LOGGER, "Leader flange to TCP transform z: %f", lead_flange_to_tcp_transform_.translation().z());
   
   // hand_to_TCP transform is different from flange_to_TCP transform, it is usually a fixed value if franka hand is not changed
@@ -357,9 +357,39 @@ std::pair<geometry_msgs::msg::PoseStamped, geometry_msgs::msg::PoseStamped> MTCT
   if (target_pose_1_transformed.pose.position.y > target_pose_2_transformed.pose.position.y){
     leader_target_pose = target_pose_1;
     follower_target_pose = target_pose_2;
+
+    // Rotate follow_target_pose around the x-axis by 45 degrees
+    Eigen::AngleAxisd follow_rotation(-M_PI / 4, Eigen::Vector3d::UnitX());
+    Eigen::Quaterniond current_orientation(follower_target_pose.pose.orientation.w,
+                                          follower_target_pose.pose.orientation.x,
+                                          follower_target_pose.pose.orientation.y,
+                                          follower_target_pose.pose.orientation.z);
+
+    // Apply the rotation
+    Eigen::Quaterniond updated_orientation = follow_rotation * current_orientation;
+    // Update the pose's orientation
+    follower_target_pose.pose.orientation.w = updated_orientation.w();
+    follower_target_pose.pose.orientation.x = updated_orientation.x();
+    follower_target_pose.pose.orientation.y = updated_orientation.y();
+    follower_target_pose.pose.orientation.z = updated_orientation.z();
   } else {
     leader_target_pose = target_pose_2;
     follower_target_pose = target_pose_1;
+
+    // Rotate follow_target_pose around the x-axis by 45 degrees
+    Eigen::AngleAxisd follow_rotation(M_PI / 4, Eigen::Vector3d::UnitX());
+    Eigen::Quaterniond current_orientation(follower_target_pose.pose.orientation.w,
+                                          follower_target_pose.pose.orientation.x,
+                                          follower_target_pose.pose.orientation.y,
+                                          follower_target_pose.pose.orientation.z);
+
+    // Apply the rotation
+    Eigen::Quaterniond updated_orientation = follow_rotation * current_orientation;
+    // Update the pose's orientation
+    follower_target_pose.pose.orientation.w = updated_orientation.w();
+    follower_target_pose.pose.orientation.x = updated_orientation.x();
+    follower_target_pose.pose.orientation.y = updated_orientation.y();
+    follower_target_pose.pose.orientation.z = updated_orientation.z();
   }
 
   return std::make_pair(leader_target_pose, follower_target_pose);
@@ -599,6 +629,45 @@ mtc::Task MTCTaskNode::createTask(std::string& start_frame_name, std::string& go
         task.add(std::move(stage_move_to_align));
       }
 
+    // /****************************************************
+    // ---- *   Fixed Grasp Pose for dual arm *
+    // ***************************************************/
+      // {
+      //   // Fixed align pose
+      //   auto dual_grasped_pose = std::make_unique<mtc::stages::FixedCartesianPosesMultiple>("dual grasping pose");
+      //   GroupPoseDict pose_pairs = {{follow_arm_group_name, follow_grasp_pose}, {lead_arm_group_name, lead_grasp_pose}};
+      //   dual_grasped_pose->addPosePair(pose_pairs);
+      //   dual_grasped_pose->setMonitoredStage(pre_grasp_stage_ptr);
+
+      //   // IK frame at TCP
+      //   Eigen::Isometry3d lead_grasp_frame_transform = Eigen::Isometry3d::Identity();
+      //   lead_grasp_frame_transform.translation().z() = 0.1034;
+      //   Eigen::Isometry3d follow_grasp_frame_transform = Eigen::Isometry3d::Identity();
+      //   follow_grasp_frame_transform.translation().z() = 0.1034;
+
+      //   // IK groups
+      //   std::vector<std::string> ik_groups = {follow_arm_group_name, lead_arm_group_name};
+      //   GroupStringDict ik_endeffectors = {{follow_arm_group_name, follow_hand_group_name}, {lead_arm_group_name, lead_hand_group_name}};
+      //   GroupStringDict ik_hand_frames = {{follow_arm_group_name, follow_hand_frame}, {lead_arm_group_name, lead_hand_frame}, };
+      //   // GroupStringDict ik_links = {{lead_arm_group, "right_arm_hand"}, {follow_arm_group, "left_arm_hand"}};
+      //   GroupPoseMatrixDict ik_frame_transforms = {{follow_arm_group_name, follow_grasp_frame_transform}, {lead_arm_group_name, lead_grasp_frame_transform}};
+
+      //   // Compute IK
+      //   auto ik_wrapper = std::make_unique<mtc::stages::ComputeIKMultiple>("grasping pose IK", std::move(dual_grasped_pose), ik_groups, dual_arm_group_name);
+      //   ik_wrapper->setSubGroups(ik_groups);
+      //   ik_wrapper->setGroup(dual_arm_group_name);
+      //   ik_wrapper->setEndEffector(ik_endeffectors);
+      //   // ik_wrapper->properties().configureInitFrom(Stage::PARENT, { "eef", "group" });
+      //   ik_wrapper->properties().configureInitFrom(mtc::Stage::INTERFACE, {"target_poses"});
+      //   // ik_wrapper->properties().set("object", "object");
+      //   ik_wrapper->setMaxIKSolutions(20);
+      //   ik_wrapper->setMinSolutionDistance(1.0);
+      //   ik_wrapper->setIKFrame(ik_frame_transforms, ik_hand_frames);
+
+      //   task.add(std::move(ik_wrapper));
+
+      // }
+
         /***************************************************
       ---- * Generate Grasp Pose for dual arm              *
         ***************************************************/
@@ -606,12 +675,13 @@ mtc::Task MTCTaskNode::createTask(std::string& start_frame_name, std::string& go
         // Target positions in clip frame
         GroupStringDict goal_frames = {{lead_arm_group_name, start_frame_name}, {follow_arm_group_name, start_frame_name}};
 
-        std::vector<double> lead_goal_delta_vector = {lead_grasp_pose.pose.position.x, lead_grasp_pose.pose.position.y, lead_grasp_pose.pose.position.z};
-        std::vector<double> follow_goal_delta_vector = {follow_grasp_pose.pose.position.x, follow_grasp_pose.pose.position.y, follow_grasp_pose.pose.position.z};
-        std::vector<double> lead_goal_orient_vector = {lead_grasp_pose.pose.orientation.x, lead_grasp_pose.pose.orientation.y, lead_grasp_pose.pose.position.z, lead_grasp_pose.pose.orientation.w};
-        std::vector<double> follow_goal_orient_vector = {follow_grasp_pose.pose.orientation.x, follow_grasp_pose.pose.orientation.y, follow_grasp_pose.pose.position.z, follow_grasp_pose.pose.orientation.w};
-        GroupVectorDict delta_pairs = {{lead_arm_group_name, lead_goal_delta_vector}, {follow_arm_group_name, follow_goal_delta_vector}};
-        GroupVectorDict orient_pairs = {{lead_arm_group_name, lead_goal_orient_vector}, {follow_arm_group_name, follow_goal_orient_vector}};
+        // std::vector<double> lead_goal_delta_vector = {lead_grasp_pose.pose.position.x, lead_grasp_pose.pose.position.y, lead_grasp_pose.pose.position.z};
+        // std::vector<double> follow_goal_delta_vector = {follow_grasp_pose.pose.position.x, follow_grasp_pose.pose.position.y, follow_grasp_pose.pose.position.z};
+        // std::vector<double> lead_goal_orient_vector = {lead_grasp_pose.pose.orientation.x, lead_grasp_pose.pose.orientation.y, lead_grasp_pose.pose.position.z, lead_grasp_pose.pose.orientation.w};
+        // std::vector<double> follow_goal_orient_vector = {follow_grasp_pose.pose.orientation.x, follow_grasp_pose.pose.orientation.y, follow_grasp_pose.pose.position.z, follow_grasp_pose.pose.orientation.w};
+        // GroupVectorDict delta_pairs = {{lead_arm_group_name, lead_goal_delta_vector}, {follow_arm_group_name, follow_goal_delta_vector}};
+        // GroupVectorDict orient_pairs = {{lead_arm_group_name, lead_goal_orient_vector}, {follow_arm_group_name, follow_goal_orient_vector}};
+        GroupPoseDict pose_pairs = {{follow_arm_group_name, follow_grasp_pose}, {lead_arm_group_name, lead_grasp_pose}};
 
         // IK groups
         std::vector<std::string> ik_groups = {follow_arm_group_name, lead_arm_group_name};
@@ -630,8 +700,9 @@ mtc::Task MTCTaskNode::createTask(std::string& start_frame_name, std::string& go
         grasp_generator->setPreGraspPose(pre_grasp_pose);
         grasp_generator->setGraspPose("close");
         grasp_generator->setObject(goal_frames); // object sets target pose frame
-        grasp_generator->setTargetDelta(delta_pairs);
-        grasp_generator->setTargetOrient(orient_pairs);
+        grasp_generator->setTargetPoseInObject(pose_pairs);
+        // grasp_generator->setTargetDelta(delta_pairs);
+        // grasp_generator->setTargetOrient(orient_pairs);
         grasp_generator->setMonitoredStage(pre_grasp_stage_ptr);
         grasp_generator->properties().set("generate_group", follow_arm_group_name);
         grasp_generator->properties().set("planning_frame", start_frame_name);
@@ -715,6 +786,12 @@ mtc::Task MTCTaskNode::createTask(std::string& start_frame_name, std::string& go
         stage_move_to_align->properties().set("follow_group", follow_arm_group_name);      
         stage_move_to_align->properties().set("lead_hand_to_tcp_transform", hand_to_tcp_transform_);
         stage_move_to_align->properties().set("follow_hand_to_tcp_transform", hand_to_tcp_transform_);
+        
+        geometry_msgs::msg::PoseStamped leader_grasp_pose_transformed = getPoseTransform(lead_grasp_pose, "world");
+        stage_move_to_align->properties().set("lead_grasp_pose", leader_grasp_pose_transformed);
+        
+        stage_move_to_align->properties().set("track_offset", 0.1);
+        stage_move_to_align->properties().set("folllow_grasp_offset", 0.03);
         // stage_move_to_align->properties().set("merge_mode", mtc::stages::ConnectMF::MergeMode::SEQUENTIAL);
         stage_move_to_align->setEndEffector(ik_endeffectors);
 
@@ -908,43 +985,43 @@ mtc::Task MTCTaskNode::createTask(std::string& start_frame_name, std::string& go
     // }
 
   //   /****************************************************
-  // ---- *   Fixed Align Pose for dual arm *
+  // ---- *   Fixed Target Pose for dual arm *
 	// ***************************************************/
-  //   {
-  //     // Fixed align pose
-  //     auto dual_fixed_pose = std::make_unique<mtc::stages::FixedCartesianPosesMultiple>("dual fixed clipping pose");
-  //     GroupPoseDict pose_pairs = {{follow_arm_group_name, follow_target_pose}, {lead_arm_group_name, lead_target_pose}};
-  //     dual_fixed_pose->addPosePair(pose_pairs);
-  //     dual_fixed_pose->setMonitoredStage(pre_move_stage_ptr);
+    // {
+    //   // Fixed align pose
+    //   auto dual_fixed_pose = std::make_unique<mtc::stages::FixedCartesianPosesMultiple>("dual fixed clipping pose");
+    //   GroupPoseDict pose_pairs = {{follow_arm_group_name, follow_target_pose}, {lead_arm_group_name, lead_target_pose}};
+    //   dual_fixed_pose->addPosePair(pose_pairs);
+    //   dual_fixed_pose->setMonitoredStage(pre_move_stage_ptr);
 
-  //     // IK frame at TCP
-  //     Eigen::Isometry3d lead_grasp_frame_transform = Eigen::Isometry3d::Identity();
-  //     lead_grasp_frame_transform.translation().z() = 0.1034;
-  //     Eigen::Isometry3d follow_grasp_frame_transform = Eigen::Isometry3d::Identity();
-  //     follow_grasp_frame_transform.translation().z() = 0.1034;
+    //   // IK frame at TCP
+    //   Eigen::Isometry3d lead_grasp_frame_transform = Eigen::Isometry3d::Identity();
+    //   lead_grasp_frame_transform.translation().z() = 0.1034;
+    //   Eigen::Isometry3d follow_grasp_frame_transform = Eigen::Isometry3d::Identity();
+    //   follow_grasp_frame_transform.translation().z() = 0.1034;
 
-  //     // IK groups
-  //     std::vector<std::string> ik_groups = {follow_arm_group_name, lead_arm_group_name};
-  //     GroupStringDict ik_endeffectors = {{follow_arm_group_name, follow_hand_group_name}, {lead_arm_group_name, lead_hand_group_name}};
-  //     GroupStringDict ik_hand_frames = {{follow_arm_group_name, follow_hand_frame}, {lead_arm_group_name, lead_hand_frame}, };
-  //     // GroupStringDict ik_links = {{lead_arm_group, "right_arm_hand"}, {follow_arm_group, "left_arm_hand"}};
-  //     GroupPoseMatrixDict ik_frame_transforms = {{follow_arm_group_name, follow_grasp_frame_transform}, {lead_arm_group_name, lead_grasp_frame_transform}};
+    //   // IK groups
+    //   std::vector<std::string> ik_groups = {follow_arm_group_name, lead_arm_group_name};
+    //   GroupStringDict ik_endeffectors = {{follow_arm_group_name, follow_hand_group_name}, {lead_arm_group_name, lead_hand_group_name}};
+    //   GroupStringDict ik_hand_frames = {{follow_arm_group_name, follow_hand_frame}, {lead_arm_group_name, lead_hand_frame}, };
+    //   // GroupStringDict ik_links = {{lead_arm_group, "right_arm_hand"}, {follow_arm_group, "left_arm_hand"}};
+    //   GroupPoseMatrixDict ik_frame_transforms = {{follow_arm_group_name, follow_grasp_frame_transform}, {lead_arm_group_name, lead_grasp_frame_transform}};
 
-  //     // Compute IK
-  //     auto ik_wrapper = std::make_unique<mtc::stages::ComputeIKMultiple>("clipping pose IK", std::move(dual_fixed_pose), ik_groups, dual_arm_group_name);
-  //     ik_wrapper->setSubGroups(ik_groups);
-  //     ik_wrapper->setGroup(dual_arm_group_name);
-  //     ik_wrapper->setEndEffector(ik_endeffectors);
-  //     // ik_wrapper->properties().configureInitFrom(Stage::PARENT, { "eef", "group" });
-  //     ik_wrapper->properties().configureInitFrom(mtc::Stage::INTERFACE, {"target_poses"});
-  //     // ik_wrapper->properties().set("object", "object");
-  //     ik_wrapper->setMaxIKSolutions(5);
-  //     ik_wrapper->setMinSolutionDistance(1.0);
-  //     ik_wrapper->setIKFrame(ik_frame_transforms, ik_hand_frames);
+    //   // Compute IK
+    //   auto ik_wrapper = std::make_unique<mtc::stages::ComputeIKMultiple>("clipping pose IK", std::move(dual_fixed_pose), ik_groups, dual_arm_group_name);
+    //   ik_wrapper->setSubGroups(ik_groups);
+    //   ik_wrapper->setGroup(dual_arm_group_name);
+    //   ik_wrapper->setEndEffector(ik_endeffectors);
+    //   // ik_wrapper->properties().configureInitFrom(Stage::PARENT, { "eef", "group" });
+    //   ik_wrapper->properties().configureInitFrom(mtc::Stage::INTERFACE, {"target_poses"});
+    //   // ik_wrapper->properties().set("object", "object");
+    //   ik_wrapper->setMaxIKSolutions(20);
+    //   ik_wrapper->setMinSolutionDistance(1.0);
+    //   ik_wrapper->setIKFrame(ik_frame_transforms, ik_hand_frames);
 
-  //     align->insert(std::move(ik_wrapper));
+    //   align->insert(std::move(ik_wrapper));
+    // }
 
-  //   }
   /****************************************************
   ---- *    Generate Target Pose for dual arm *
 	***************************************************/
@@ -952,12 +1029,14 @@ mtc::Task MTCTaskNode::createTask(std::string& start_frame_name, std::string& go
       // Target positions in clip frame
       GroupStringDict goal_frames = {{lead_arm_group_name, goal_frame_name}, {follow_arm_group_name, goal_frame_name}};
 
-      std::vector<double> lead_goal_delta_vector = {lead_target_pose.pose.position.x, lead_target_pose.pose.position.y, lead_target_pose.pose.position.z};
-      std::vector<double> follow_goal_delta_vector = {follow_target_pose.pose.position.x, follow_target_pose.pose.position.y, follow_target_pose.pose.position.z};
-      std::vector<double> lead_goal_orient_vector = {lead_target_pose.pose.orientation.x, lead_target_pose.pose.orientation.y, lead_target_pose.pose.position.z, lead_target_pose.pose.orientation.w};
-      std::vector<double> follow_goal_orient_vector = {follow_target_pose.pose.orientation.x, follow_target_pose.pose.orientation.y, follow_target_pose.pose.position.z, follow_target_pose.pose.orientation.w};
-      GroupVectorDict delta_pairs = {{lead_arm_group_name, lead_goal_delta_vector}, {follow_arm_group_name, follow_goal_delta_vector}};
-      GroupVectorDict orient_pairs = {{lead_arm_group_name, lead_goal_orient_vector}, {follow_arm_group_name, follow_goal_orient_vector}};
+      // std::vector<double> lead_goal_delta_vector = {lead_target_pose.pose.position.x, lead_target_pose.pose.position.y, lead_target_pose.pose.position.z};
+      // std::vector<double> follow_goal_delta_vector = {follow_target_pose.pose.position.x, follow_target_pose.pose.position.y, follow_target_pose.pose.position.z};
+      // std::vector<double> lead_goal_orient_vector = {lead_target_pose.pose.orientation.x, lead_target_pose.pose.orientation.y, lead_target_pose.pose.position.z, lead_target_pose.pose.orientation.w};
+      // std::vector<double> follow_goal_orient_vector = {follow_target_pose.pose.orientation.x, follow_target_pose.pose.orientation.y, follow_target_pose.pose.position.z, follow_target_pose.pose.orientation.w};
+      // GroupVectorDict delta_pairs = {{lead_arm_group_name, lead_goal_delta_vector}, {follow_arm_group_name, follow_goal_delta_vector}};
+      // GroupVectorDict orient_pairs = {{lead_arm_group_name, lead_goal_orient_vector}, {follow_arm_group_name, follow_goal_orient_vector}};
+      
+      GroupPoseDict pose_pairs = {{follow_arm_group_name, follow_target_pose}, {lead_arm_group_name, lead_target_pose}};
 
       // IK groups
       std::vector<std::string> ik_groups = {follow_arm_group_name, lead_arm_group_name};
@@ -971,13 +1050,14 @@ mtc::Task MTCTaskNode::createTask(std::string& start_frame_name, std::string& go
       auto grasp_generator = std::make_unique<mtc::stages::GenerateGraspPoseDual>("generate clipping pose", ik_groups);
       grasp_generator->setEndEffector(ik_endeffectors);
       grasp_generator->properties().set("marker_ns", "align_pose");
-      grasp_generator->properties().set("explr_axis", "y");
+      grasp_generator->properties().set("explr_axis", "x");
       grasp_generator->setAngleDelta(0.2); // enumerate over angles from 0 to 6.4 (less then 2 PI)
       grasp_generator->setPreGraspPose(pre_grasp_pose);
       grasp_generator->setGraspPose("close");
       grasp_generator->setObject(goal_frames); // object sets target pose frame
-      grasp_generator->setTargetDelta(delta_pairs);
-      grasp_generator->setTargetOrient(orient_pairs);
+      grasp_generator->setTargetPoseInObject(pose_pairs);
+      // grasp_generator->setTargetDelta(delta_pairs);
+      // grasp_generator->setTargetOrient(orient_pairs);
       grasp_generator->setMonitoredStage(pre_move_stage_ptr);
       grasp_generator->properties().set("generate_group", follow_arm_group_name);
       grasp_generator->properties().set("planning_frame", goal_frame_name);
@@ -995,7 +1075,6 @@ mtc::Task MTCTaskNode::createTask(std::string& start_frame_name, std::string& go
       ik_wrapper->setIKFrame(ik_frame_transforms, ik_hand_frames);
 
       align->insert(std::move(ik_wrapper));
-
     }
     /****************************************************
   ---- *               Allow Collision (hand object)   *
@@ -1325,13 +1404,13 @@ int main(int argc, char** argv)
       // from the second clip on, set the orientation and add approach
       mtc_task_node->setSelectOrientation(true);
 
-      mtc_task_node->doTask(prev_clip_id, clip_id, true, true, true, true, true,
+      mtc_task_node->doTask(prev_clip_id, clip_id, true, true, false, true, true,
                       [mtc_task_node](std::string& start, std::string& goal, bool dual, bool split, bool cartesian, bool approach) {
                       return mtc_task_node->createTask(start, goal, dual, split, cartesian, approach);
                       });
       
     }else{
-      mtc_task_node->doTask(prev_clip_id, clip_id, false, true, false, false, false,
+      mtc_task_node->doTask(prev_clip_id, clip_id, false, true, false, false, true,
                     [mtc_task_node](std::string& start, std::string& goal, bool dual, bool split, bool cartesian, bool approach) {
                     return mtc_task_node->createTask(start, goal, dual, split, cartesian, approach);
                     });
