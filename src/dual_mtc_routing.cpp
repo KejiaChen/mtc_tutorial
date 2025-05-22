@@ -55,8 +55,8 @@ std::vector<double> insertion_vector = {-(insertion_offset_magnitude+0.02), 0, 0
 // offset in clip frame
 std::vector<double> leader_pre_insert_offset = {(insertion_offset_magnitude+clip_size[0]/2), -(clip_size[1]/2+hold_y_offset), clip_size[2]/2+hold_z_offset};
 std::vector<double> follower_pre_insert_offset = {(insertion_offset_magnitude+clip_size[0]/2), clip_size[1]/2+hold_y_offset, clip_size[2]/2+hold_z_offset}; 
-std::vector<double> leader_grasp_offset = {clip_size[0]/2, -(clip_size[1]/2+grasp_leader_offset_magnitude), clip_size[2]/2+hold_z_offset};
-std::vector<double> follower_grasp_offset = {clip_size[0]/2, -(clip_size[1]/2+grasp_follower_offset_magnitude), clip_size[2]/2+hold_z_offset};
+std::vector<double> leader_grasp_offset = {0, -(clip_size[1]/2+grasp_leader_offset_magnitude), clip_size[2]/2+hold_z_offset};
+std::vector<double> follower_grasp_offset = {0, -(clip_size[1]/2+grasp_follower_offset_magnitude), clip_size[2]/2+hold_z_offset};
 double default_franka_flange_to_tcp_z = 0.1034;
 double sensone_height = 0.036; 
 
@@ -93,6 +93,8 @@ MTCTaskNode::MTCTaskNode(const rclcpp::NodeOptions& options)
   }
   RCLCPP_INFO(LOGGER, "Joint states received.");
 
+  // CAUTION: flange_to_tcp stands for the transform from panda_link_8 to TCP
+  // In comparison to hand_to_tcp, there is additional rotation of 45 degree around z axis, and an optional z offset because of wrist snesor
   // adapt flange to TCP transform based on the wrist sensor's height
   if (node_->get_parameter("use_sensone_left").as_bool()){
     follow_flange_to_tcp_transform_.translation().z() = default_franka_flange_to_tcp_z + sensone_height;
@@ -149,7 +151,8 @@ void MTCTaskNode::initializeGroups()
 }
 
 void MTCTaskNode::initializePlanners()
-{
+{ 
+    std::string chomp_pipeline_name = "chomp";
     // Lead arm planners
     lead_sampling_planner = std::make_shared<mtc::solvers::PipelinePlanner>(node_);
     lead_sampling_planner->setMaxVelocityScalingFactor(0.05);
@@ -158,9 +161,13 @@ void MTCTaskNode::initializePlanners()
     lead_interpolation_planner = std::make_shared<mtc::solvers::JointInterpolationPlanner>();
 
     lead_cartesian_planner = std::make_shared<mtc::solvers::CartesianPath>();
-    lead_cartesian_planner->setMaxVelocityScalingFactor(0.05);
-    lead_cartesian_planner->setMaxAccelerationScalingFactor(0.05);
-    lead_cartesian_planner->setStepSize(0.001);
+    lead_cartesian_planner->setMaxVelocityScalingFactor(1.0);
+    lead_cartesian_planner->setMaxAccelerationScalingFactor(1.0);
+    lead_cartesian_planner->setStepSize(0.01);
+
+    lead_chomp_planner = std::make_shared<mtc::solvers::PipelinePlanner>(node_, chomp_pipeline_name);
+    lead_chomp_planner->setMaxVelocityScalingFactor(0.05);
+    lead_chomp_planner->setMaxAccelerationScalingFactor(0.05);
 
     // Follow arm planners
     follow_sampling_planner = std::make_shared<mtc::solvers::PipelinePlanner>(node_);
@@ -170,9 +177,13 @@ void MTCTaskNode::initializePlanners()
     follow_interpolation_planner = std::make_shared<mtc::solvers::JointInterpolationPlanner>();
 
     follow_cartesian_planner = std::make_shared<mtc::solvers::CartesianPath>();
-    follow_cartesian_planner->setMaxVelocityScalingFactor(0.05);
-    follow_cartesian_planner->setMaxAccelerationScalingFactor(0.05);
-    follow_cartesian_planner->setStepSize(0.001);
+    follow_cartesian_planner->setMaxVelocityScalingFactor(1.0);
+    follow_cartesian_planner->setMaxAccelerationScalingFactor(1.0);
+    follow_cartesian_planner->setStepSize(0.01);
+
+    follow_chomp_planner = std::make_shared<mtc::solvers::PipelinePlanner>(node_, chomp_pipeline_name);
+    follow_chomp_planner->setMaxVelocityScalingFactor(0.05);
+    follow_chomp_planner->setMaxAccelerationScalingFactor(0.05);
 }
 
  void MTCTaskNode::jointStateCallback(const sensor_msgs::msg::JointState::SharedPtr msg)
@@ -745,11 +756,13 @@ mtc::Task MTCTaskNode::createTask(std::string& start_frame_name, std::string& go
     mtc::stages::Connect::GroupPlannerVector planners;
     mtc::stages::Connect::GroupPlannerVector interpolation_planners;
     mtc::stages::ConnectMF::GroupCartPlannerVector carteisan_planners;
+    mtc::stages::ConnectMFReverse::GroupPipePlannerVector chomp_planners;
     if (if_use_dual){
       // The order is important for collision checking!
       planners = {{lead_arm_group_name, lead_sampling_planner}, {follow_arm_group_name, follow_sampling_planner}};
       interpolation_planners = {{lead_arm_group_name, lead_interpolation_planner}, {follow_arm_group_name, follow_interpolation_planner}};
       carteisan_planners = {{lead_arm_group_name, lead_cartesian_planner}, {follow_arm_group_name, follow_cartesian_planner}};
+      chomp_planners = {{lead_arm_group_name, lead_chomp_planner}, {follow_arm_group_name, follow_chomp_planner}};
     }else{
       planners = {{lead_arm_group_name, lead_sampling_planner}};
       interpolation_planners = {{lead_arm_group_name, lead_interpolation_planner}};
@@ -759,6 +772,7 @@ mtc::Task MTCTaskNode::createTask(std::string& start_frame_name, std::string& go
     if (if_cartesian_connect){
       GroupStringDict ik_endeffectors = {{follow_arm_group_name, follow_hand_group_name}, {lead_arm_group_name, lead_hand_group_name}};
 
+      moveit::planning_interface::MoveGroupInterfacePtr lead_move_group_interface = std::make_shared<moveit::planning_interface::MoveGroupInterface>(node_, lead_arm_group_name);
       moveit::planning_interface::MoveGroupInterfacePtr follow_move_group_interface = std::make_shared<moveit::planning_interface::MoveGroupInterface>(node_, follow_arm_group_name);
       
       if (if_split_plan){
@@ -779,14 +793,41 @@ mtc::Task MTCTaskNode::createTask(std::string& start_frame_name, std::string& go
 
         task.add(std::move(stage_move_to_align));
       }else{
-        auto stage_move_to_align = std::make_unique<mtc::stages::ConnectMF>("move to align", planners, interpolation_planners, carteisan_planners, follow_move_group_interface, visual_tools_);
+        // auto stage_move_to_align = std::make_unique<mtc::stages::ConnectMF>("move to align", planners, interpolation_planners, carteisan_planners, follow_move_group_interface, visual_tools_);
+        // stage_move_to_align->setTimeout(5.0);
+        // stage_move_to_align->properties().configureInitFrom(mtc::Stage::PARENT);
+        // stage_move_to_align->properties().set("lead_group", lead_arm_group_name);
+        // stage_move_to_align->properties().set("follow_group", follow_arm_group_name);      
+        // stage_move_to_align->properties().set("lead_hand_to_tcp_transform", hand_to_tcp_transform_);
+        // stage_move_to_align->properties().set("follow_hand_to_tcp_transform", hand_to_tcp_transform_);
+        
+        // geometry_msgs::msg::PoseStamped leader_grasp_pose_transformed = getPoseTransform(lead_grasp_pose, "world");
+        // stage_move_to_align->properties().set("lead_grasp_pose", leader_grasp_pose_transformed);
+        
+        // stage_move_to_align->properties().set("track_offset", 0.1);
+        // stage_move_to_align->properties().set("folllow_grasp_offset", 0.03);
+        // // stage_move_to_align->properties().set("merge_mode", mtc::stages::ConnectMF::MergeMode::SEQUENTIAL);
+        // stage_move_to_align->setEndEffector(ik_endeffectors);
+
+        // // add path constraints
+        // moveit_msgs::msg::Constraints path_constraints = createBoxConstraints(lead_hand_frame, lead_target_pose);
+        // stage_move_to_align->setPathConstraints(path_constraints);
+        // RCLCPP_INFO(LOGGER, "Path constraints set");
+
+        // task.add(std::move(stage_move_to_align));
+
+        auto stage_move_to_align = std::make_unique<mtc::stages::ConnectMFReverse>("move to align", planners, interpolation_planners, carteisan_planners, chomp_planners,
+                                                                                    lead_move_group_interface, visual_tools_);
         stage_move_to_align->setTimeout(5.0);
         stage_move_to_align->properties().configureInitFrom(mtc::Stage::PARENT);
         stage_move_to_align->properties().set("lead_group", lead_arm_group_name);
         stage_move_to_align->properties().set("follow_group", follow_arm_group_name);      
-        stage_move_to_align->properties().set("lead_hand_to_tcp_transform", hand_to_tcp_transform_);
-        stage_move_to_align->properties().set("follow_hand_to_tcp_transform", hand_to_tcp_transform_);
+        stage_move_to_align->properties().set("hand_to_tcp_transform", hand_to_tcp_transform_);
+        stage_move_to_align->properties().set("lead_flange_to_tcp_transform", lead_flange_to_tcp_transform_);
+        stage_move_to_align->properties().set("follow_flange_to_tcp_transform", follow_flange_to_tcp_transform_);
         
+        geometry_msgs::msg::PoseStamped follower_grasp_pose_transformed = getPoseTransform(follow_grasp_pose, "world");
+        stage_move_to_align->properties().set("follow_grasp_pose", follower_grasp_pose_transformed);
         geometry_msgs::msg::PoseStamped leader_grasp_pose_transformed = getPoseTransform(lead_grasp_pose, "world");
         stage_move_to_align->properties().set("lead_grasp_pose", leader_grasp_pose_transformed);
         
@@ -1404,7 +1445,7 @@ int main(int argc, char** argv)
       // from the second clip on, set the orientation and add approach
       mtc_task_node->setSelectOrientation(true);
 
-      mtc_task_node->doTask(prev_clip_id, clip_id, true, true, false, true, true,
+      mtc_task_node->doTask(prev_clip_id, clip_id, true, true, false, true , true,
                       [mtc_task_node](std::string& start, std::string& goal, bool dual, bool split, bool cartesian, bool approach) {
                       return mtc_task_node->createTask(start, goal, dual, split, cartesian, approach);
                       });
