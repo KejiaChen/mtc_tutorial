@@ -196,20 +196,20 @@ int main(int argc, char** argv) {
                     if (clip_poses.count(start_clip)){
                         line_start_pose = poseToIsometry(clip_poses[start_clip]);
                         line_starts.push_back(line_start_pose.translation());
-                    }
 
-                    // except the last clip
-                    if (i < clip_names.size() - 1) {
-                        const auto& end_clip = clip_names[i + 1];
-                        if (clip_poses.count(end_clip)) {
-                            line_end_pose = poseToIsometry(clip_poses[end_clip]);
-                            line_ends.push_back(line_end_pose.translation());
+                        // except the last clip
+                        if (i < clip_names.size() - 1) {
+                            const auto& end_clip = clip_names[i + 1];
+                            if (clip_poses.count(end_clip)) {
+                                line_end_pose = poseToIsometry(clip_poses[end_clip]);
+                                line_ends.push_back(line_end_pose.translation());
+                            }
+                        }else{
+                            // place holder for the last clip, will be updated later with transform
+                            line_ends.push_back(line_start_pose.translation());
+                            line_starts.push_back(line_start_pose.translation());
+                            line_ends.push_back(line_start_pose.translation());
                         }
-                    }else{
-                        // place holder for the last clip, will be updated later with transform
-                        line_ends.push_back(line_start_pose.translation());
-                        line_starts.push_back(line_start_pose.translation());
-                        line_ends.push_back(line_start_pose.translation());
                     }
                 }
 
@@ -249,7 +249,9 @@ int main(int argc, char** argv) {
             // bool publishing = visual_tools->publishLine(line_marker_start, line_marker_end, line_marker_color, line_marker_scale, 1);
             for (size_t i = 0; i < line_starts.size(); ++i) {
                 visual_tools.publishLine(line_starts[i], line_ends[i], line_marker_color, line_marker_scale, i); // Pass 'i' as the ID
-                // RCLCPP_INFO(LOGGER, "Published line marker %zu", i);
+                RCLCPP_INFO(LOGGER, "Published line marker %zu between start: (%f, %f, %f) and end: (%f, %f, %f)", 
+                            i, line_starts[i].x(), line_starts[i].y(), line_starts[i].z(),
+                            line_ends[i].x(), line_ends[i].y(), line_ends[i].z());
             }
 
             visual_tools.trigger();
