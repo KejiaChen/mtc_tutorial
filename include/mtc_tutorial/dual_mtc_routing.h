@@ -14,6 +14,8 @@
 #include <moveit_task_constructor_msgs/msg/sub_trajectory.hpp>
 #include <tf2_ros/buffer.h>
 #include <tf2_ros/transform_listener.h>
+#include <boost/asio.hpp>
+#include <nlohmann/json.hpp>
 
 #if __has_include(<tf2_geometry_msgs/tf2_geometry_msgs.hpp>)
 #include <tf2_geometry_msgs/tf2_geometry_msgs.hpp>
@@ -50,8 +52,39 @@ public:
 
   // Compose an MTC task from a series of stages.
   mtc::Task createTask(std::string& start_frame_name, std::string& goal_frame_name, bool if_use_dual, bool if_split_plan, bool if_cartesian_connect, bool if_approach);
+  mtc::Task createReverseTask(std::string& start_frame_name, std::string& goal_frame_name, bool if_use_dual, bool if_split_plan, bool if_cartesian_connect, bool if_approach);
   mtc::Task createPostTask(std::string& start_frame_name, std::string& goal_frame_name, bool if_use_dual, bool if_split_plan, bool if_cartesian_connect, bool if_approach);
   mtc::Task createTestWaypointTask(std::string& goal_frame_name, bool if_use_dual, bool if_split_plan, bool if_cartesian_connect, bool if_approach);
+  mtc::Task createHomingTask(std::string& start_frame_name, std::string& goal_frame_name, bool if_use_dual, bool if_split_plan, bool if_cartesian_connect, bool if_approach);
+
+  // synchronization with real-world
+  void udpReceiverSync(const std::string& host, int port,
+                    std::vector<double>& joint_positions,
+                    std::mutex& joint_positions_mutex,
+                    std::condition_variable& joint_positions_condition_variable,
+                    std::vector<double>& ee_pose,
+                    std::mutex& ee_pose_mutex);
+
+  mtc::Task createGoalJointTask(std::string arm_group_name, 
+                                std::string hand_group_name, 
+                                std::string hand_frame,
+                                std::mutex& joint_positions_mutex,
+                                std::vector<double>& joint_positions,
+                                std::vector<std::string>& joint_names,
+                                std::shared_ptr<mtc::solvers::PipelinePlanner> sampling_planner);
+  
+ bool doSyncTask(std::string arm_group_name, 
+                std::string hand_group_name, 
+                std::string hand_frame,
+                std::mutex& joint_positions_mutex,
+                std::vector<double>& joint_positions,
+                std::vector<std::string>& joint_names,
+                std::condition_variable& joint_positions_condition_variable,
+                std::atomic<bool>& joint_data_received_flag,
+                std::shared_ptr<mtc::solvers::PipelinePlanner> sampling_planner
+                );
+
+  void syncwithRealWorld();
 
   // publish mtc sub_trajectory
   void publishSolutionSubTraj(const moveit_task_constructor_msgs::msg::Solution& msg);
@@ -82,9 +115,13 @@ public:
   std::shared_ptr<mtc::solvers::JointInterpolationPlanner> lead_interpolation_planner;
   std::shared_ptr<mtc::solvers::CartesianPath> lead_cartesian_planner;
 
+  std::shared_ptr<mtc::solvers::PipelinePlanner> lead_chomp_planner;
+
   std::shared_ptr<mtc::solvers::PipelinePlanner> follow_sampling_planner;
   std::shared_ptr<mtc::solvers::JointInterpolationPlanner> follow_interpolation_planner;
   std::shared_ptr<mtc::solvers::CartesianPath> follow_cartesian_planner;
+
+  std::shared_ptr<mtc::solvers::PipelinePlanner> follow_chomp_planner;
 
 private:
   geometry_msgs::msg::PoseStamped getPoseTransform(const geometry_msgs::msg::PoseStamped& pose, const std::string& target_frame);
@@ -132,6 +169,30 @@ private:
   // Helper methods for internal setup
   void initializeGroups();
   void initializePlanners();
+
+  // synchronization variables
+  std::thread udp_thread_lead_sync_;
+  std::thread udp_thread_follow_sync_;
+
+  // Flags to indicate that joint data has been received
+  std::atomic<bool> lead_joint_data_received_{false};
+  std::atomic<bool> follow_joint_data_received_{false};
+  
+  std::mutex lead_joint_positions_mutex_,
+              follow_joint_positions_mutex_,
+              lead_ee_pose_mutex_,
+              follow_ee_pose_mutex_;
+  
+  std::condition_variable lead_joint_positions_condition_variable_,
+                          follow_joint_positions_condition_variable_;
+
+  std::vector<double> lead_joint_positions_;
+  std::vector<double> follow_joint_positions_;
+  std::vector<double> lead_ee_pose_;
+  std::vector<double> follow_ee_pose_;
+  std::vector<std::string> lead_franka_joint_names_ = {"right_panda_joint1", "right_panda_joint2", "right_panda_joint3", "right_panda_joint4", "right_panda_joint5", "right_panda_joint6", "right_panda_joint7"};
+  std::vector<std::string> follow_franka_joint_names_ = {"left_panda_joint1", "left_panda_joint2", "left_panda_joint3", "left_panda_joint4", "left_panda_joint5", "left_panda_joint6", "left_panda_joint7"};
+  std::atomic<bool> sync_udp_running_{true}; // Flag to control the UDP sync thread
 };
 
 #endif  // MTC_TASK_NODE_H

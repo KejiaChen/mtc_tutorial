@@ -26,10 +26,13 @@
 #include <vector>
 
 #include <mtc_tutorial/dual_mtc_routing.h>
+#include <moveit/task_constructor/stages/noop.h>
 // #include <moveit/task_constructor/task_routing.h>
 // #include <moveit_task_constructor_msgs/msg/clip_names.hpp>
 // #include <moveit_msgs>
 
+using boost::asio::ip::udp;
+using json = nlohmann::json;
 
 static const rclcpp::Logger LOGGER = rclcpp::get_logger("mtc_node");
 
@@ -93,6 +96,29 @@ MTCTaskNode::MTCTaskNode(const rclcpp::NodeOptions& options)
   }
   RCLCPP_INFO(LOGGER, "Joint states received.");
 
+  // initialize udp sync with real-world
+  udp_thread_lead_sync_ = std::thread(&MTCTaskNode::udpReceiverSync, // member function pointer
+                                      this,                          // object pointer (this class instance)
+                                      "10.157.175.222",                 // host
+                                      6305,                          // port
+                                      std::ref(lead_joint_positions_),              // reference to class member
+                                      std::ref(lead_joint_positions_mutex_),        // mutex
+                                      std::ref(lead_joint_positions_condition_variable_), // condition variable
+                                      std::ref(lead_ee_pose_),                      // EE pose vector
+                                      std::ref(lead_ee_pose_mutex_)                 // EE pose mutex
+                                      );
+
+  udp_thread_follow_sync_ = std::thread(&MTCTaskNode::udpReceiverSync, // member function pointer
+                                        this,                          // object pointer (this class instance)
+                                        "10.157.175.222",
+                                        6306,                          // port
+                                        std::ref(follow_joint_positions_),              // EE pose mutex
+                                        std::ref(follow_joint_positions_mutex_),        // mutex
+                                        std::ref(follow_joint_positions_condition_variable_), // condition variable
+                                        std::ref(follow_ee_pose_),                      // EE pose vector
+                                        std::ref(follow_ee_pose_mutex_)                 // EE pose mutex
+                                        );
+
   // CAUTION: flange_to_tcp stands for the transform from panda_link_8 to TCP
   // In comparison to hand_to_tcp, there is additional rotation of 45 degree around z axis, and an optional z offset because of wrist snesor
   // adapt flange to TCP transform based on the wrist sensor's height
@@ -127,10 +153,22 @@ MTCTaskNode::MTCTaskNode(const rclcpp::NodeOptions& options)
 // Destructor
 MTCTaskNode::~MTCTaskNode()
 {
-  stop_thread_ = true; // Signal the thread to stop
-  if (update_thread_.joinable())
-  {
-    update_thread_.join(); // Wait for the thread to finish
+  // stop_thread_ = true; // Signal the thread to stop
+  // if (update_thread_.joinable())
+  // {
+  //   update_thread_.join(); // Wait for the thread to finish
+  // }
+
+  // stop the UDP receiver thread
+  sync_udp_running_ = false; // Signal the UDP threads to stop
+  lead_joint_positions_condition_variable_.notify_all();
+  if (udp_thread_lead_sync_.joinable()) {
+    udp_thread_lead_sync_.join();
+  }
+
+  follow_joint_positions_condition_variable_.notify_all();
+  if (udp_thread_follow_sync_.joinable()) {
+    udp_thread_follow_sync_.join();
   }
 }
 
@@ -155,6 +193,7 @@ void MTCTaskNode::initializePlanners()
     std::string chomp_pipeline_name = "chomp";
     // Lead arm planners
     lead_sampling_planner = std::make_shared<mtc::solvers::PipelinePlanner>(node_);
+    // lead_sampling_planner->setPlannerId("RRTstarkConfigDefault");
     lead_sampling_planner->setMaxVelocityScalingFactor(0.05);
     lead_sampling_planner->setMaxAccelerationScalingFactor(0.05);
 
@@ -171,6 +210,7 @@ void MTCTaskNode::initializePlanners()
 
     // Follow arm planners
     follow_sampling_planner = std::make_shared<mtc::solvers::PipelinePlanner>(node_);
+    follow_sampling_planner->setPlannerId("BiESTkConfigDefault");
     follow_sampling_planner->setMaxVelocityScalingFactor(0.05);
     follow_sampling_planner->setMaxAccelerationScalingFactor(0.05);
 
@@ -242,8 +282,287 @@ moveit_visual_tools::MoveItVisualTools& MTCTaskNode::getVisualTools()
   return visual_tools_;
 }
 
+void MTCTaskNode::udpReceiverSync(const std::string& host, int port,
+  // std::array<double, 6>& joint_positions,
+  std::vector<double>& joint_positions,
+  std::mutex& joint_positions_mutex,
+  std::condition_variable& joint_positions_condition_variable,
+  std::vector<double>& ee_pose,
+  std::mutex& ee_pose_mutex
+  )
+{
+  try {
+    boost::asio::io_context io_context;
+
+    // Bind to all interfaces to avoid issues if the IP is wrong
+    udp::socket socket(io_context, udp::endpoint(boost::asio::ip::udp::v4(), port));
+
+    std::array<char, 4096> recv_buf;
+
+    while (sync_udp_running_) {
+      udp::endpoint sender_endpoint;
+      size_t len = socket.receive_from(boost::asio::buffer(recv_buf), sender_endpoint);
+      std::string data(recv_buf.data(), len);
+    
+      std::cout << "[UDP raw data] " << data << std::endl;
+    
+      // Safely parse JSON
+      json received_json;
+      try {
+        received_json = json::parse(data);
+      } catch (const json::parse_error& e) {
+        std::cerr << "[UDP] JSON parse error: " << e.what() << "\n[UDP] Dropping message: " << data << std::endl;
+        continue;  // Skip garbage
+      }
+    
+      // Verify 'command' or 'magic' key to ensure it's from your system
+      if (!received_json.contains("command") || received_json["command"] != "synchronize") {
+        std::cerr << "[UDP] Invalid or missing 'command'. Skipping message." << std::endl;
+        continue;
+      }
+    
+      // Check and validate joint data
+      if (!received_json.contains("q") || !received_json["q"].is_array()) {
+        std::cerr << "[UDP] Missing or invalid 'q' array." << std::endl;
+        continue;
+      }
+    
+      std::vector<double> current_q = received_json["q"].get<std::vector<double>>();
+      if (current_q.size() != 7) {
+        std::cerr << "[UDP] Incorrect joint vector size: " << current_q.size() << std::endl;
+        continue;
+      }
+    
+      {
+        std::lock_guard<std::mutex> lock(joint_positions_mutex);
+        joint_positions = current_q;
+    
+        if (port == 6305) lead_joint_data_received_ = true;
+        if (port == 6306) follow_joint_data_received_ = true;
+      }
+    
+      joint_positions_condition_variable.notify_one();
+    
+      std::cout << "[UDP] Accepted joint data: ";
+      for (double q : current_q) std::cout << q << " ";
+      std::cout << std::endl;
+    }    
+
+  } catch (const std::exception& e) {
+    std::cerr << "UDP Receiver Error: " << e.what() << std::endl;
+  }
+}
+
+bool MTCTaskNode::doSyncTask(std::string arm_group_name, 
+                              std::string hand_group_name, 
+                              std::string hand_frame,
+                              std::mutex& joint_positions_mutex,
+                              std::vector<double>& joint_positions,
+                              std::vector<std::string>& joint_names,
+                              std::condition_variable& joint_positions_condition_variable,
+                              std::atomic<bool>& joint_data_received_flag,
+                              std::shared_ptr<mtc::solvers::PipelinePlanner> sampling_planner
+  )
+{
+  RCLCPP_INFO(LOGGER, "Waiting for joint position via UDP...");
+
+  joint_data_received_flag = false;
+
+  {
+  std::unique_lock<std::mutex> lock(joint_positions_mutex);
+  joint_positions_condition_variable.wait(lock, [&] {
+  return joint_data_received_flag.load() && joint_positions.size() == 7;
+  });
+  }
+
+  RCLCPP_INFO(LOGGER, "Joint position received: [%f, %f, %f, %f, %f, %f, %f]",
+  joint_positions[0], joint_positions[1], joint_positions[2],
+  joint_positions[3], joint_positions[4], joint_positions[5],
+  joint_positions[6]);
+
+  joint_data_received_flag = false;  // Reset
+
+  RCLCPP_INFO(LOGGER, "Joint position received: [%f, %f, %f, %f, %f, %f, %f]", joint_positions[0], joint_positions[1], joint_positions[2], joint_positions[3], joint_positions[4], joint_positions[5], joint_positions[6]);
+
+  mtc::Task sync_task = createGoalJointTask(arm_group_name, hand_group_name, hand_frame,
+                    joint_positions_mutex, 
+                    joint_positions, 
+                    joint_names,
+                    sampling_planner
+                    );
+  try
+  {
+  sync_task.init();
+  }
+  catch (mtc::InitStageException& e)
+  {
+  RCLCPP_ERROR_STREAM(LOGGER, "Arm sync task initialization failed: " << e.what());
+  return false;
+  }
+
+  if (!sync_task.plan(5))
+  {
+  RCLCPP_ERROR_STREAM(LOGGER, "Arm sync task planning failed");
+  return false;
+  }
+
+  // Do not publish the solution for synchronization task
+  // sync_task.introspection().publishSolution(*sync_task.solutions().front());
+  auto sync_result = sync_task.execute(*sync_task.solutions().front());
+  if (sync_result.val != moveit_msgs::msg::MoveItErrorCodes::SUCCESS)
+  {
+  RCLCPP_ERROR_STREAM(LOGGER, "Arm sync task execution failed");
+  return false;
+  }
+  RCLCPP_INFO(LOGGER, "Arm sync task executed successfully");
+
+  return true;
+}
+
+mtc::Task MTCTaskNode::createGoalJointTask(std::string arm_group_name, 
+                                          std::string hand_group_name, 
+                                          std::string hand_frame,
+                                          std::mutex& joint_positions_mutex,
+                                          std::vector<double>& joint_positions,
+                                          std::vector<std::string>& joint_names,
+                                          std::shared_ptr<mtc::solvers::PipelinePlanner> sampling_planner
+                                          )
+{
+  mtc::Task task;
+  task.stages()->setName("synchronization arm task");
+  task.loadRobotModel(node_);
+
+  std::vector<double> delta = {0, 0, 0};
+  std::vector<double> orients = {0, 0, 0, 1};
+
+  // task.setProperty("left_group", arm_group_name);
+  // task.setProperty("left_eef", hand_group_name);
+  // task.setProperty("left_ik_frame", hand_frame);
+
+  // Disable warnings for this line, as it's a variable that's set but not used in this example
+  #pragma GCC diagnostic push
+  #pragma GCC diagnostic ignored "-Wunused-but-set-variable"
+  mtc::Stage* current_state_ptr = nullptr;  // Forward current_state on to grasp pose generator
+  #pragma GCC diagnostic pop
+
+
+  auto stage_state_current = std::make_unique<mtc::stages::CurrentState>("current");
+  current_state_ptr = stage_state_current.get();
+  task.add(std::move(stage_state_current));
+
+  // move to synchronization joint position
+  {
+    // set Goal from joint positions
+    std::map<std::string, double> joint_goal;
+    {
+    if (joint_positions.size() != joint_names.size()) {
+    std::cerr << "Error: joint_positions size (" << joint_positions.size() 
+    << ") does not match joint_names size (" << joint_names.size() << ")" << std::endl;
+    return task;
+    }
+
+    std::lock_guard<std::mutex> joint_lock(joint_positions_mutex);
+
+    for (size_t i = 0; i < joint_names.size(); i++)
+    {
+    joint_goal[joint_names[i]] = joint_positions[i];
+    }
+
+    std::cout << "printing joint goal" << std::endl;
+    for (auto const& [key, val] : joint_goal)
+    {
+    std::cout << key << ": " << val << std::endl;
+    }
+
+    }
+
+    // auto stage_move_to_joint = std::make_unique<mtc::stages::MoveTo>("move to synchronization position", joint_interpolation_planner);
+    auto stage_move_to_joint = std::make_unique<mtc::stages::MoveTo>("move to synchronization position", sampling_planner);
+    stage_move_to_joint->setGroup(arm_group_name);
+    stage_move_to_joint->setGoal(joint_goal);
+    task.add(std::move(stage_move_to_joint));
+  }
+
+  // // further move to synchronization cartesian ee pose
+  // {
+  //   // set Goal from ee pose
+  //   geometry_msgs::msg::PoseStamped ee_goal;
+  //   {
+  //     std::lock_guard<std::mutex> cartesian_lock(ee_pose_mutex);
+  //     ee_goal.header.frame_id = "left_base_link";
+  //     ee_goal.pose.position.x = ee_pose[0];
+  //     ee_goal.pose.position.y = ee_pose[1];
+  //     ee_goal.pose.position.z = ee_pose[2];
+
+  //     // Convert Euler angles (RX, RY, RZ) to quaternion
+  //     tf2::Quaternion quaternion;
+  //     quaternion.setRPY(ee_pose[3], ee_pose[4], ee_pose[5]);
+
+  //     // Set the orientation of ee_goal
+  //     ee_goal.pose.orientation = tf2::toMsg(quaternion);
+  //   }
+
+  //   // IK frame at TCP
+  //   Eigen::Isometry3d grasp_frame_transform = Eigen::Isometry3d::Identity();
+  //   grasp_frame_transform.translation().z() = 0.197;
+
+  //   auto stage_move_to_cartesian = std::make_unique<mtc::stages::MoveTo>("move to synchronization cartesian pose", cartesian_interpolation_planner);
+  //   stage_move_to_cartesian->setGroup(left_arm_group_name);
+  //   stage_move_to_cartesian->setGoal(ee_goal);
+  //   stage_move_to_cartesian->setIKFrame(grasp_frame_transform, left_hand_frame);
+  //   task.add(std::move(stage_move_to_cartesian));
+  // }
+
+  return task;
+}
+
+
+void MTCTaskNode::syncwithRealWorld()
+{
+  initializeGroups();
+
+  initializePlanners();
+
+  RCLCPP_INFO(LOGGER, "Synchronizing the lead arm to its real-world position...");
+  doSyncTask(lead_arm_group_name, lead_hand_group_name, lead_hand_frame,
+             lead_joint_positions_mutex_, 
+             lead_joint_positions_, lead_franka_joint_names_,
+             lead_joint_positions_condition_variable_,
+             lead_joint_data_received_,
+             lead_sampling_planner
+             );
+
+  RCLCPP_INFO(LOGGER, "Synchronizing the follow arm to its real-world position...");
+  doSyncTask(follow_arm_group_name, follow_hand_group_name, follow_hand_frame,
+             follow_joint_positions_mutex_,
+             follow_joint_positions_, follow_franka_joint_names_,
+             follow_joint_positions_condition_variable_,
+              follow_joint_data_received_,
+              follow_sampling_planner
+             );
+
+  RCLCPP_INFO(LOGGER, "Synchronization with real-world completed.");
+}
+
+
 void MTCTaskNode::publishSolutionSubTraj(const moveit_task_constructor_msgs::msg::Solution& msg) {
 	int index = 0;
+  // int task_id = std::stoi(msg.task_id);
+  int task_id = 0;
+  // try {
+  //   if (!msg.task_id.empty()) {
+  //       task_id = std::stoi(msg.task_id);
+  //   } else {
+  //       RCLCPP_WARN(LOGGER, "task_id is empty.");
+  //   }
+  // }catch (const std::invalid_argument& e) {
+  //     RCLCPP_ERROR(LOGGER, "Invalid task_id: %s", msg.task_id.c_str());
+  //     return;  // Handle the error appropriately
+  // } catch (const std::out_of_range& e) {
+  //     RCLCPP_ERROR(LOGGER, "task_id out of range: %s", msg.task_id.c_str());
+  //     return;  // Handle the error appropriately
+  // }
+
   for (const moveit_task_constructor_msgs::msg::SubTrajectory& sub_trajectory : msg.sub_trajectory) {
     if (sub_trajectory.trajectory.joint_trajectory.points.empty())
       continue;
@@ -253,9 +572,9 @@ void MTCTaskNode::publishSolutionSubTraj(const moveit_task_constructor_msgs::msg
     robot_trajectory.joint_trajectory = sub_trajectory.trajectory.joint_trajectory;
 
     visual_tools_.publishTrajectoryLine(robot_trajectory, move_group_.getCurrentState()->getJointModelGroup(lead_arm_group_name),
-                                        lead_flange_to_tcp_transform_, sub_trajectory.info.stage_id, index, "/home/tp2/ws_humble/trajectories_leader", rviz_visual_tools::ORANGE, lead_base_frame);
+                                        lead_flange_to_tcp_transform_, task_id, sub_trajectory.info.stage_id, index, "/home/tp2/ws_humble/trajectories_leader", rviz_visual_tools::ORANGE, lead_base_frame);
     visual_tools_.publishTrajectoryLine(robot_trajectory, move_group_.getCurrentState()->getJointModelGroup(follow_arm_group_name),
-                                        follow_flange_to_tcp_transform_, sub_trajectory.info.stage_id, index, "/home/tp2/ws_humble/trajectories_follower", rviz_visual_tools::BLUE, follow_base_frame);
+                                        follow_flange_to_tcp_transform_, task_id, sub_trajectory.info.stage_id, index, "/home/tp2/ws_humble/trajectories_follower", rviz_visual_tools::BLUE, follow_base_frame);
     // visual_tools_.publishTrajectoryLine(robot_trajectory, move_group_.getCurrentState()->getLinkModel(lead_hand_frame));
     visual_tools_.trigger();
 
@@ -265,6 +584,10 @@ void MTCTaskNode::publishSolutionSubTraj(const moveit_task_constructor_msgs::msg
 
     // publish trajectories
     subtrajectory_publisher_->publish(new_sub_trajectory);
+    RCLCPP_INFO(LOGGER, "Sub-trajectory includes the following joints:");
+    for (const auto& joint_name : sub_trajectory.trajectory.joint_trajectory.joint_names) {
+        RCLCPP_INFO(LOGGER, "  %s", joint_name.c_str());
+    }
     RCLCPP_INFO_STREAM(LOGGER, "Published subtrajectory id " << new_sub_trajectory.info.id 
                               << " for stage " << new_sub_trajectory.info.stage_id
                               << " with " << new_sub_trajectory.trajectory.joint_trajectory.points.size()
@@ -576,12 +899,12 @@ mtc::Task MTCTaskNode::createTask(std::string& start_frame_name, std::string& go
 	 ***************************************************/
   {
     auto stage_state_current = std::make_unique<mtc::stages::CurrentState>("current");
+    pre_move_stage_ptr = stage_state_current.get();
     current_state_ptr = stage_state_current.get();
     task.add(std::move(stage_state_current));
 
-    // pre_move_stage_ptr = stage_state_current.get();
   }
-
+   
   // Set up planners
   initializePlanners();
 
@@ -735,18 +1058,16 @@ mtc::Task MTCTaskNode::createTask(std::string& start_frame_name, std::string& go
     }
   }
 
-  /****************************************************
-  ---- *               Follower Grasping              *
-  ***************************************************/
- {
-    auto stage = std::make_unique<mtc::stages::MoveTo>("close hand", follow_interpolation_planner);
+       /****************************************************
+    ---- *               Open Hand                      *
+    ***************************************************/
+   {
+    auto stage = std::make_unique<mtc::stages::MoveTo>("open hand", follow_interpolation_planner);
     stage->setGroup(follow_hand_group_name);
-    stage->setGoal("close");
-
-    pre_move_stage_ptr = stage.get();
-
+    stage->setGoal("open");
     task.add(std::move(stage));
- }
+  }
+
   /****************************************************
 	 *                                                  *
 	 *              Connect to Align                     *
@@ -757,12 +1078,14 @@ mtc::Task MTCTaskNode::createTask(std::string& start_frame_name, std::string& go
     mtc::stages::Connect::GroupPlannerVector interpolation_planners;
     mtc::stages::ConnectMF::GroupCartPlannerVector carteisan_planners;
     mtc::stages::ConnectMFReverse::GroupPipePlannerVector chomp_planners;
+    mtc::stages::Connect::GroupPlannerVector hand_planners;
     if (if_use_dual){
       // The order is important for collision checking!
       planners = {{lead_arm_group_name, lead_sampling_planner}, {follow_arm_group_name, follow_sampling_planner}};
       interpolation_planners = {{lead_arm_group_name, lead_interpolation_planner}, {follow_arm_group_name, follow_interpolation_planner}};
       carteisan_planners = {{lead_arm_group_name, lead_cartesian_planner}, {follow_arm_group_name, follow_cartesian_planner}};
       chomp_planners = {{lead_arm_group_name, lead_chomp_planner}, {follow_arm_group_name, follow_chomp_planner}};
+      hand_planners = {{lead_hand_group_name, lead_interpolation_planner}, {follow_hand_group_name, follow_interpolation_planner}};
     }else{
       planners = {{lead_arm_group_name, lead_sampling_planner}};
       interpolation_planners = {{lead_arm_group_name, lead_interpolation_planner}};
@@ -805,7 +1128,7 @@ mtc::Task MTCTaskNode::createTask(std::string& start_frame_name, std::string& go
         // stage_move_to_align->properties().set("lead_grasp_pose", leader_grasp_pose_transformed);
         
         // stage_move_to_align->properties().set("track_offset", 0.1);
-        // stage_move_to_align->properties().set("folllow_grasp_offset", 0.03);
+        // stage_move_to_align->properties().set("follow_grasp_offset", 0.03);
         // // stage_move_to_align->properties().set("merge_mode", mtc::stages::ConnectMF::MergeMode::SEQUENTIAL);
         // stage_move_to_align->setEndEffector(ik_endeffectors);
 
@@ -817,11 +1140,13 @@ mtc::Task MTCTaskNode::createTask(std::string& start_frame_name, std::string& go
         // task.add(std::move(stage_move_to_align));
 
         auto stage_move_to_align = std::make_unique<mtc::stages::ConnectMFReverse>("move to align", planners, interpolation_planners, carteisan_planners, chomp_planners,
-                                                                                    lead_move_group_interface, visual_tools_);
-        stage_move_to_align->setTimeout(5.0);
+                                                                                    hand_planners, lead_move_group_interface, visual_tools_);
+        stage_move_to_align->setTimeout(10.0);
         stage_move_to_align->properties().configureInitFrom(mtc::Stage::PARENT);
         stage_move_to_align->properties().set("lead_group", lead_arm_group_name);
-        stage_move_to_align->properties().set("follow_group", follow_arm_group_name);      
+        stage_move_to_align->properties().set("lead_hand_group", lead_hand_group_name);
+        stage_move_to_align->properties().set("follow_group", follow_arm_group_name);
+        stage_move_to_align->properties().set("follow_hand_group", follow_hand_group_name);      
         stage_move_to_align->properties().set("hand_to_tcp_transform", hand_to_tcp_transform_);
         stage_move_to_align->properties().set("lead_flange_to_tcp_transform", lead_flange_to_tcp_transform_);
         stage_move_to_align->properties().set("follow_flange_to_tcp_transform", follow_flange_to_tcp_transform_);
@@ -832,7 +1157,7 @@ mtc::Task MTCTaskNode::createTask(std::string& start_frame_name, std::string& go
         stage_move_to_align->properties().set("lead_grasp_pose", leader_grasp_pose_transformed);
         
         stage_move_to_align->properties().set("track_offset", 0.1);
-        stage_move_to_align->properties().set("folllow_grasp_offset", 0.03);
+        stage_move_to_align->properties().set("follow_grasp_offset", 0.03);
         // stage_move_to_align->properties().set("merge_mode", mtc::stages::ConnectMF::MergeMode::SEQUENTIAL);
         stage_move_to_align->setEndEffector(ik_endeffectors);
 
@@ -845,7 +1170,7 @@ mtc::Task MTCTaskNode::createTask(std::string& start_frame_name, std::string& go
       }
 
     }else{
-      auto stage_move_to_align = std::make_unique<mtc::stages::Connect>("move to align", planners);
+      auto stage_move_to_align = std::make_unique<mtc::stages::Connect>("move to align", planners, hand_planners);
       stage_move_to_align->setTimeout(5.0);
       stage_move_to_align->properties().configureInitFrom(mtc::Stage::PARENT);
 
@@ -873,6 +1198,17 @@ mtc::Task MTCTaskNode::createTask(std::string& start_frame_name, std::string& go
     //   align->properties().configureInitFrom(mtc::Stage::PARENT,
     //                                         { "eef", "group", "ik_frame" });
     // }
+
+  /****************************************************
+  ---- *               Follower Grasping              *
+  ***************************************************/
+  {
+      auto stage = std::make_unique<mtc::stages::MoveTo>("close hand", follow_interpolation_planner);
+      stage->setGroup(follow_hand_group_name);
+      stage->setGoal("close");
+
+      align->insert(std::move(stage));
+  }
 
     /****************************************************
   ---- *               Insertion in EE-z                *
@@ -1218,6 +1554,164 @@ mtc::Task MTCTaskNode::createTask(std::string& start_frame_name, std::string& go
   return task;
 }
 
+mtc::Task MTCTaskNode::createReverseTask(std::string& start_frame_name, std::string& goal_frame_name, bool if_use_dual, bool if_split_plan, bool if_cartesian_connect, bool if_approach)
+{
+  /*Attempt to plan from generated IK goal back to the current scene.
+    Not finished: trajectory from connect_reverse stage is promising, but task is somehow still marks as failure.*/
+  mtc::Task task;
+  task.stages()->setName("routing task");
+  task.loadRobotModel(node_);
+
+  // Initialize robot groups
+  initializeGroups();
+
+  // Set task properties (only valid for single arm)
+  // if (!if_use_dual){
+  //   task.setProperty("group", lead_arm_group_name);
+  //   task.setProperty("eef", lead_hand_group_name);
+  //   task.setProperty("ik_frame", lead_hand_frame);
+  // }
+  
+  // delete markers
+  visual_tools_.deleteAllMarkers();
+  visual_tools_.trigger();
+
+  // set target pose
+  // geometry_msgs::msg::PoseStamped lead_target_pose = createClipGoal(goal_frame_name, leader_pre_insert_offset);
+  // geometry_msgs::msg::PoseStamped follow_target_pose = createClipGoal(goal_frame_name, follower_pre_insert_offset);
+  RCLCPP_INFO(LOGGER, "Grasping in clip frame : %s", start_frame_name.c_str());
+  auto [lead_grasp_pose, follow_grasp_pose] = assignClipGoal(start_frame_name, leader_grasp_offset, follower_grasp_offset);
+
+  RCLCPP_INFO(LOGGER, "Inserting in clip frame : %s", goal_frame_name.c_str());
+  auto [lead_target_pose, follow_target_pose] = assignClipGoal(goal_frame_name, leader_pre_insert_offset, follower_pre_insert_offset);
+
+// Disable warnings for this line, as it's a variable that's set but not used in this example
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wunused-but-set-variable"
+  mtc::Stage* current_state_ptr = nullptr;  // Forward current_state on to grasp pose generator
+#pragma GCC diagnostic pop
+
+  mtc::Stage* pre_move_stage_ptr = nullptr;
+  mtc::Stage* pre_grasp_stage_ptr = nullptr;
+
+ 
+  /****************************************************
+	 *                                                  *
+	 *               Start from Goal State              *
+	 *                                                  *
+	 ***************************************************/
+  // Set up planners
+  initializePlanners();
+
+     /****************************************************
+	 *                                                  *
+	 *               Current State                      *
+	 *                                                  *
+	 ***************************************************/
+  {
+    // Add the monitored stage first, so IK sees real frame updates
+    auto stage_state_current = std::make_unique<mtc::stages::CurrentState>("current");
+    pre_move_stage_ptr = stage_state_current.get();  // Set monitored before consuming
+    current_state_ptr = stage_state_current.get();
+
+    task.add(std::move(stage_state_current));
+
+  }
+   
+
+  /****************************************************
+	 *                                                  *
+	 *              Connect to Align                     *
+	 *                                                  *
+	 ***************************************************/
+  { 
+    mtc::stages::Connect::GroupPlannerVector planners;
+    mtc::stages::Connect::GroupPlannerVector interpolation_planners;
+    mtc::stages::ConnectMF::GroupCartPlannerVector carteisan_planners;
+    mtc::stages::ConnectMFReverse::GroupPipePlannerVector chomp_planners;
+    if (if_use_dual){
+      // The order is important for collision checking!
+      planners = {{lead_arm_group_name, lead_sampling_planner}, {follow_arm_group_name, follow_sampling_planner}};
+      interpolation_planners = {{lead_arm_group_name, lead_interpolation_planner}, {follow_arm_group_name, follow_interpolation_planner}};
+      carteisan_planners = {{lead_arm_group_name, lead_cartesian_planner}, {follow_arm_group_name, follow_cartesian_planner}};
+      chomp_planners = {{lead_arm_group_name, lead_chomp_planner}, {follow_arm_group_name, follow_chomp_planner}};
+    }else{
+      planners = {{lead_arm_group_name, lead_sampling_planner}};
+      interpolation_planners = {{lead_arm_group_name, lead_interpolation_planner}};
+      carteisan_planners = {{lead_arm_group_name, lead_cartesian_planner}};
+    }
+    
+      auto stage_move_to_align = std::make_unique<mtc::stages::ConnectReverse>("move to align", planners);
+      stage_move_to_align->setTimeout(5.0);
+      stage_move_to_align->properties().configureInitFrom(mtc::Stage::PARENT);
+
+      // add path constraints
+      moveit_msgs::msg::Constraints path_constraints = createBoxConstraints(lead_hand_frame, lead_target_pose);
+      stage_move_to_align->setPathConstraints(path_constraints);
+      RCLCPP_INFO(LOGGER, "Path constraints set");
+
+      // stage_move_to_align->properties().set("merge_mode", mtc::stages::ConnectMF::MergeMode::SEQUENTIAL);
+    
+      task.add(std::move(stage_move_to_align));
+  
+  }
+
+  auto ik_chain = std::make_unique<mtc::SerialContainer>("IK chain");
+  ik_chain->setForwardedProperties({"target_poses"});
+  // ik_chain->setForwardedInterface(mtc::Stage::InterfaceFlags::ALL);
+
+ /****************************************************
+  ---- *   Fixed Clipping Pose for dual arm *
+  ***************************************************/
+  {
+    // Fixed align pose
+    auto dual_fixed_pose = std::make_unique<mtc::stages::FixedCartesianPosesMultiple>("dual fixed clipping pose");
+    GroupPoseDict pose_pairs = {{follow_arm_group_name, follow_target_pose}, {lead_arm_group_name, lead_target_pose}};
+    dual_fixed_pose->addPosePair(pose_pairs);
+    dual_fixed_pose->setMonitoredStage(pre_move_stage_ptr);
+
+    // IK frame at TCP
+    Eigen::Isometry3d lead_grasp_frame_transform = Eigen::Isometry3d::Identity();
+    lead_grasp_frame_transform.translation().z() = 0.1034;
+    Eigen::Isometry3d follow_grasp_frame_transform = Eigen::Isometry3d::Identity();
+    follow_grasp_frame_transform.translation().z() = 0.1034;
+
+    // IK groups
+    std::vector<std::string> ik_groups = {follow_arm_group_name, lead_arm_group_name};
+    GroupStringDict ik_endeffectors = {{follow_arm_group_name, follow_hand_group_name}, {lead_arm_group_name, lead_hand_group_name}};
+    GroupStringDict ik_hand_frames = {{follow_arm_group_name, follow_hand_frame}, {lead_arm_group_name, lead_hand_frame}, };
+    // GroupStringDict ik_links = {{lead_arm_group, "right_arm_hand"}, {follow_arm_group, "left_arm_hand"}};
+    GroupPoseMatrixDict ik_frame_transforms = {{follow_arm_group_name, follow_grasp_frame_transform}, {lead_arm_group_name, lead_grasp_frame_transform}};
+
+    // Compute IK
+    auto ik_wrapper = std::make_unique<mtc::stages::ComputeIKMultiple>("clipping pose IK", std::move(dual_fixed_pose), ik_groups, dual_arm_group_name);
+    ik_wrapper->setSubGroups(ik_groups);
+    ik_wrapper->setGroup(dual_arm_group_name);
+    ik_wrapper->setEndEffector(ik_endeffectors);
+    // ik_wrapper->properties().configureInitFrom(Stage::PARENT, { "eef", "group" });
+    ik_wrapper->properties().configureInitFrom(mtc::Stage::INTERFACE, {"target_poses"});
+    // ik_wrapper->properties().set("object", "object");
+    ik_wrapper->setMaxIKSolutions(20);
+    ik_wrapper->setMinSolutionDistance(1.0);
+    ik_wrapper->setIKFrame(ik_frame_transforms, ik_hand_frames);
+
+    ik_chain->insert(std::move(ik_wrapper));
+    // task.add(std::move(ik_wrapper));
+  }
+
+
+  {
+    auto noop = std::make_unique<mtc::stages::NoOp>("mark end");
+    noop->setForwardedProperties({"target_poses"});
+    // task.add(std::move(noop));
+    ik_chain->insert(std::move(noop));
+  }
+
+  task.add(std::move(ik_chain));
+
+  return task;
+}
+
 mtc::Task MTCTaskNode::createTestWaypointTask(std::string& goal_frame_name, bool if_use_dual, bool if_split_plan, bool if_cartesian_connect, bool if_approach)
 {
   mtc::Task task;
@@ -1385,6 +1879,47 @@ mtc::Task MTCTaskNode::createPostTask(std::string& start_frame_name, std::string
   return task;
 }
 
+mtc::Task MTCTaskNode::createHomingTask(std::string& start_frame_name, std::string& goal_frame_name, bool if_use_dual, bool if_split_plan, bool if_cartesian_connect, bool if_approach)
+{
+  mtc::Task task;
+  task.stages()->setName("homing task");
+  task.loadRobotModel(node_);
+
+  // Initialize robot groups
+  initializeGroups();
+
+  // delete markers
+  visual_tools_.deleteAllMarkers();
+  visual_tools_.trigger();
+
+  // Current state stage
+  {
+    auto stage_state_current = std::make_unique<mtc::stages::CurrentState>("current");
+    task.add(std::move(stage_state_current));
+
+    // pre_move_stage_ptr = stage_state_current.get();
+  }
+
+  // Set up planners
+  initializePlanners();
+
+  {
+    auto stage = std::make_unique<mtc::stages::MoveTo>("move follower back home", follow_sampling_planner);
+    stage->setGroup(follow_arm_group_name);
+    stage->setGoal("ready");
+    task.add(std::move(stage));
+  }
+
+  {
+    auto stage = std::make_unique<mtc::stages::MoveTo>("move leader back home", lead_sampling_planner);
+    stage->setGroup(lead_arm_group_name);
+    stage->setGoal("ready");
+    task.add(std::move(stage));
+  }
+  
+  return task;
+}
+
 int main(int argc, char** argv)
 {
   rclcpp::init(argc, argv);
@@ -1400,7 +1935,7 @@ int main(int argc, char** argv)
 
   std::vector<std::string> clip_names;
 
-  // Service client to get clip names
+  // Service client to get clip names for update DLO model
   auto clip_names_client = mtc_task_node->getNode()->create_client<moveit_task_constructor_msgs::srv::GetClipNames>("get_clip_names");
   auto request = std::make_shared<moveit_task_constructor_msgs::srv::GetClipNames::Request>();
 
@@ -1420,6 +1955,9 @@ int main(int argc, char** argv)
     executor.remove_node(mtc_task_node->getNodeBaseInterface());
   });
 
+  // Synchronize with RealWolrd
+  mtc_task_node->syncwithRealWorld();
+  mtc_task_node->getVisualTools().prompt("Synchronization with RealWorld is done. Press 'next' in the RvizVisualToolsGui window to continue the next task");
 
   // Variables for synchronization
   std::mutex mutex;
@@ -1427,7 +1965,7 @@ int main(int argc, char** argv)
   bool response_received = false;
 
   // List of clip IDs to process
-  std::vector<std::string> clip_ids = {"clip5", "clip6", "clip8"}; //"clip5", "clip6", "clip8"
+  std::vector<std::string> clip_ids = {"clip5", "clip6", "clip7"}; //"clip5", "clip6", "clip7 or 8"
 
   // initial clip
   for (auto i = 0; i < clip_ids.size(); i++)
@@ -1445,7 +1983,7 @@ int main(int argc, char** argv)
       // from the second clip on, set the orientation and add approach
       mtc_task_node->setSelectOrientation(true);
 
-      mtc_task_node->doTask(prev_clip_id, clip_id, true, true, false, true , true,
+      mtc_task_node->doTask(prev_clip_id, clip_id, true, true, false, true, true,
                       [mtc_task_node](std::string& start, std::string& goal, bool dual, bool split, bool cartesian, bool approach) {
                       return mtc_task_node->createTask(start, goal, dual, split, cartesian, approach);
                       });
@@ -1480,6 +2018,10 @@ int main(int argc, char** argv)
     request->clip_names = clip_names;
     // Send the request asynchronously
     RCLCPP_INFO(LOGGER, "Sending service request...");
+    for (const auto& name : clip_names)
+    {
+      RCLCPP_INFO(LOGGER, "Clip Name: %s", name.c_str());
+    }
     clip_names_client->async_send_request(request, 
                             [&](rclcpp::Client<moveit_task_constructor_msgs::srv::GetClipNames>::SharedFuture future) 
     {
@@ -1512,15 +2054,23 @@ int main(int argc, char** argv)
 
     if (clip_id == "clip5")
     {
-    // // Use visul tools to control the movement from one clip to another
-    mtc_task_node->getVisualTools().prompt("After moving to initial positions, press 'next' in the RvizVisualToolsGui window to start servo");
-    // start follower tracking
-    std_msgs::msg::Bool start_tracking_msg;
-    start_tracking_msg.data = true;
-    tracking_start_pub->publish(start_tracking_msg);
+      // // Use visul tools to control the movement from one clip to another
+      mtc_task_node->getVisualTools().prompt("After moving to initial positions, press 'next' in the RvizVisualToolsGui window to start servo");
+      // start follower tracking
+      std_msgs::msg::Bool start_tracking_msg;
+      start_tracking_msg.data = true;
+      tracking_start_pub->publish(start_tracking_msg);
     }
 
   }
+
+  // move back home
+  std::string clip_id_place_holder = "clip0";
+  mtc_task_node->doTask(clip_id_place_holder, clip_id_place_holder, false, true, false, false, false,
+  [mtc_task_node](std::string& start, std::string& goal, bool dual, bool split, bool cartesian, bool approach) {
+  return mtc_task_node->createHomingTask(start, goal, dual, split, cartesian, approach);
+  });
+
 
   spin_thread->join();
   rclcpp::shutdown();
