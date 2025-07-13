@@ -51,6 +51,10 @@ ament_target_dependencies(load_scene
   moveit_ros_planning_interface
   # moveit_task_constructor_core
   moveit_visual_tools
+  tf2
+  tf2_ros
+  tf2_geometry_msgs
+  shape_msgs
 )
 install(TARGETS load_scene DESTINATION lib/${PROJECT_NAME})
 
