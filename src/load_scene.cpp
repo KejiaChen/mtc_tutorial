@@ -11,11 +11,17 @@
 #include <moveit_visual_tools/moveit_visual_tools.h>
 #include <tf2_ros/transform_broadcaster.h>
 #include <tf2_ros/static_transform_broadcaster.h>
+#include <tf2_geometry_msgs/tf2_geometry_msgs.hpp>
+#include <tf2_ros/transform_listener.h>
+#include <tf2_ros/buffer.h>
 
 class ObjectTFBroadcaster
 {
 public:
-    ObjectTFBroadcaster(rclcpp::Node::SharedPtr node) : tf_broadcaster_(node), static_tf_broadcaster_(node)
+    ObjectTFBroadcaster(rclcpp::Node::SharedPtr node) : tf_broadcaster_(node), 
+                                                        static_tf_broadcaster_(node),
+                                                        tf_buffer_(node->get_clock()), // Initialize TF Buffer with node clock
+                                                        tf_listener_(tf_buffer_)      // Initialize TF Listener with TF Buffer
     {
     }
 
@@ -39,11 +45,28 @@ public:
         static_tf_broadcaster_.sendTransform(transform);
     }
 
+    geometry_msgs::msg::PoseStamped getPoseTransform(const geometry_msgs::msg::PoseStamped& pose, const std::string& target_frame)
+    {
+        geometry_msgs::msg::PoseStamped transformed_pose;
+        try
+        {
+            transformed_pose = tf_buffer_.transform(pose, target_frame, tf2::durationFromSec(1.0));
+        }
+        catch (const tf2::TransformException& ex)
+        {
+            RCLCPP_ERROR(rclcpp::get_logger("ObjectTFBroadcaster"), "Failed to transform pose: %s", ex.what());
+            throw std::runtime_error("Failed to transform pose");
+        }
+        return transformed_pose;
+    }
+
+
 private:
     tf2_ros::TransformBroadcaster tf_broadcaster_;
     tf2_ros::StaticTransformBroadcaster static_tf_broadcaster_;
+    tf2_ros::Buffer tf_buffer_;
+    tf2_ros::TransformListener tf_listener_;
 };
-
 
 void disableCollisions(const std::string &object_name, const std::string &base_name,
                        moveit::planning_interface::PlanningSceneInterface &planning_scene_interface)
@@ -133,7 +156,7 @@ bool readOrientLine(std::string ori_line, bool is_is_clip_file, double &qx, doub
     }
 }
 
-void loadCustomScene(const std::string &path, rclcpp::Node::SharedPtr move_group_node, bool is_clip_file)
+std::vector<moveit_msgs::msg::CollisionObject> loadCustomScene(const std::string &path, rclcpp::Node::SharedPtr move_group_node, bool is_clip_file)
 {
     // planning_scene_monitor::LockedPlanningSceneRW ps(planning_scene_monitor);
     // if (!ps)
@@ -253,6 +276,7 @@ void loadCustomScene(const std::string &path, rclcpp::Node::SharedPtr move_group
 
     // Add object to planning scene
     planning_scene_interface.addCollisionObjects(collision_objects);
+    RCLCPP_INFO(rclcpp::get_logger("load_scene"), "Added %zu collision objects to planning scene", collision_objects.size());
 
     // publish tf
     for (const auto &collision_object : collision_objects)
@@ -265,6 +289,83 @@ void loadCustomScene(const std::string &path, rclcpp::Node::SharedPtr move_group
     visual_tools.trigger();
 
     RCLCPP_INFO(rclcpp::get_logger("load_scene"), "Scene loaded successfully from %s", path.c_str());
+
+    return collision_objects;
+}
+
+void loadObjectHats(std::vector<moveit_msgs::msg::CollisionObject> &collision_objects, rclcpp::Node::SharedPtr move_group_node)
+{
+    moveit::planning_interface::PlanningSceneInterface planning_scene_interface;
+    ObjectTFBroadcaster object_tf_broadcaster(move_group_node);
+
+    std::vector<moveit_msgs::msg::CollisionObject> hat_objects;
+
+    for (const auto &collision_object : collision_objects)
+    {   
+        // get collision obejct's name and size
+        std::string object_name = collision_object.id;
+        double dx = collision_object.primitives[0].dimensions[shape_msgs::msg::SolidPrimitive::BOX_X];
+        double dy = collision_object.primitives[0].dimensions[shape_msgs::msg::SolidPrimitive::BOX_Y];
+        double dz = collision_object.primitives[0].dimensions[shape_msgs::msg::SolidPrimitive::BOX_Z];
+
+        moveit_msgs::msg::CollisionObject hat_object;
+        std::string hat_name = object_name + "_hat";
+
+        RCLCPP_INFO(rclcpp::get_logger("load_scene"), "Loading object hat: %s", hat_name.c_str());
+
+        hat_object.id = hat_name;
+        hat_object.header.frame_id = object_name; // Use the original object's frame as the base frame
+
+        shape_msgs::msg::SolidPrimitive primitive;
+        primitive.type = primitive.BOX;
+        primitive.dimensions.resize(3);
+        primitive.dimensions[primitive.BOX_X] = 0.5*dx;
+        primitive.dimensions[primitive.BOX_Y] = 0.5*dy;
+        primitive.dimensions[primitive.BOX_Z] = 0.02;
+
+        // Create pose
+        geometry_msgs::msg::Pose pose_in_object_frame;
+
+        pose_in_object_frame.position.x = 0.25*dx;        // pose.position.x = collision_object.primitive_poses[0].position.x + 0.25*dx;
+        // pose.position.y = collision_object.primitive_poses[0].position.y + 0.25*dy;
+        // pose.position.z = collision_object.primitive_poses[0].position.z + 0.5*dz + 0.01;
+        // pose.orientation.x = collision_object.primitive_poses[0].orientation.x;
+        // pose.orientation.y = collision_object.primitive_poses[0].orientation.y;
+        // pose.orientation.z = collision_object.primitive_poses[0].orientation.z;
+        // pose.orientation.w = collision_object.primitive_poses[0].orientation.w;
+        pose_in_object_frame.position.y = 0.25*dy;
+        pose_in_object_frame.position.z = 0.5*dz + 0.01;
+        pose_in_object_frame.orientation.x = 0.0;
+        pose_in_object_frame.orientation.y = 0.0;
+        pose_in_object_frame.orientation.z = 0.0;
+        pose_in_object_frame.orientation.w = 1.0;
+
+        // Transform pose to world frame
+        geometry_msgs::msg::PoseStamped pose_in_world_frame;
+        pose_in_world_frame.header.frame_id = "world"; // Set the frame to world
+        pose_in_world_frame.pose = pose_in_object_frame;
+        pose_in_world_frame = object_tf_broadcaster.getPoseTransform(pose_in_world_frame, "world");
+
+        hat_object.primitives.push_back(primitive);
+        hat_object.primitive_poses.push_back(pose_in_world_frame.pose);
+        hat_object.operation = hat_object.ADD;
+
+        hat_objects.push_back(hat_object);
+
+        // sleep for a while
+        rclcpp::sleep_for(std::chrono::milliseconds(100));
+    }
+    planning_scene_interface.addCollisionObjects(hat_objects);
+
+    RCLCPP_INFO(rclcpp::get_logger("load_scene"), "Added %d hat objects to planning scene", hat_objects.size());
+
+    // publish tf for hat objects
+    for (const auto &hat_object : hat_objects)
+    {
+        object_tf_broadcaster.publishObjectTF(hat_object.id, hat_object.primitive_poses[0]);
+    }
+    RCLCPP_INFO(rclcpp::get_logger("load_scene"), "Published %d hat object TFs", hat_objects.size());
+
 }
 
 int main(int argc, char **argv)
@@ -279,9 +380,10 @@ int main(int argc, char **argv)
     }
 
     std::string scene_file = argv[1];
+    std::vector<moveit_msgs::msg::CollisionObject> environment_objects;
     try
     {
-        loadCustomScene(scene_file, node, false);
+        environment_objects = loadCustomScene(scene_file, node, false);
         RCLCPP_INFO(node->get_logger(), "Scene loaded successfully!");
     }
     catch (const std::exception &e)
@@ -298,14 +400,26 @@ int main(int argc, char **argv)
         std::string clip_file = argv[2];
         RCLCPP_INFO(node->get_logger(), "Clip file provided: %s", clip_file.c_str());
         
+        std::vector<moveit_msgs::msg::CollisionObject> clip_objects;
         try
-        {
-            loadCustomScene(clip_file, node, true);
+        {   
+            clip_objects = loadCustomScene(clip_file, node, true);
             RCLCPP_INFO(node->get_logger(), "Clip loaded successfully!");
         }
         catch (const std::exception &e)
         {
             RCLCPP_ERROR(node->get_logger(), "Error loading clip: %s", e.what());
+        }
+
+        // Load clip hats
+        try
+        {
+            loadObjectHats(clip_objects, node);
+            RCLCPP_INFO(node->get_logger(), "Clip hats loaded successfully!");
+        }
+        catch (const std::exception &e)
+        {
+            RCLCPP_ERROR(node->get_logger(), "Error loading clip hats: %s", e.what());
         }
     }   
     else
