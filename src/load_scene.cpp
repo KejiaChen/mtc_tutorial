@@ -411,15 +411,19 @@ int main(int argc, char **argv)
             RCLCPP_ERROR(node->get_logger(), "Error loading clip: %s", e.what());
         }
 
+        bool add_clip_hats = (argc > 3) ? (std::string(argv[3]) == "true") : false;
         // Load clip hats
-        try
+        if (add_clip_hats)
         {
-            loadObjectHats(clip_objects, node);
-            RCLCPP_INFO(node->get_logger(), "Clip hats loaded successfully!");
-        }
-        catch (const std::exception &e)
-        {
-            RCLCPP_ERROR(node->get_logger(), "Error loading clip hats: %s", e.what());
+            try
+            {
+                loadObjectHats(clip_objects, node);
+                RCLCPP_INFO(node->get_logger(), "Clip hats loaded successfully!");
+            }
+            catch (const std::exception &e)
+            {
+                RCLCPP_ERROR(node->get_logger(), "Error loading clip hats: %s", e.what());
+            }
         }
     }   
     else

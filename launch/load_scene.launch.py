@@ -31,6 +31,12 @@ def generate_launch_description():
         description="Whether to include the BotaSys external force torque sensor in the right robot model",
     )
 
+    add_clip_hats = DeclareLaunchArgument(
+        "add_clip_hats",
+        default_value="false",
+        description="Whether to include extra hats in each clip fixture",
+    )
+
     
     moveit_config = (
         MoveItConfigsBuilder("dual_arm_panda")
@@ -66,6 +72,7 @@ def generate_launch_description():
         ],
         arguments=[LaunchConfiguration("scene_file"),
                    LaunchConfiguration("clip_file"),  # Pass clip_file even if it's empty
+                   LaunchConfiguration("add_clip_hats")
         ],
     )
     
@@ -82,4 +89,5 @@ def generate_launch_description():
                               use_sensone_right, 
                               scene_file_arg, 
                               clip_file_arg,
+                              add_clip_hats,
                               load_scene])
