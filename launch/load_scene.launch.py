@@ -13,10 +13,22 @@ def generate_launch_description():
         description="Path to the .scene file to be loaded",
     )
 
+    mesh_file_arg = DeclareLaunchArgument(
+        "mesh_file",
+        default_value="/home/tp2/ws_humble/scene/surface.STL",  # Default file path
+        description="Path to the mesh file to be loaded",
+    )
+
     clip_file_arg = DeclareLaunchArgument(
         "clip_file",
         default_value="",  # Default file path
         description="Optional path to the clip configuration file to be loaded",
+    )
+
+    use_qb_board_coordinate = DeclareLaunchArgument(
+        "use_qb_board_coordinate",
+        default_value="true",
+        description="Whether to use QB board coordinate for pose reading of clip_file.",
     )
 
     use_sensone_left = DeclareLaunchArgument(
@@ -71,7 +83,9 @@ def generate_launch_description():
             moveit_config.to_dict(),
         ],
         arguments=[LaunchConfiguration("scene_file"),
+                   LaunchConfiguration("mesh_file"),
                    LaunchConfiguration("clip_file"),  # Pass clip_file even if it's empty
+                   LaunchConfiguration("use_qb_board_coordinate"),
                    LaunchConfiguration("add_clip_hats")
         ],
     )
@@ -88,6 +102,8 @@ def generate_launch_description():
     return LaunchDescription([use_sensone_left, 
                               use_sensone_right, 
                               scene_file_arg, 
+                              mesh_file_arg,
                               clip_file_arg,
+                              use_qb_board_coordinate,
                               add_clip_hats,
                               load_scene])
