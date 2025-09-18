@@ -2,7 +2,9 @@
 #include <moveit/planning_scene_interface/planning_scene_interface.h>
 #include <moveit_msgs/msg/collision_object.hpp>
 #include <shape_msgs/msg/solid_primitive.hpp>
+#include <shape_msgs/msg/mesh.hpp>
 #include <geometry_msgs/msg/pose.hpp>
+#include <geometric_shapes/shape_operations.h>
 #include <rclcpp/rclcpp.hpp>
 #include <fstream>
 #include <sstream>
@@ -14,6 +16,7 @@
 #include <tf2_geometry_msgs/tf2_geometry_msgs.hpp>
 #include <tf2_ros/transform_listener.h>
 #include <tf2_ros/buffer.h>
+#include <filesystem>
 
 class ObjectTFBroadcaster
 {
@@ -110,18 +113,20 @@ void disableCollisions(const std::string &object_name, const std::string &base_n
     RCLCPP_INFO(rclcpp::get_logger("disable_collisions"), "Disabled collision between '%s' and '%s'", object_name.c_str(), base_name.c_str());
 }
 
-bool readPosLine(std::string pos_line, bool is_is_clip_file, double &x, double &y, double &z)
+bool readPosLine(std::string pos_line, bool is_use_qb_board_coordinate, double &x, double &y, double &z)
 {   
     double num_x, num_y, num_z;
     if (!(std::istringstream(pos_line) >> num_x >> num_y >> num_z)){
         return false;
     }else{
-        if (is_is_clip_file){  
-            double unit = 0.304/20; // one board has length of 304mm with 20 units
-            double origin_x = 0.49;
+        if (is_use_qb_board_coordinate){  
+            double unit = 0.305/20; // one board has length of 305mm with 20 units
+            double origin_x = 0.48;
             double origin_y = 0.0;
-            x = (num_x - 0.5) * unit + origin_x;
-            y = (num_y - 0.5) * unit + origin_y;
+            double sign_x = (num_x >= 0.0) ? 1.0 : -1.0;
+            double sign_y = (num_y >= 0.0) ? 1.0 : -1.0;
+            x = sign_x * (std::abs(num_x) - 0.5) * unit + origin_x;
+            y = sign_y * (std::abs(num_y) - 0.5) * unit + origin_y;
         }else{
             x = num_x;
             y = num_y;
@@ -132,13 +137,13 @@ bool readPosLine(std::string pos_line, bool is_is_clip_file, double &x, double &
 
 }
 
-bool readOrientLine(std::string ori_line, bool is_is_clip_file, double &qx, double &qy, double &qz, double &qw)
+bool readOrientLine(std::string ori_line, bool is_use_qb_board_coordinate, double &qx, double &qy, double &qz, double &qw)
 {
     double num_x, num_y, num_z, num_w;
     if (!(std::istringstream(ori_line) >> num_x >> num_y >> num_z >> num_w)){
         return false;
     }else{
-        if (is_is_clip_file){  
+        if (is_use_qb_board_coordinate){  
             // Only consider num_z, which is the angle in degree
             double Euler_z = num_z * M_PI / 180.0; // Convert to radians
             // Obtain quaternion from Euler angles
@@ -156,7 +161,51 @@ bool readOrientLine(std::string ori_line, bool is_is_clip_file, double &qx, doub
     }
 }
 
-std::vector<moveit_msgs::msg::CollisionObject> loadCustomScene(const std::string &path, rclcpp::Node::SharedPtr move_group_node, bool is_clip_file)
+// moveit_msgs::msg::CollisionObject makeMeshCollisionObject(
+//     const std::string& id,
+//     const std::string& resource_uri,                 // e.g. "package://my_env_pkg/meshes/fixture.stl"
+//     const std::string& parent_frame,                 // pose is expressed in this frame (e.g. "world")
+//     const geometry_msgs::msg::Pose& pose_in_parent,  // pose of the mesh in parent_frame
+//     ObjectTFBroadcaster& tf_broadcaster,
+//     const Eigen::Vector3d& scale = Eigen::Vector3d(1.0, 1.0, 1.0),
+//     const std::string& world_frame = "world")
+// {
+//   // Load STL
+//   std::unique_ptr<shapes::Mesh> mesh(shapes::createMeshFromResource(resource_uri, scale));
+//   if (!mesh)
+//     throw std::runtime_error("Failed to load mesh resource: " + resource_uri);
+
+//   shapes::ShapeMsg shape_msg_any;
+//   shapes::constructMsgFromShape(mesh.get(), shape_msg_any);
+//   shape_msgs::msg::Mesh mesh_msg = boost::get<shape_msgs::msg::Mesh>(shape_msg_any);
+
+//   // Transform pose -> world
+//   geometry_msgs::msg::PoseStamped src_pose;
+//   src_pose.header.frame_id = parent_frame;
+//   src_pose.pose = pose_in_parent;
+
+//   geometry_msgs::msg::PoseStamped world_pose =
+//       tf_broadcaster.getPoseTransform(src_pose, world_frame);
+
+//   // Build CollisionObject (world-frame)
+//   moveit_msgs::msg::CollisionObject co;
+//   co.id = id;
+//   co.header.frame_id = world_frame;
+//   co.meshes.push_back(mesh_msg);
+//   co.mesh_poses.push_back(world_pose.pose);
+//   co.operation = co.ADD;
+//   return co;
+// }
+
+inline geometry_msgs::msg::Pose firstPoseOf(const moveit_msgs::msg::CollisionObject& co)
+{
+  if (!co.primitive_poses.empty()) return co.primitive_poses[0];
+  if (!co.mesh_poses.empty())      return co.mesh_poses[0];
+  if (!co.plane_poses.empty())     return co.plane_poses[0];
+  geometry_msgs::msg::Pose p; p.orientation.w = 1.0; return p; // safe fallback
+}
+
+std::vector<moveit_msgs::msg::CollisionObject> loadCustomScene(const std::string &scene_path, const std::string &mesh_path, rclcpp::Node::SharedPtr move_group_node, bool use_qb_board_coordinate)
 {
     // planning_scene_monitor::LockedPlanningSceneRW ps(planning_scene_monitor);
     // if (!ps)
@@ -174,20 +223,20 @@ std::vector<moveit_msgs::msg::CollisionObject> loadCustomScene(const std::string
 
     ObjectTFBroadcaster object_tf_broadcaster(move_group_node);
 
-    if (is_clip_file)
+    if (use_qb_board_coordinate)
     {
-        RCLCPP_INFO(rclcpp::get_logger("load_scene"), "Loading clip file: %s", path.c_str());
+        RCLCPP_INFO(rclcpp::get_logger("load_scene"), "Reading pose in QB board coordinate and converting to world coordinate.");
     }
     else
     {
-        RCLCPP_INFO(rclcpp::get_logger("load_scene"), "Loading scene file: %s", path.c_str());
+        RCLCPP_INFO(rclcpp::get_logger("load_scene"), "Reading pose in world coordinate.");
     }
 
     std::vector<moveit_msgs::msg::CollisionObject> collision_objects;
-    std::ifstream fin(path);
+    std::ifstream fin(scene_path);
     if (!fin.is_open())
     {
-        throw std::runtime_error("Failed to open scene file: " + path);
+        throw std::runtime_error("Failed to open scene file: " + scene_path);
     }
 
     std::string line;
@@ -212,12 +261,12 @@ std::vector<moveit_msgs::msg::CollisionObject> loadCustomScene(const std::string
 
             // Read position
             // if (!std::getline(fin, pos_line) || !(std::istringstream(pos_line) >> x >> y >> z))
-            if (!std::getline(fin, pos_line) || !readPosLine(pos_line, is_clip_file, x, y, z))
+            if (!std::getline(fin, pos_line) || !readPosLine(pos_line, use_qb_board_coordinate, x, y, z))
                 throw std::runtime_error("Invalid position line for object: " + object_name);
 
             // Read orientation
             // if (!std::getline(fin, ori_line) || !(std::istringstream(ori_line) >> qx >> qy >> qz >> qw))
-            if (!std::getline(fin, ori_line) || !readOrientLine(ori_line, is_clip_file, qx, qy, qz, qw))
+            if (!std::getline(fin, ori_line) || !readOrientLine(ori_line, use_qb_board_coordinate, qx, qy, qz, qw))
                 throw std::runtime_error("Invalid orientation line for object: " + object_name);
 
             // Skip one line (the "1" marker)
@@ -225,7 +274,7 @@ std::vector<moveit_msgs::msg::CollisionObject> loadCustomScene(const std::string
                 throw std::runtime_error("Unexpected end of file after orientation for object: " + object_name);
 
             // Read shape type (assuming it's always "box")
-            if (!std::getline(fin, shape_line) || shape_line != "box")
+            if (!std::getline(fin, shape_line) || (shape_line != "box" && shape_line != "mesh"))
                 throw std::runtime_error("Invalid or unsupported shape type for object: " + object_name);
 
             // Read dimensions
@@ -238,13 +287,6 @@ std::vector<moveit_msgs::msg::CollisionObject> loadCustomScene(const std::string
                 if (!std::getline(fin, unused_line))
                     throw std::runtime_error("Unexpected end of file in unused block for object: " + object_name);
             }
-            
-            shape_msgs::msg::SolidPrimitive primitive;
-            primitive.type = primitive.BOX;
-            primitive.dimensions.resize(3);
-            primitive.dimensions[primitive.BOX_X] = dx;
-            primitive.dimensions[primitive.BOX_Y] = dy;
-            primitive.dimensions[primitive.BOX_Z] = dz;
 
             // Create pose
             geometry_msgs::msg::Pose pose;
@@ -256,13 +298,53 @@ std::vector<moveit_msgs::msg::CollisionObject> loadCustomScene(const std::string
             pose.orientation.z = qz;
             pose.orientation.w = qw;
 
-            collision_object.primitives.push_back(primitive);
-            collision_object.primitive_poses.push_back(pose);
-            collision_object.operation = collision_object.ADD;
+            if (shape_line == "box") {
+                shape_msgs::msg::SolidPrimitive primitive;
+                primitive.type = primitive.BOX;
+                primitive.dimensions.resize(3);
+                primitive.dimensions[primitive.BOX_X] = dx;
+                primitive.dimensions[primitive.BOX_Y] = dy;
+                primitive.dimensions[primitive.BOX_Z] = dz;
+
+                collision_object.primitives.push_back(primitive);
+                collision_object.primitive_poses.push_back(pose);
+                collision_object.operation = collision_object.ADD;
+
+            } else if(shape_line == "mesh"){
+                // Use dim_line (already parsed into dx, dy, dz) as SCALE
+                // Eigen::Vector3d scale(dx, dy, dz);  
+                Eigen::Vector3d scale (1, 1, 1); // for STL, use 1,1,1
+
+                // const std::string mesh_path = "/home/tp2/ws_humble/scene/" + object_name + ".stl";
+                if (mesh_path.empty()) {
+                    throw std::runtime_error("Mesh path is empty for object: " + object_name);
+                }
+                if (!std::filesystem::exists(mesh_path)) {
+                    throw std::runtime_error("Mesh file does not exist: " + mesh_path);
+                }
+                std::string uri = "file://" + std::filesystem::absolute(mesh_path).string(); // -> file:///home/...
+
+                // auto mesh_co = makeMeshCollisionObject(
+                //     object_name, uri, /*parent_frame=*/"world", pose,
+                //     object_tf_broadcaster, /*scale=*/scale, /*world_frame=*/"world");
+
+                  // Load STL
+                std::unique_ptr<shapes::Mesh> mesh(shapes::createMeshFromResource(uri, scale));
+                if (!mesh)
+                    throw std::runtime_error("Failed to load mesh resource: " + uri);
+
+                shapes::ShapeMsg shape_msg_any;
+                shapes::constructMsgFromShape(mesh.get(), shape_msg_any);
+                shape_msgs::msg::Mesh mesh_msg = boost::get<shape_msgs::msg::Mesh>(shape_msg_any);
+
+                // Build CollisionObject (world-frame)
+                collision_object.meshes.push_back(mesh_msg);
+                collision_object.mesh_poses.push_back(pose);
+                collision_object.operation = collision_object.ADD;
+            }
 
             collision_objects.push_back(collision_object);
 
-            // sleep for a while
             rclcpp::sleep_for(std::chrono::milliseconds(100));
 
             // Disable collision with base
@@ -281,14 +363,14 @@ std::vector<moveit_msgs::msg::CollisionObject> loadCustomScene(const std::string
     // publish tf
     for (const auto &collision_object : collision_objects)
     {
-        object_tf_broadcaster.publishObjectTF(collision_object.id, collision_object.primitive_poses[0]);
+        object_tf_broadcaster.publishObjectTF(collision_object.id, firstPoseOf(collision_object));
     }
     RCLCPP_INFO(rclcpp::get_logger("load_scene"), "Published %d object TFs", collision_objects.size());
 
     // Show text in RViz of status and wait for MoveGroup to receive and process the collision object message
     visual_tools.trigger();
 
-    RCLCPP_INFO(rclcpp::get_logger("load_scene"), "Scene loaded successfully from %s", path.c_str());
+    RCLCPP_INFO(rclcpp::get_logger("load_scene"), "Scene loaded successfully from %s", scene_path.c_str());
 
     return collision_objects;
 }
@@ -319,21 +401,21 @@ void loadObjectHats(std::vector<moveit_msgs::msg::CollisionObject> &collision_ob
         shape_msgs::msg::SolidPrimitive primitive;
         primitive.type = primitive.BOX;
         primitive.dimensions.resize(3);
-        primitive.dimensions[primitive.BOX_X] = 0.5*dx;
-        primitive.dimensions[primitive.BOX_Y] = 0.5*dy;
+        primitive.dimensions[primitive.BOX_X] = dx;
+        primitive.dimensions[primitive.BOX_Y] = dy;
         primitive.dimensions[primitive.BOX_Z] = 0.02;
 
         // Create pose
         geometry_msgs::msg::Pose pose_in_object_frame;
 
-        pose_in_object_frame.position.x = 0.25*dx;        // pose.position.x = collision_object.primitive_poses[0].position.x + 0.25*dx;
+        pose_in_object_frame.position.x = 0;        // pose.position.x = collision_object.primitive_poses[0].position.x + 0.25*dx;
         // pose.position.y = collision_object.primitive_poses[0].position.y + 0.25*dy;
         // pose.position.z = collision_object.primitive_poses[0].position.z + 0.5*dz + 0.01;
         // pose.orientation.x = collision_object.primitive_poses[0].orientation.x;
         // pose.orientation.y = collision_object.primitive_poses[0].orientation.y;
         // pose.orientation.z = collision_object.primitive_poses[0].orientation.z;
         // pose.orientation.w = collision_object.primitive_poses[0].orientation.w;
-        pose_in_object_frame.position.y = 0.25*dy;
+        pose_in_object_frame.position.y = 0;
         pose_in_object_frame.position.z = 0.5*dz + 0.01;
         pose_in_object_frame.orientation.x = 0.0;
         pose_in_object_frame.orientation.y = 0.0;
@@ -373,17 +455,18 @@ int main(int argc, char **argv)
     rclcpp::init(argc, argv);
     auto node = rclcpp::Node::make_shared("scene_loader");
 
-    if (argc < 2)
+    if (argc < 4)
     {
         RCLCPP_ERROR(node->get_logger(), "Usage: ros2 run <package_name> <executable_name> <path_to_scene_file>");
         return 1;
     }
 
     std::string scene_file = argv[1];
+    std::string mesh_file = argv[2];
     std::vector<moveit_msgs::msg::CollisionObject> environment_objects;
     try
     {
-        environment_objects = loadCustomScene(scene_file, node, false);
+        environment_objects = loadCustomScene(scene_file, mesh_file, node, false);
         RCLCPP_INFO(node->get_logger(), "Scene loaded successfully!");
     }
     catch (const std::exception &e)
@@ -395,15 +478,16 @@ int main(int argc, char **argv)
     rclcpp::sleep_for(std::chrono::milliseconds(100));
 
     // Load clip file if provided
-    if (argc > 2 && std::string(argv[2]).empty() == false)
+    if (argc > 3 && std::string(argv[3]).empty() == false)
     {
-        std::string clip_file = argv[2];
+        std::string clip_file = argv[3];
+        bool use_qb_board_coordinate = (argc > 4) ? (std::string(argv[4]) == "true") : true;
         RCLCPP_INFO(node->get_logger(), "Clip file provided: %s", clip_file.c_str());
         
         std::vector<moveit_msgs::msg::CollisionObject> clip_objects;
         try
-        {   
-            clip_objects = loadCustomScene(clip_file, node, true);
+        {
+            clip_objects = loadCustomScene(clip_file, "", node, use_qb_board_coordinate);
             RCLCPP_INFO(node->get_logger(), "Clip loaded successfully!");
         }
         catch (const std::exception &e)
@@ -411,7 +495,7 @@ int main(int argc, char **argv)
             RCLCPP_ERROR(node->get_logger(), "Error loading clip: %s", e.what());
         }
 
-        bool add_clip_hats = (argc > 3) ? (std::string(argv[3]) == "true") : false;
+        bool add_clip_hats = (argc > 5) ? (std::string(argv[5]) == "true") : false;
         // Load clip hats
         if (add_clip_hats)
         {
