@@ -87,7 +87,7 @@ public:
   void syncwithRealWorld();
 
   // publish mtc sub_trajectory
-  void publishSolutionSubTraj(const moveit_task_constructor_msgs::msg::Solution& msg);
+  void publishSolutionSubTraj(std::string goal_clip_name, const moveit_task_constructor_msgs::msg::Solution& msg);
 
   void doTask(std::string& start_clip_id, std::string& goal_clip_id, bool execute, bool plan_for_dual, bool split, bool cartesian_connect, 
             bool approach, std::function<mtc::Task(std::string&, std::string&, bool, bool, bool, bool)> createTaskFn);
@@ -125,11 +125,14 @@ public:
 
 private:
   geometry_msgs::msg::PoseStamped getPoseTransform(const geometry_msgs::msg::PoseStamped& pose, const std::string& target_frame);
-  moveit_msgs::msg::Constraints createBoxConstraints(const std::string& link_name, geometry_msgs::msg::PoseStamped& goal_pose);
+  moveit_msgs::msg::Constraints createBoxConstraints(const std::string& link_name, geometry_msgs::msg::PoseStamped& goal_pose, double x_offset, double y_offset, double z_offset);
 
   geometry_msgs::msg::PoseStamped createClipGoal(const std::string& goal_frame, const std::vector<double>& goal_translation_vector);
   std::pair<geometry_msgs::msg::PoseStamped, geometry_msgs::msg::PoseStamped> assignClipGoal(const std::string& goal_frame, 
-          const std::vector<double>& goal_vector_1, const std::vector<double>& goal_vector_2);
+                                                                                              const std::vector<double>& goal_vector_1, const std::vector<double>& goal_vector_2);
+
+  std::pair<geometry_msgs::msg::PoseStamped, geometry_msgs::msg::PoseStamped> assignClipGoalBiDirection(const std::string& goal_frame_name, 
+                                                                                                        const std::vector<double>& goal_vector_1, const std::vector<double>& goal_vector_2);
 
   // // Compose an MTC task from a series of stages.
   // mtc::Task createTask(std::string& goal_frame_name, bool if_use_dual, bool if_split_plan);
@@ -164,7 +167,8 @@ private:
   // Transform from flange to TCP
   Eigen::Isometry3d lead_flange_to_tcp_transform_;
   Eigen::Isometry3d follow_flange_to_tcp_transform_;
-  Eigen::Isometry3d hand_to_tcp_transform_;
+  Eigen::Isometry3d lead_hand_to_tcp_transform_;
+  Eigen::Isometry3d follow_hand_to_tcp_transform_;
 
   // Helper methods for internal setup
   void initializeGroups();
