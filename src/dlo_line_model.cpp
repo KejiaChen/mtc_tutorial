@@ -50,7 +50,7 @@ Eigen::Isometry3d transformStampedToEigen(const geometry_msgs::msg::TransformSta
 }
 
 
-Eigen::Isometry3d poseToIsometry(const geometry_msgs::msg::Pose& pose_msg) {
+Eigen::Isometry3d poseToIsometry(const geometry_msgs::msg::Pose& pose_msg, geometry_msgs::msg::Vector3& offset) {
     Eigen::Isometry3d isometry = Eigen::Isometry3d::Identity();
     
     // Translation
@@ -60,6 +60,9 @@ Eigen::Isometry3d poseToIsometry(const geometry_msgs::msg::Pose& pose_msg) {
     Eigen::Quaterniond quat(pose_msg.orientation.w, pose_msg.orientation.x,
                             pose_msg.orientation.y, pose_msg.orientation.z);
     isometry.linear() = quat.toRotationMatrix();
+
+    // Apply offset
+    isometry.translate(Eigen::Vector3d(offset.x, offset.y, offset.z));
     
     return isometry;
 }
@@ -108,6 +111,10 @@ int main(int argc, char** argv) {
 
     rclcpp::init(argc, argv);
 	rclcpp::Node::SharedPtr node = rclcpp::Node::make_shared("dlo_tracker");
+
+    bool alter_finger_left = (argc > 4) ? (std::string(argv[1]) == "true") : true;
+    bool alter_finger_right = (argc > 4) ? (std::string(argv[2]) == "true") : false;
+    double extend_finger_length = 0.015;
 
     moveit::planning_interface::PlanningSceneInterface psi;
     moveit::planning_interface::MoveGroupInterface move_group_interface(node, "dual_arm");
@@ -194,14 +201,20 @@ int main(int argc, char** argv) {
                 for (size_t i = 0; i < clip_names.size(); ++i) {
                     const auto& start_clip = clip_names[i];
                     if (clip_poses.count(start_clip)){
-                        line_start_pose = poseToIsometry(clip_poses[start_clip]);
+                        // start pose is clip_poses[start_clip] with an offset
+                        geometry_msgs::msg::Vector3 offset;
+                        offset.x = 0.0;
+                        offset.y = 0.0;
+                        offset.z = 0.03;
+
+                        line_start_pose = poseToIsometry(clip_poses[start_clip], offset);
                         line_starts.push_back(line_start_pose.translation());
 
                         // except the last clip
                         if (i < clip_names.size() - 1) {
                             const auto& end_clip = clip_names[i + 1];
                             if (clip_poses.count(end_clip)) {
-                                line_end_pose = poseToIsometry(clip_poses[end_clip]);
+                                line_end_pose = poseToIsometry(clip_poses[end_clip], offset);
                                 line_ends.push_back(line_end_pose.translation());
                             }
                         }else{
@@ -220,18 +233,25 @@ int main(int argc, char** argv) {
         // Lookup transform to lead hand
         if (clip_names.size() > 0){
             // Define the offset in the z-axis
-            double z_offset = 0.1034;
+            double lead_z_offset = 0.1034;
+            double follow_z_offset = 0.1034;
+            if (alter_finger_left){
+                follow_z_offset = follow_z_offset + extend_finger_length*0.5;
+            }
+            if (alter_finger_right){
+                lead_z_offset = lead_z_offset + extend_finger_length*0.5;
+            }
             geometry_msgs::msg::TransformStamped lead_hand_transform =
                 tf_buffer->lookupTransform(reference_frame, lead_hand_frame, rclcpp::Time(0));
             // Apply the offset to the lead hand frame to get the fingertip position
             Eigen::Isometry3d lead_hand_pose = transformStampedToEigen(lead_hand_transform);
-            Eigen::Isometry3d lead_fingertip_pose = lead_hand_pose * Eigen::Translation3d(0, 0, z_offset);
-            
+            Eigen::Isometry3d lead_fingertip_pose = lead_hand_pose * Eigen::Translation3d(0, 0, lead_z_offset);
+
             geometry_msgs::msg::TransformStamped follow_hand_transform = tf_buffer->lookupTransform(
                     reference_frame, follow_hand_frame, rclcpp::Time(0));
             // Apply the offset to the follow hand frame to get the fingertip position
             Eigen::Isometry3d follow_hand_pose = transformStampedToEigen(follow_hand_transform);
-            Eigen::Isometry3d follow_fingertip_pose = follow_hand_pose * Eigen::Translation3d(0, 0, z_offset);
+            Eigen::Isometry3d follow_fingertip_pose = follow_hand_pose * Eigen::Translation3d(0, 0, follow_z_offset);
 
             // Lookup transform to follow hand
             if (follow_hand_closed){

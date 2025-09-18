@@ -12,10 +12,22 @@ def generate_launch_description():
         description="Whether to include the BotaSys external force torque sensor in the left robot model",
     )
 
+    alter_finger_left = DeclareLaunchArgument(
+        "alter_finger_left",
+        default_value="true",
+        description="Whether to alter the left robot model's finger configuration",
+    )
+
     use_sensone_right = DeclareLaunchArgument(
         "use_sensone_right",
         default_value="true",
         description="Whether to include the BotaSys external force torque sensor in the right robot model",
+    )
+
+    alter_finger_right = DeclareLaunchArgument(
+        "alter_finger_right",
+        default_value="false",
+        description="Whether to alter the right robot model's finger configuration",
     )
 
     moveit_config = (
@@ -24,14 +36,18 @@ def generate_launch_description():
                             mappings={
                                     # "ros2_control_hardware_type": LaunchConfiguration("ros2_control_hardware_type"),
                                     "use_sensone_left": LaunchConfiguration("use_sensone_left"),
+                                    "alter_finger_left": LaunchConfiguration("alter_finger_left"),
                                     "use_sensone_right": LaunchConfiguration("use_sensone_right"),
+                                    "alter_finger_right": LaunchConfiguration("alter_finger_right"),
                         },
         )
         .robot_description_semantic(
             file_path="config/panda.srdf.xacro",
             mappings={
                 "use_sensone_left": LaunchConfiguration("use_sensone_left"),
+                "alter_finger_left": LaunchConfiguration("alter_finger_left"),
                 "use_sensone_right": LaunchConfiguration("use_sensone_right"),
+                "alter_finger_right": LaunchConfiguration("alter_finger_right"),
             },
         )
         .trajectory_execution(file_path="config/moveit_controllers.yaml")
@@ -50,4 +66,8 @@ def generate_launch_description():
     ],
     )
     
-    return LaunchDescription([use_sensone_left, use_sensone_right, dlo_model])
+    return LaunchDescription([use_sensone_left, 
+                              alter_finger_left, 
+                              use_sensone_right, 
+                              alter_finger_right, 
+                              dlo_model])
