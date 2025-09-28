@@ -67,7 +67,7 @@ std::vector<double> follower_grasp_offset_magnitude = {0, (clip_size[1]/2+grasp_
 
 double default_franka_flange_to_tcp_z = 0.1034;
 double sensone_height = 0.036; 
-double extend_finger_length = 0.015;
+double extend_finger_length = 0.01;
 
 rclcpp::node_interfaces::NodeBaseInterface::SharedPtr MTCTaskNode::getNodeBaseInterface()
 {
@@ -128,41 +128,39 @@ MTCTaskNode::MTCTaskNode(const rclcpp::NodeOptions& options)
   // CAUTION: flange_to_tcp stands for the transform from panda_link_8 to TCP
   // In comparison to hand_to_tcp, there is additional rotation of 45 degree around z axis, and an optional z offset because of wrist snesor
   // adapt flange to TCP transform based on the wrist sensor's height
+  follow_flange_to_tcp_transform_.translation().z() = default_franka_flange_to_tcp_z; 
   if (node_->get_parameter("use_sensone_left").as_bool()){
-    follow_flange_to_tcp_transform_.translation().z() = default_franka_flange_to_tcp_z + sensone_height;
-  }else{
-    follow_flange_to_tcp_transform_.translation().z() = default_franka_flange_to_tcp_z; 
+    follow_flange_to_tcp_transform_.translation().z() += sensone_height;
   }
   // set rotation to 45 degree around z axis
   follow_flange_to_tcp_transform_.rotate(Eigen::AngleAxisd(-M_PI/4, Eigen::Vector3d::UnitZ())); // link8 rotates 45 degree around z axis to tcp
   RCLCPP_INFO(LOGGER, "Follower flange to TCP transform z: %f", follow_flange_to_tcp_transform_.translation().z());
-
+  
+  lead_flange_to_tcp_transform_.translation().z() = default_franka_flange_to_tcp_z; 
   if (node_->get_parameter("use_sensone_right").as_bool()){
-    lead_flange_to_tcp_transform_.translation().z() = default_franka_flange_to_tcp_z + sensone_height; 
-  }else{
-    lead_flange_to_tcp_transform_.translation().z() = default_franka_flange_to_tcp_z; 
+    lead_flange_to_tcp_transform_.translation().z() += sensone_height; 
   }
   lead_flange_to_tcp_transform_.rotate(Eigen::AngleAxisd(-M_PI/4, Eigen::Vector3d::UnitZ())); // link8 rotates 45 degree around z axis to tcp
   RCLCPP_INFO(LOGGER, "Leader flange to TCP transform z: %f", lead_flange_to_tcp_transform_.translation().z());
   
   // hand_to_TCP transform is different from flange_to_TCP transform, it is usually a fixed value if franka hand is not changed
+  follow_hand_to_tcp_transform_ = Eigen::Isometry3d::Identity();
+  follow_hand_to_tcp_transform_.translation().z() = default_franka_flange_to_tcp_z; // 0.1034 is the default value for panda hand
   if (node_->get_parameter("alter_finger_left").as_bool()){
-    follow_hand_to_tcp_transform_ = Eigen::Isometry3d::Identity();
-    follow_hand_to_tcp_transform_.translation().z() = 0.1034 + extend_finger_length*0.5; // 0.1034 is the default value for panda hand
+    follow_hand_to_tcp_transform_.translation().z() += extend_finger_length*0.5;
+    follow_flange_to_tcp_transform_.translation().z() += extend_finger_length*0.5; // 0.1034 is the default value for panda flange
     RCLCPP_INFO(LOGGER, "Altered follower hand to TCP transform z: %f", follow_hand_to_tcp_transform_.translation().z());
   }else{
-    follow_hand_to_tcp_transform_ = Eigen::Isometry3d::Identity();
-    follow_hand_to_tcp_transform_.translation().z() = 0.1034; // 0.1034 is the default value for panda hand
     RCLCPP_INFO(LOGGER, "Default follower hand to TCP transform z: %f", follow_hand_to_tcp_transform_.translation().z());
   }
 
+  lead_hand_to_tcp_transform_ = Eigen::Isometry3d::Identity();
+  lead_hand_to_tcp_transform_.translation().z() = default_franka_flange_to_tcp_z; // 0.1034 is the default value for panda hand
   if (node_->get_parameter("alter_finger_right").as_bool()){
-    lead_hand_to_tcp_transform_ = Eigen::Isometry3d::Identity();
-    lead_hand_to_tcp_transform_.translation().z() = 0.1034 + extend_finger_length*0.5; // 0.1034 is the default value for panda hand
+    lead_hand_to_tcp_transform_.translation().z() += extend_finger_length*0.5; // 0.1034 is the default value for panda hand
+    lead_flange_to_tcp_transform_.translation().z() += extend_finger_length*0.5; // 0.1034 is the default value for panda flange
     RCLCPP_INFO(LOGGER, "Altered leader hand to TCP transform z: %f", lead_hand_to_tcp_transform_.translation().z());
   }else{
-    lead_hand_to_tcp_transform_ = Eigen::Isometry3d::Identity();
-    lead_hand_to_tcp_transform_.translation().z() = 0.1034; // 0.1034 is the default value for panda hand
     RCLCPP_INFO(LOGGER, "Default leader hand to TCP transform z: %f", lead_hand_to_tcp_transform_.translation().z());
   }
 
@@ -650,6 +648,39 @@ geometry_msgs::msg::PoseStamped MTCTaskNode::getPoseTransform(const geometry_msg
     return pose_world;
 }
 
+  // Helper: look up T^world_clip as Eigen Isometry
+  Eigen::Isometry3d MTCTaskNode::getTransformIsometry(const std::string& source_frame, const std::string& target_frame)
+  {
+    geometry_msgs::msg::TransformStamped transform;
+    try {
+        transform = tf_buffer_.lookupTransform(
+            target_frame,   // Target frame
+            source_frame,  // Source frame
+            rclcpp::Time(0),  // Get the latest transform
+            rclcpp::Duration::from_seconds(1.0)// Timeout
+        );
+    } catch (tf2::TransformException &ex) {
+        RCLCPP_ERROR(LOGGER, "Could not transform %s frame to %s frame: %s", source_frame.c_str(), target_frame.c_str(), ex.what());
+        return Eigen::Isometry3d::Identity(); // Return identity on failure
+    }
+
+    // Convert to Eigen::Isometry3d
+    Eigen::Isometry3d T = tf2::transformToEigen(transform.transform);
+
+    // Guard against tiny numerical drift (keeps rotation orthonormal)
+    Eigen::Matrix3d R = T.linear();
+    Eigen::JacobiSVD<Eigen::Matrix3d> svd(R, Eigen::ComputeFullU | Eigen::ComputeFullV);
+    Eigen::Matrix3d R_orth = svd.matrixU() * svd.matrixV().transpose();
+    if (R_orth.determinant() < 0.0) {  // fix potential reflection
+      Eigen::Matrix3d U = svd.matrixU();
+      U.col(2) *= -1.0;
+      R_orth = U * svd.matrixV().transpose();
+    }
+    T.linear() = R_orth;  // reassign the cleaned rotation
+
+    return T;
+  };
+
 moveit_msgs::msg::Constraints MTCTaskNode::createBoxConstraints(const std::string& link_name, geometry_msgs::msg::PoseStamped& goal_pose, double x_offset, double y_offset, double z_offset)
 {
   // Assume current_pose and goal_pose are of type geometry_msgs::msg::PoseStamped
@@ -702,6 +733,83 @@ moveit_msgs::msg::Constraints MTCTaskNode::createBoxConstraints(const std::strin
   return box_constraints;
 }
 
+
+// ===== Main function =====
+std::tuple<int, geometry_msgs::msg::PoseStamped, geometry_msgs::msg::PoseStamped> MTCTaskNode::assignClipGoalsAlongConnection(const std::string& clip_frame,
+                                                                                                                      const std::string& next_clip_frame,
+                                                                                                                      const std::vector<double>& leader_grasp_offset,
+                                                                                                                      const std::vector<double>& follower_grasp_offset,
+                                                                                                                      bool tilt_follower,
+                                                                                                                      double follower_tilt_rad,
+                                                                                                                      Eigen::Quaterniond& clip2ee_quat)
+{
+  // 1) Look up both clip poses in world
+  const auto T_w_c = getTransformIsometry(clip_frame, "world");
+  const auto T_w_n = getTransformIsometry(next_clip_frame, "world");
+
+  const Eigen::Vector3d p_c = T_w_c.translation();
+  const Eigen::Vector3d p_n = T_w_n.translation();
+
+  // 2) Connection vector current->next in world
+  Eigen::Vector3d v_conn_w = (p_n - p_c);
+  if (v_conn_w.norm() < 1e-9) {
+    throw std::runtime_error("assignClipGoalsAlongConnection: clips are coincident.");
+  }
+  v_conn_w.normalize();
+
+  // 3) Decide forward side in the CLIP frame (+Y or -Y)
+  int clip_sign = signAlongClipY(T_w_c, v_conn_w); // +1 => use +Y_clip, else -Y_clip
+
+  // 4) Base orientation: Q2 for +Y, Q1 for -Y
+  static const tf2::Quaternion Q1(0.7071068, -0.7071068, 0.0, 0.0); // 180° about X then -90° about Z
+  static const tf2::Quaternion Q2(0.7071068,  0.7071068, 0.0, 0.0); // 180° about X then +90° about Z
+  const tf2::Quaternion q_tf = (clip_sign > 0) ? Q2 : Q1;
+  // const Eigen::Quaterniond q_base(q_tf.getW(), q_tf.getX(), q_tf.getY(), q_tf.getZ());
+  clip2ee_quat = Eigen::Quaterniond(q_tf.getW(), q_tf.getX(), q_tf.getY(), q_tf.getZ());
+
+  // 5) Build leader/follower goals in the CLIP frame
+  geometry_msgs::msg::PoseStamped leader, follower;
+  leader.header.frame_id   = clip_frame;
+  follower.header.frame_id = clip_frame;
+
+  // Positions: ±Y in CLIP frame
+  leader.pose.position.x   = leader_grasp_offset[0]; // leader offset along clip X
+  leader.pose.position.y   = clip_sign * leader_grasp_offset[1];   // leader ahead along connection
+  leader.pose.position.z   = leader_grasp_offset[2]; // leader offset along clip Z
+
+  follower.pose.position.x = follower_grasp_offset[0]; // follower offset along clip X
+  follower.pose.position.y = clip_sign * follower_grasp_offset[1];   // opposite side
+  follower.pose.position.z = follower_grasp_offset[2]; // follower offset along clip Z
+
+  // Orientations
+  assignQuat(leader.pose,   clip2ee_quat);
+  assignQuat(follower.pose, clip2ee_quat);
+
+  // 6) Optional follower tilt about X (applied after base orientation)
+  if (tilt_follower && std::abs(follower_tilt_rad) > 1e-6) {
+    // Build a rotation about local Y (intrinsic): q_delta_y
+    const Eigen::AngleAxisd aa_local_y(follower_tilt_rad, Eigen::Vector3d::UnitY());
+    const Eigen::Quaterniond q_delta_y(aa_local_y);
+
+    // Compose: local-Y tilt AFTER base orientation => right-multiply
+    Eigen::Quaterniond qf(follower.pose.orientation.w,
+                          follower.pose.orientation.x,
+                          follower.pose.orientation.y,
+                          follower.pose.orientation.z);
+    Eigen::Quaterniond q_new = qf * q_delta_y;
+    q_new.normalize();
+
+    follower.pose.orientation.w = q_new.w();
+    follower.pose.orientation.x = q_new.x();
+    follower.pose.orientation.y = q_new.y();
+    follower.pose.orientation.z = q_new.z();
+  }
+
+  return std::make_tuple(clip_sign, leader, follower);
+}
+
+
+
 std::pair<geometry_msgs::msg::PoseStamped, geometry_msgs::msg::PoseStamped> MTCTaskNode::assignClipGoal(const std::string& goal_frame_name, 
           const std::vector<double>& goal_vector_1, const std::vector<double>& goal_vector_2)
 {
@@ -722,13 +830,13 @@ std::pair<geometry_msgs::msg::PoseStamped, geometry_msgs::msg::PoseStamped> MTCT
     follower_target_pose = target_pose_2;
 
     // Rotate follow_target_pose around the x-axis by 45 degrees
-    follow_rotation = Eigen::AngleAxisd(-M_PI / 4, Eigen::Vector3d::UnitX());
+    // follow_rotation = Eigen::AngleAxisd(-M_PI / 4, Eigen::Vector3d::UnitX());
   } else {
     leader_target_pose = target_pose_2;
     follower_target_pose = target_pose_1;
 
     // Rotate follow_target_pose around the x-axis by 45 degrees
-    follow_rotation = Eigen::AngleAxisd(M_PI / 4, Eigen::Vector3d::UnitX());
+    // follow_rotation = Eigen::AngleAxisd(M_PI / 4, Eigen::Vector3d::UnitX());
   }
 
   // leader_target_pose = target_pose_1;
@@ -936,7 +1044,11 @@ mtc::Task MTCTaskNode::createTask(std::string& start_frame_name, std::string& go
   // geometry_msgs::msg::PoseStamped lead_target_pose = createClipGoal(goal_frame_name, leader_pre_insert_offset);
   // geometry_msgs::msg::PoseStamped follow_target_pose = createClipGoal(goal_frame_name, follower_pre_insert_offset);
   RCLCPP_INFO(LOGGER, "Grasping in clip frame : %s", start_frame_name.c_str());
-  auto [lead_grasp_pose, follow_grasp_pose] = assignClipGoalBiDirection(start_frame_name, leader_grasp_offset_magnitude, follower_grasp_offset_magnitude);
+  Eigen::Quaterniond quat_clip2ee;
+  auto [clip_sign, lead_grasp_pose, follow_grasp_pose] = assignClipGoalsAlongConnection(start_frame_name, goal_frame_name,
+                                                                                      leader_grasp_offset_magnitude, follower_grasp_offset_magnitude,
+                                                                                      true, M_PI/4, quat_clip2ee);
+  // auto [lead_grasp_pose, follow_grasp_pose] = assignClipGoalBiDirection(start_frame_name, leader_grasp_offset_magnitude, follower_grasp_offset_magnitude);
 
   RCLCPP_INFO(LOGGER, "Inserting in clip frame : %s", goal_frame_name.c_str());
   auto [lead_target_pose, follow_target_pose] = assignClipGoal(goal_frame_name, leader_pre_insert_offset, follower_pre_insert_offset);
@@ -1207,10 +1319,13 @@ mtc::Task MTCTaskNode::createTask(std::string& start_frame_name, std::string& go
         stage_move_to_align->properties().set("follow_group", follow_arm_group_name);
         stage_move_to_align->properties().set("follow_hand_group", follow_hand_group_name);
         stage_move_to_align->properties().set("follow_base_link", follow_base_frame);
+        stage_move_to_align->properties().set("grasp_frame", start_frame_name);
+        stage_move_to_align->properties().set("goal_frame", goal_frame_name);
         stage_move_to_align->properties().set("lead_hand_to_tcp_transform", lead_hand_to_tcp_transform_);
         stage_move_to_align->properties().set("follow_hand_to_tcp_transform", follow_hand_to_tcp_transform_);
         stage_move_to_align->properties().set("lead_flange_to_tcp_transform", lead_flange_to_tcp_transform_);
         stage_move_to_align->properties().set("follow_flange_to_tcp_transform", follow_flange_to_tcp_transform_);
+        stage_move_to_align->properties().set("quat_clip2ee", quat_clip2ee);
         
         geometry_msgs::msg::PoseStamped follower_grasp_pose_transformed;
         geometry_msgs::msg::PoseStamped leader_grasp_pose_transformed;
@@ -1223,7 +1338,8 @@ mtc::Task MTCTaskNode::createTask(std::string& start_frame_name, std::string& go
         stage_move_to_align->properties().set("lead_grasp_pose", leader_grasp_pose_transformed);
         
         stage_move_to_align->properties().set("track_offset", desired_ee_distance);
-        stage_move_to_align->properties().set("follow_grasp_offset", grasp_follower_offset_magnitude);
+        stage_move_to_align->properties().set("follow_grasp_offset", follower_grasp_offset_magnitude[1]);
+        stage_move_to_align->properties().set("clip_sign", clip_sign);
         // stage_move_to_align->properties().set("merge_mode", mtc::stages::ConnectMF::MergeMode::SEQUENTIAL);
         stage_move_to_align->setEndEffector(ik_endeffectors);
 
@@ -1472,7 +1588,7 @@ mtc::Task MTCTaskNode::createTask(std::string& start_frame_name, std::string& go
   //   }
 
   /****************************************************
-  ---- *    Generate Target Pose for dual arm *
+  ---- *    Generate Target Pose for dual arm transport *
 	***************************************************/
     if (if_use_dual){
       // Target positions in clip frame

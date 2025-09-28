@@ -125,7 +125,38 @@ public:
 
 private:
   geometry_msgs::msg::PoseStamped getPoseTransform(const geometry_msgs::msg::PoseStamped& pose, const std::string& target_frame);
+  Eigen::Isometry3d getTransformIsometry(const std::string& source_frame, const std::string& target_frame);
+
   moveit_msgs::msg::Constraints createBoxConstraints(const std::string& link_name, geometry_msgs::msg::PoseStamped& goal_pose, double x_offset, double y_offset, double z_offset);
+
+  // Returns +1 if v aligns more with +Y_clip, -1 if more with -Y_clip.
+  static int signAlongClipY(const Eigen::Isometry3d& T_w_c,
+                          const Eigen::Vector3d& v_conn_w)
+  {
+    // Express connection vector in CLIP frame (rotation only).
+    Eigen::Vector3d v_c = T_w_c.linear().transpose() * v_conn_w; // R_c^T * v_w
+    const double dot_y = v_c.normalized().dot(Eigen::Vector3d::UnitY());
+    return (dot_y >= 0.0) ? +1 : -1;
+  }
+
+  static inline void assignQuat(geometry_msgs::msg::Pose& pose,
+                              const Eigen::Quaterniond& q)
+  {
+    Eigen::Quaterniond nq = q.normalized();
+    pose.orientation.w = nq.w();
+    pose.orientation.x = nq.x();
+    pose.orientation.y = nq.y();
+    pose.orientation.z = nq.z();
+  }
+
+
+  std::tuple<int, geometry_msgs::msg::PoseStamped, geometry_msgs::msg::PoseStamped> assignClipGoalsAlongConnection(const std::string& clip_frame,
+                                                                                                                        const std::string& next_clip_frame,
+                                                                                                                        const std::vector<double>& leader_grasp_offset,
+                                                                                                                        const std::vector<double>& follower_grasp_offset,
+                                                                                                                        bool tilt_follower,
+                                                                                                                        double follower_tilt_rad,
+                                                                                                                        Eigen::Quaterniond& clip2ee_quat);
 
   geometry_msgs::msg::PoseStamped createClipGoal(const std::string& goal_frame, const std::vector<double>& goal_translation_vector);
   std::pair<geometry_msgs::msg::PoseStamped, geometry_msgs::msg::PoseStamped> assignClipGoal(const std::string& goal_frame, 
