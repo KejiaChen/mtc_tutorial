@@ -1326,6 +1326,8 @@ mtc::Task MTCTaskNode::createTask(std::string& start_frame_name, std::string& go
         stage_move_to_align->properties().set("lead_flange_to_tcp_transform", lead_flange_to_tcp_transform_);
         stage_move_to_align->properties().set("follow_flange_to_tcp_transform", follow_flange_to_tcp_transform_);
         stage_move_to_align->properties().set("quat_clip2ee", quat_clip2ee);
+        stage_move_to_align->properties().set("attach_pull_cable", true);
+        stage_move_to_align->properties().set("attach_transport_cable", true);
         
         geometry_msgs::msg::PoseStamped follower_grasp_pose_transformed;
         geometry_msgs::msg::PoseStamped leader_grasp_pose_transformed;
@@ -1645,10 +1647,67 @@ mtc::Task MTCTaskNode::createTask(std::string& start_frame_name, std::string& go
       insertion_dir_vector.vector.y = insertion_vector[1];
       insertion_dir_vector.vector.z = insertion_vector[2];
 
+      // hard manipuability gate
+      ik_wrapper->properties().set("singularity_threshold", 0.10);
+
       std::map<std::string,double> manipuability_weights = {{lead_arm_group_name, 1.0}, {follow_arm_group_name, 1.0}};
-      auto translation_manipuability = moveit::task_constructor::cost::DirectionalManipulability::Space::TRANSLATION;
-      ik_wrapper->setCostTerm(std::make_unique<moveit::task_constructor::cost::DirectionalManipulability>(ik_hand_frames, insertion_dir_vector,
-                                                                                                          translation_manipuability, manipuability_weights));
+      std::map<std::string, Eigen::Isometry3d> group_tcp_offsets = {{lead_arm_group_name, lead_hand_to_tcp_transform_}, {follow_arm_group_name, follow_hand_to_tcp_transform_}};
+      // auto translation_manipuability = moveit::task_constructor::cost::DirectionalManipulability::Space::TRANSLATION;
+      // ik_wrapper->setCostTerm(std::make_unique<moveit::task_constructor::cost::DirectionalManipulability>(ik_hand_frames, insertion_dir_vector,
+      //                                                                                                     translation_manipuability, manipuability_weights));
+
+      // --- Build individual costs ---
+      auto dir_cost = std::make_shared<moveit::task_constructor::cost::DirectionalManipulability>(
+          /*group_ee=*/ik_hand_frames,
+          /*direction_vec=*/insertion_dir_vector, // geometry_msgs::msg::Vector3Stamped
+          /*space=*/moveit::task_constructor::cost::DirectionalManipulability::Space::TRANSLATION,
+          /*group_weights=*/manipuability_weights,
+          /*group_tcp_offsets=*/group_tcp_offsets,
+          /*epsilon=*/1e-4,
+          /*mode=*/moveit::task_constructor::cost::DirectionalManipulability::Mode::AUTO);
+
+      auto mani_soft = std::make_shared<moveit::task_constructor::cost::ManipulabilitySoftPenalty>(
+          /*group_ee=*/ik_hand_frames,
+          /*sigma_warn=*/3e-3,
+          /*sigma_crit=*/1e-3,
+          /*hard_gate=*/true,
+          /*weight=*/1.0);
+
+      auto manip_vol = std::make_shared<moveit::task_constructor::cost::ManipulabilityVolumeCost>(
+          /*group_ee=*/ik_hand_frames,
+          /*group_weights=*/manipuability_weights,
+          /*translation_only=*/true,                  // or false for 6D
+          /*group_tcp_offsets=*/group_tcp_offsets,           // your task TCP
+          /*lambda=*/1e-4,
+          /*mu=*/0.0,                                 // tune so typical states ≈ cost 1
+          /*weight=*/1.0);
+
+      // --- Combine them (alpha * dir + beta * soft) ---
+      auto combo = std::make_shared<moveit::task_constructor::cost::WeightedSumCost>();
+      combo->add(dir_cost,  /*alpha=*/2.0);
+      combo->add(manip_vol, /*beta =*/2.0);
+
+      // --- ComputeIK stage using the combined cost ---
+      ik_wrapper->setCostTerm(combo);          // your DirectionalManipulability works fine here (no traj → state path)
+
+      // // (Optional but recommended) Hard σmin(J) gate in a solution callback:
+      // const double SIGMA_CRIT = 1e-3;  // tune for Panda
+      // ik->setSolutionCallback([&](mtc::SolutionBase& sol, const mtc::InterfaceState& is){
+      //   const auto& rs = is.scene()->getCurrentState();
+      //   // left
+      //   const auto* jmgL = rs.getJointModelGroup("left_arm");
+      //   const auto* tipL = rs.getLinkModel("left_ee_link");
+      //   // right
+      //   const auto* jmgR = rs.getJointModelGroup("right_arm");
+      //   const auto* tipR = rs.getLinkModel("right_ee_link");
+      //   if (!jmgL || !tipL || !jmgR || !tipR) return false;
+
+      //   const double sminL = mtc_costs::sigmaMinFullJ(rs, jmgL, "left_ee_link");
+      //   const double sminR = mtc_costs::sigmaMinFullJ(rs, jmgR, "right_ee_link");
+      //   if (sminL < SIGMA_CRIT || sminR < SIGMA_CRIT) return false;  // hard reject near singular
+
+      //   return true;
+      // });
 
       align->insert(std::move(ik_wrapper));
     }
