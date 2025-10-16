@@ -16,6 +16,11 @@
 #include <tf2_ros/transform_listener.h>
 #include <boost/asio.hpp>
 #include <nlohmann/json.hpp>
+#include <moveit_msgs/msg/collision_object.hpp>
+#include <shape_msgs/msg/solid_primitive.hpp>
+#include <moveit_msgs/msg/planning_scene.hpp>
+#include <moveit/planning_scene_monitor/planning_scene_monitor.h>
+
 
 #if __has_include(<tf2_geometry_msgs/tf2_geometry_msgs.hpp>)
 #include <tf2_geometry_msgs/tf2_geometry_msgs.hpp>
