@@ -107,6 +107,136 @@ void follow_hand_callback(const sensor_msgs::msg::JointState::SharedPtr msg)
     }
 }
 
+geometry_msgs::msg::Pose poseFromAB_ZAligned(const Eigen::Vector3d& A,
+                                             const Eigen::Vector3d& B)
+{
+  geometry_msgs::msg::Pose p;
+
+  const Eigen::Vector3d dir = (B - A);
+  const double len = dir.norm();
+  if (len < 1e-6) {
+    p.position.x = A.x();
+    p.position.y = A.y();
+    p.position.z = A.z();
+    p.orientation.w = 1.0;
+    return p;
+  }
+
+  const Eigen::Vector3d mid = 0.5 * (A + B);
+  const Eigen::Quaterniond q =
+      Eigen::Quaterniond::FromTwoVectors(Eigen::Vector3d::UnitZ(), dir.normalized());
+
+  p.position.x = mid.x();
+  p.position.y = mid.y();
+  p.position.z = mid.z();
+  p.orientation.x = q.x();
+  p.orientation.y = q.y();
+  p.orientation.z = q.z();
+  p.orientation.w = q.w();
+  return p;
+}
+
+moveit_msgs::msg::CollisionObject makeCableCylinder(const std::string& id,
+                                                    const Eigen::Vector3d& A,
+                                                    const Eigen::Vector3d& B,
+                                                    double radius,
+                                                    const std::string& frame_id)
+{
+  moveit_msgs::msg::CollisionObject co;
+  co.id = id;
+  co.header.frame_id = frame_id;
+
+  const double height = (B - A).norm();
+  if (height < 1e-5) {
+    co.operation = moveit_msgs::msg::CollisionObject::ADD;
+    return co;  // degenerate; no primitive
+  }
+
+  shape_msgs::msg::SolidPrimitive prim;
+  prim.type = shape_msgs::msg::SolidPrimitive::CYLINDER;
+  prim.dimensions.resize(2);
+  prim.dimensions[shape_msgs::msg::SolidPrimitive::CYLINDER_HEIGHT] = height;
+  prim.dimensions[shape_msgs::msg::SolidPrimitive::CYLINDER_RADIUS] = radius;
+
+  co.primitives.push_back(prim);
+  co.primitive_poses.push_back(poseFromAB_ZAligned(A, B));
+  co.operation = moveit_msgs::msg::CollisionObject::ADD;  // upsert
+  return co;
+}
+
+
+// Adds/updates individual cable segments: cable_base_id_0, _1, ...
+// - Only the first `segment_count` pairs are used (lets you skip dynamic robot endpoints).
+// - If remove_stale == true, any existing cable_base_id_* beyond segment_count are removed.
+// - If set_acm_allow_with_env == true, allows cable segments with other environment objects (robot collisions remain enabled).
+void upsertCableSegmentsAndACM(moveit::planning_interface::PlanningSceneInterface& psi,
+                               const std::shared_ptr<planning_scene_monitor::PlanningSceneMonitor>& psm,
+                               const std::string& reference_frame,
+                               const std::vector<Eigen::Vector3d>& line_starts,
+                               const std::vector<Eigen::Vector3d>& line_ends,
+                               const std::string& cable_base_id,
+                               size_t segment_count,
+                               double radius,
+                               bool set_acm_allow_with_env = true,
+                               bool remove_stale = false)
+{
+  const size_t usable = std::min({segment_count, line_starts.size(), line_ends.size()});
+
+  std::vector<moveit_msgs::msg::CollisionObject> batch;
+  std::vector<std::string> live_ids;
+  batch.reserve(usable);
+  live_ids.reserve(usable);
+
+  for (size_t i = 0; i < usable; ++i) {
+    const std::string id = cable_base_id + "_" + std::to_string(i);
+    moveit_msgs::msg::CollisionObject co =
+        makeCableCylinder(id, line_starts[i], line_ends[i], radius, reference_frame);
+
+    batch.push_back(std::move(co));
+    live_ids.push_back(id);
+  }
+
+  if (!batch.empty()) {
+    psi.applyCollisionObjects(batch);
+  }
+
+  if (remove_stale) {
+    // Remove any older segments that no longer exist.
+    const std::vector<std::string> world = psi.getKnownObjectNames();
+    std::vector<std::string> to_remove;
+
+    for (const std::string& name : world) {
+      const std::string prefix = cable_base_id + "_";
+      if (name.rfind(prefix, 0) == 0) {
+        if (std::find(live_ids.begin(), live_ids.end(), name) == live_ids.end()) {
+          to_remove.push_back(name);
+        }
+      }
+    }
+
+    if (!to_remove.empty()) {
+      psi.removeCollisionObjects(to_remove);
+    }
+  }
+
+  if (set_acm_allow_with_env && psm) {
+    planning_scene_monitor::LockedPlanningSceneRW ls(psm);
+    auto& acm = ls->getAllowedCollisionMatrixNonConst();
+
+    const std::vector<std::string> world_objects = psi.getKnownObjectNames();
+    for (const std::string& cid : live_ids) {
+      for (const std::string& env : world_objects) {
+        // allow with env objects except the segment itself
+        if (env != cid) {
+          acm.setEntry(cid, env, true);
+        }
+      }
+    }
+  }
+}
+
+
+
 int main(int argc, char** argv) {
 
     rclcpp::init(argc, argv);
@@ -118,6 +248,8 @@ int main(int argc, char** argv) {
 
     moveit::planning_interface::PlanningSceneInterface psi;
     moveit::planning_interface::MoveGroupInterface move_group_interface(node, "dual_arm");
+    auto psm = std::make_shared<planning_scene_monitor::PlanningSceneMonitor>(node, "robot_description");
+    psm->requestPlanningSceneState();
 
     // TF buffer and listener
     auto tf_buffer = std::make_shared<tf2_ros::Buffer>(node->get_clock());
@@ -227,6 +359,22 @@ int main(int argc, char** argv) {
                 }
 
                 clip_names_changed = false;
+
+                size_t fixture_segment_count = 0;
+                if (clip_names.size() > 1) {
+                    fixture_segment_count = clip_names.size() - 1;
+                }
+
+                const std::string cable_base_id = "cable_seg_static";
+                const double cable_radius = 0.004;  // 4 mm
+
+                upsertCableSegmentsAndACM(psi, psm, reference_frame,
+                                            line_starts, line_ends,
+                                            cable_base_id,
+                                            fixture_segment_count,
+                                            cable_radius,
+                                            /*set_acm_allow_with_env=*/true,
+                                            /*remove_stale=*/true);
 
             }
 
