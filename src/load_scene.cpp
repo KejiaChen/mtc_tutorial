@@ -137,6 +137,29 @@ bool readPosLine(std::string pos_line, bool is_use_qb_board_coordinate, double &
 
 }
 
+bool convertPosToqboardCoordinate(double x, double y, double z,
+                                  double &num_x, double &num_y, double &num_z)
+{
+    // Board geometry
+    const double unit = 0.305 / 20.0;     // 1 grid unit = 0.01525 m
+    const double origin_x = 0.48;         // world->board origin (m)
+    const double origin_y = 0.0;
+
+    // Map world -> continuous QB index, where integer indices correspond to hole centers.
+    // The "+0.5" centers the 0 index at half a unit from the origin, matching your file format.
+    const double ix = (x - origin_x) / unit + 0.5;
+    const double iy = (y - origin_y) / unit + 0.5;
+
+    // Snap to nearest integer grid cell
+    num_x = static_cast<double>(std::llround(ix));
+    num_y = static_cast<double>(std::llround(iy));
+
+    // Height: if your world Z is meters, QB wants mm integers (common in your files)
+    // If your Z is already mm, just remove the *1000 and rounding.
+    num_z = z;
+    return true;
+}
+
 bool readOrientLine(std::string ori_line, bool is_use_qb_board_coordinate, double &qx, double &qy, double &qz, double &qw)
 {
     double num_x, num_y, num_z, num_w;
@@ -160,6 +183,35 @@ bool readOrientLine(std::string ori_line, bool is_use_qb_board_coordinate, doubl
         return true;
     }
 }
+
+bool convertOrientToqboardCoordinate(double qx, double qy, double qz, double qw,
+                                     double &num_x, double &num_y, double &num_z, double &num_w)
+{
+    // 1) extract yaw [deg]
+    tf2::Quaternion quat(qx, qy, qz, qw);
+    tf2::Matrix3x3 m(quat);
+    double roll, pitch, yaw;
+    m.getRPY(roll, pitch, yaw);                 // radians
+    double yaw_deg = yaw * 180.0 / M_PI;
+
+    // 2) snap to nearest 30°
+    constexpr double STEP = 30.0;
+    // use integer rounding to avoid FP drift like 59.999999
+    const long k = std::lround(yaw_deg / STEP);
+    double snapped = k * STEP;                  // ... now a multiple of 30
+
+    // 3) normalize to the range [-90, 270]
+    while (snapped < -90.0) snapped += 360.0;
+    while (snapped > 270.0) snapped -= 360.0;
+
+    // 4) write QB format (roll, pitch placeholders; yaw in degrees)
+    num_x = 0.0;
+    num_y = 0.0;
+    num_z = snapped;    // ∈ {-90, -60, ..., 240, 270}
+    num_w = 0.0;
+    return true;
+}
+
 
 // moveit_msgs::msg::CollisionObject makeMeshCollisionObject(
 //     const std::string& id,
@@ -237,6 +289,54 @@ std::vector<moveit_msgs::msg::CollisionObject> loadCustomScene(const std::string
     if (!fin.is_open())
     {
         throw std::runtime_error("Failed to open scene file: " + scene_path);
+        return collision_objects;
+    }
+
+    // -------- NEW: prepare an output file to save converted world poses --------
+    std::unique_ptr<std::ofstream> fout;
+    std::string out_path;
+    auto ends_with = [](const std::string& s, const std::string& suffix) -> bool {
+    return s.size() >= suffix.size() &&
+            s.compare(s.size() - suffix.size(), suffix.size(), suffix) == 0;
+    };
+
+    {
+        const auto in_path = std::filesystem::path(scene_path);
+        const std::string stem = in_path.stem().string(); // filename without extension
+
+        if (use_qb_board_coordinate)
+        {
+            // reading QB -> converting to WORLD -> write *_world.scene
+            if (ends_with(stem, "qb"))
+            {
+                const std::string base = stem.substr(0, stem.size() - 2);
+                out_path = (in_path.parent_path() / (base + "world" + in_path.extension().string())).string();
+            }
+            else
+            {
+                out_path = (in_path.parent_path() / (stem + "_world" + in_path.extension().string())).string();
+            }
+        }
+        else
+        {
+            // reading WORLD -> converting to QB -> write *_qb.scene
+            if (ends_with(stem, "world"))
+            {
+                const std::string base = stem.substr(0, stem.size() - 5);
+                out_path = (in_path.parent_path() / (base + "qb" + in_path.extension().string())).string();
+            }
+            else
+            {
+                out_path = (in_path.parent_path() / (stem + "_qb" + in_path.extension().string())).string();
+            }
+        }
+
+        fout = std::make_unique<std::ofstream>(out_path, std::ios::out | std::ios::trunc);
+        if (!(*fout))
+            throw std::runtime_error("Failed to create output scene file: " + out_path);
+
+        // Harmless header your reader ignores
+        (*fout) << "(noname)+\n";
     }
 
     std::string line;
@@ -344,6 +444,39 @@ std::vector<moveit_msgs::msg::CollisionObject> loadCustomScene(const std::string
             }
 
             collision_objects.push_back(collision_object);
+
+            if (fout)
+            {
+                if (use_qb_board_coordinate)
+                {
+                    // Already converted to WORLD by read*Line(..., true) -> write WORLD
+                    (*fout) << "* " << object_name << "\n";
+                    (*fout) << std::fixed << std::setprecision(9)
+                            << x << " " << y << " " << z << "\n";
+                    (*fout) << std::setprecision(10)
+                            << qx << " " << qy << " " << qz << " " << qw << "\n";
+                    (*fout) << "1\n" << shape_line << "\n";
+                    (*fout) << std::setprecision(9) << dx << " " << dy << " " << dz << "\n";
+                    (*fout) << "0 0 0\n" << "0 0 0 1\n" << "0 0 0 0\n" << "0\n";
+                }
+                else
+                {
+                    // Convert WORLD -> QB once
+                    double nx, ny, nz, nqx, nqy, nqz, nqw;
+                    convertPosToqboardCoordinate(x, y, z, nx, ny, nz);
+                    convertOrientToqboardCoordinate(qx, qy, qz, qw, nqx, nqy, nqz, nqw);
+
+                    (*fout) << "* " << object_name << "\n";
+                    (*fout) << std::fixed << std::setprecision(9)
+                            << nx << " " << ny << " " << nz << "\n";
+                    (*fout) << std::setprecision(10)
+                            << nqx << " " << nqy << " " << nqz << " " << nqw << "\n";
+                    (*fout) << "1\n" << shape_line << "\n";
+                    (*fout) << std::setprecision(9) << dx << " " << dy << " " << dz << "\n";
+                    (*fout) << "0 0 0\n" << "0 0 0 1\n" << "0 0 0 0\n" << "0\n";
+                }
+            }
+
 
             rclcpp::sleep_for(std::chrono::milliseconds(100));
 
