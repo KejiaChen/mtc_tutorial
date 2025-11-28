@@ -20,6 +20,8 @@
 #include <shape_msgs/msg/solid_primitive.hpp>
 #include <moveit_msgs/msg/planning_scene.hpp>
 #include <moveit/planning_scene_monitor/planning_scene_monitor.h>
+#include <moveit/collision_detection/collision_matrix.h>
+#include <nlohmann/json.hpp>
 
 
 #if __has_include(<tf2_geometry_msgs/tf2_geometry_msgs.hpp>)
@@ -154,6 +156,110 @@ private:
     pose.orientation.z = nq.z();
   }
 
+  double computeMinClearance(
+      const planning_scene::PlanningScenePtr& scene,   // note: non-const now
+      const robot_trajectory::RobotTrajectory& traj,
+      const collision_detection::AllowedCollisionMatrix& acm)
+  {
+    collision_detection::CollisionRequest req;
+    collision_detection::CollisionResult res;
+    req.distance = true;
+
+    double min_d = std::numeric_limits<double>::infinity();
+
+    // Use the scene's current state, which has the attached cable
+    moveit::core::RobotState& scene_state = scene->getCurrentStateNonConst();
+
+    for (size_t i = 0; i < traj.getWayPointCount(); ++i) {
+      const moveit::core::RobotState& wp_state = traj.getWayPoint(i);
+
+      // Copy joint values from the waypoint into the scene state
+      scene_state.setVariablePositions(wp_state.getVariablePositions());
+      scene_state.update();  // update transforms
+
+      res.clear();
+      scene->checkCollision(req, res, scene_state, acm);
+
+      if (res.collision)
+        min_d = 0.0;  // by convention; res.distance is usually 0 in collision
+      else
+        min_d = std::min(min_d, res.distance);
+    }
+
+    return min_d;
+  }
+
+
+  void attachCollisionCable(planning_scene::PlanningScenePtr scene,
+                                              const std::string& id, 
+                                              double length,
+                                              double radius,
+                                              Eigen::Vector3d vec_in_world,
+                                              const std::string& attach_link, 
+                                              std::vector<std::string> touch_links,
+                                              bool enable_cable_collision)
+  {
+      moveit_msgs::msg::AttachedCollisionObject attach_msg;
+      attach_msg.link_name = attach_link;
+      attach_msg.object.header.frame_id = attach_link;
+      attach_msg.object.id = id;
+
+      // Add geometry of cable
+      shape_msgs::msg::SolidPrimitive prim;
+      prim.type = prim.CYLINDER;
+      prim.dimensions = {length, radius}; // height (along local Z), radius
+
+      // Step 1: Create pose in TCP frame (cylinder lying along +X, end at origin)
+      Eigen::Isometry3d cylinder_pose_tcp = Eigen::Isometry3d::Identity();
+      // Convert direction from world frame into attach_link tcp frame
+      Eigen::Isometry3d world_to_hand = scene->getFrameTransform(attach_link).inverse();
+      Eigen::Vector3d vec_in_hand = world_to_hand.linear() * vec_in_world.normalized();
+      // Calculate the rotation of cylinder Z-axis to align with the direction
+      Eigen::Quaterniond align_quat = Eigen::Quaterniond::FromTwoVectors(Eigen::Vector3d::UnitZ(), vec_in_hand);
+      cylinder_pose_tcp.linear() = align_quat.toRotationMatrix();
+      // Rotate cylinder Z-axis → X-axis using +90° about Y
+      // cylinder_pose_tcp.linear() = Eigen::AngleAxisd(M_PI / 2, Eigen::Vector3d::UnitY()).toRotationMatrix();
+      // Translate it so one end sits at TCP
+      cylinder_pose_tcp.translation() =  vec_in_hand.normalized() * (0.5*length);
+      // Step 2: Transform to `left_panda_hand` frame
+      Eigen::Isometry3d cylinder_pose_in_hand = follow_hand_to_tcp_transform_ * cylinder_pose_tcp;
+      // Step 3: Convert to geometry_msgs::Pose
+      geometry_msgs::msg::Pose pose_msg = tf2::toMsg(cylinder_pose_in_hand);
+
+      // RCLCPP_INFO_STREAM(LOGGER, "Attach collision object: " << id 
+      //                           << " position: " << pose_msg.position.x << ", " << pose_msg.position.y << ", " << pose_msg.position.z 
+      //                           << " orientation: " << pose_msg.orientation.x << ", " << pose_msg.orientation.y << ", " << pose_msg.orientation.z << ", " << pose_msg.orientation.w);
+
+      attach_msg.object.primitives.push_back(prim);
+      attach_msg.object.primitive_poses.push_back(pose_msg);
+      attach_msg.object.operation = moveit_msgs::msg::CollisionObject::ADD;
+
+      // Ignore collision with both grippers
+      attach_msg.touch_links = touch_links;
+
+      scene->processAttachedCollisionObjectMsg(attach_msg);
+
+      // add the object but disable cable collision if enable_cable_collision is false
+      if (!enable_cable_collision) {
+        collision_detection::AllowedCollisionMatrix& acm = scene->getAllowedCollisionMatrixNonConst();
+
+        bool allow = true;  // always allowed to collide
+
+        // Let dlo_obj collide with everything by default
+        acm.setDefaultEntry(id, allow);
+        acm.setEntry(id, allow);
+      }
+
+      // visualization
+      Eigen::Isometry3d pose_in_world = scene->getFrameTransform(attach_link) * cylinder_pose_in_hand;
+      // Convert the pose to a geometry_msgs::Pose for visualization
+      geometry_msgs::msg::Pose pose_msg_world = tf2::toMsg(pose_in_world);
+      visual_tools_.publishCylinder(pose_msg_world, rviz_visual_tools::ORANGE, length, radius);
+      visual_tools_.trigger();
+
+  }
+
+  void printACM(const collision_detection::AllowedCollisionMatrix& acm);
 
   std::tuple<int, geometry_msgs::msg::PoseStamped, geometry_msgs::msg::PoseStamped> assignClipGoalsAlongConnection(const std::string& clip_frame,
                                                                                                                         const std::string& next_clip_frame,
@@ -233,6 +339,7 @@ private:
   std::vector<std::string> lead_franka_joint_names_ = {"right_panda_joint1", "right_panda_joint2", "right_panda_joint3", "right_panda_joint4", "right_panda_joint5", "right_panda_joint6", "right_panda_joint7"};
   std::vector<std::string> follow_franka_joint_names_ = {"left_panda_joint1", "left_panda_joint2", "left_panda_joint3", "left_panda_joint4", "left_panda_joint5", "left_panda_joint6", "left_panda_joint7"};
   std::atomic<bool> sync_udp_running_{true}; // Flag to control the UDP sync thread
+  nlohmann::json clearance_results_ = nlohmann::json::object();
 };
 
 #endif  // MTC_TASK_NODE_H

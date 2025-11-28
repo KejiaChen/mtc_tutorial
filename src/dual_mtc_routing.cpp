@@ -945,6 +945,61 @@ geometry_msgs::msg::PoseStamped MTCTaskNode::createClipGoal(const std::string& g
   return goal_pose;
 }
 
+void MTCTaskNode::printACM(const collision_detection::AllowedCollisionMatrix& acm)
+{
+  RCLCPP_INFO(LOGGER, "----- AllowedCollisionMatrix dump -----");
+
+  std::vector<std::string> entries;
+  acm.getAllEntryNames(entries);
+
+  // 1. Print entry names
+  RCLCPP_INFO(LOGGER, "ACM contains %zu entries:", entries.size());
+  for (const auto& name : entries)
+    RCLCPP_INFO_STREAM(LOGGER, "  • " << name);
+
+  // 2. Pairwise entries (explicit rules)
+  RCLCPP_INFO(LOGGER, "Pairwise collision rules (explicit entries):");
+  for (size_t i = 0; i < entries.size(); ++i) {
+    for (size_t j = i; j < entries.size(); ++j) {
+      const auto& a = entries[i];
+      const auto& b = entries[j];
+
+      collision_detection::AllowedCollision::Type type;
+      bool has_entry = acm.getEntry(a, b, type);  // <--- 3-arg version
+
+      if (!has_entry) {
+        // No explicit rule; skip or mark as unspecified
+        continue;
+        // or:
+        // RCLCPP_INFO_STREAM(LOGGER,
+        //   "  (" << a << ", " << b << ") : UNSPECIFIED");
+      } else {
+        std::string type_str;
+        switch (type) {
+          case collision_detection::AllowedCollision::ALWAYS:
+            type_str = "ALWAYS (ALLOWED)";
+            break;
+          case collision_detection::AllowedCollision::NEVER:
+            type_str = "NEVER (NOT ALLOWED)";
+            break;
+          case collision_detection::AllowedCollision::CONDITIONAL:
+            type_str = "CONDITIONAL";
+            break;
+          default:
+            type_str = "UNKNOWN";
+            break;
+        }
+
+        RCLCPP_INFO_STREAM(LOGGER,
+          "  (" << a << ", " << b << ") : " << type_str);
+      }
+    }
+  }
+
+  RCLCPP_INFO(LOGGER, "-----------------------------------------");
+}
+
+
 void MTCTaskNode::doTask(std::string& start_clip_id, std::string& goal_clip_id, bool execute, bool plan_for_dual, bool split, bool cartesian_connect, bool approach,
                         std::function<mtc::Task(std::string&, std::string&, bool, bool, bool, bool)> createTaskFn)
 {
@@ -970,6 +1025,103 @@ void MTCTaskNode::doTask(std::string& start_clip_id, std::string& goal_clip_id, 
   }
 
   RCLCPP_INFO_STREAM(LOGGER, "Task planned successfully");
+
+  if (task_.solutions().empty()) {
+    RCLCPP_WARN(LOGGER, "No solutions, skip clearance eval");
+    return;
+  }
+ 
+  clearance_results_["clip_"+goal_clip_id] = json::object();
+
+  const auto& root = *task_.solutions().front();
+  const std::string object_id = "grasped_cable";
+
+  // Which subtrajectory index inside "move to align" we care about
+  const int target_idx = 3;  // adjust if you mean 0-based or 1-based
+  int seen_in_move_to_align = 0;
+
+  std::function<void(const mtc::SolutionBase&)> recurse;
+  recurse = [&](const mtc::SolutionBase& s)
+  {
+    // Leaf: SubTrajectory
+    if (auto* sub = dynamic_cast<const mtc::SubTrajectory*>(&s)) {
+      const auto* stage = sub->creator();
+      if (!stage) return;
+
+      if (stage->name() == "move to align") {
+        // Count subtrajectories for this stage
+        int this_idx = seen_in_move_to_align++;
+        RCLCPP_INFO_STREAM(LOGGER,
+            "Found 'move to align' SubTrajectory index " << this_idx);
+
+        if (this_idx == target_idx) {
+        // {
+          RCLCPP_INFO(LOGGER, "Evaluating clearance on target 'move to align' subtrajectory");
+
+          const mtc::InterfaceState* start_interface_state = sub->start();
+          if (!start_interface_state) {
+            RCLCPP_WARN(LOGGER, "SubTrajectory has no start state");
+            return;
+          }
+
+          // Base scene: no cable attached
+          planning_scene::PlanningSceneConstPtr base_scene = start_interface_state->scene();
+          const auto& rs    = base_scene->getCurrentState();
+
+          // Make a modifiable copy and attach cable for evaluation
+          planning_scene::PlanningScenePtr eval_scene = base_scene->diff();
+          Eigen::Isometry3d leader_hand_transform = rs.getGlobalLinkTransform("right_panda_hand") * lead_hand_to_tcp_transform_;
+          Eigen::Isometry3d follower_hand_transform = rs.getGlobalLinkTransform("left_panda_hand") * follow_hand_to_tcp_transform_;
+          Eigen::Vector3d cable_vector_in_world = (leader_hand_transform.translation() - follower_hand_transform.translation()).normalized();
+          attachCollisionCable(eval_scene, object_id, 0.1, 0.01, cable_vector_in_world, "left_panda_hand",
+                               {"left_panda_hand", "left_panda_leftfinger", "left_panda_rightfinger", "right_panda_hand", "right_panda_leftfinger", "right_panda_rightfinger"},
+                              true);
+
+          // Get the trajectory for THIS subtrajectory
+          auto traj_ptr = sub->trajectory();
+          if (!traj_ptr) {
+            RCLCPP_WARN(LOGGER, "SubTrajectory has no RobotTrajectory");
+            return;
+          }
+          const robot_trajectory::RobotTrajectory& traj = *traj_ptr;
+
+          // Base ACM from the eval scene
+          collision_detection::AllowedCollisionMatrix acm_base =
+              eval_scene->getAllowedCollisionMatrix();
+
+          // A) Robot-only clearance: ignore cable collisions
+          collision_detection::AllowedCollisionMatrix acm_robot_only = acm_base;
+          acm_robot_only.setDefaultEntry(object_id, true);
+          acm_robot_only.setEntry(object_id, true);
+
+          // B) Robot + cable clearance: enforce cable collisions
+          collision_detection::AllowedCollisionMatrix acm_with_object = acm_base;
+          acm_with_object.removeEntry(object_id);
+
+          // printACM(acm_base);
+          // printACM(acm_robot_only);
+          // printACM(acm_with_object);
+
+          double clearance_robot_only = computeMinClearance(eval_scene, traj, acm_robot_only);
+          double clearance_with_object = computeMinClearance(eval_scene, traj, acm_with_object);
+
+          RCLCPP_INFO_STREAM(LOGGER,
+              "[move to align, subtraj " << this_idx << "] Clearance (robot only): "
+              << clearance_robot_only
+              << " | Clearance (robot + grasped_cable): "
+              << clearance_with_object);
+        }
+      }
+    }
+
+    // Container: SolutionSequence → recurse into children
+    if (auto* seq = dynamic_cast<const mtc::SolutionSequence*>(&s)) {
+      for (const mtc::SolutionBase* child : seq->solutions())
+        recurse(*child);
+    }
+  };
+
+  recurse(root);
 
   // Publish the solution
   // task_.introspection().publishSolution(*task_.solutions().front(), publish_mtc_trajectory);
@@ -1326,9 +1478,9 @@ mtc::Task MTCTaskNode::createTask(std::string& start_frame_name, std::string& go
         stage_move_to_align->properties().set("lead_flange_to_tcp_transform", lead_flange_to_tcp_transform_);
         stage_move_to_align->properties().set("follow_flange_to_tcp_transform", follow_flange_to_tcp_transform_);
         stage_move_to_align->properties().set("quat_clip2ee", quat_clip2ee);
-        stage_move_to_align->properties().set("attach_pull_cable", true);
-        stage_move_to_align->properties().set("attach_transport_cable", true);
-        
+        stage_move_to_align->properties().set("attach_pull_cable", node_->get_parameter("attach_pull_cable").as_bool());
+        stage_move_to_align->properties().set("attach_transport_cable", node_->get_parameter("attach_transport_cable").as_bool());
+
         geometry_msgs::msg::PoseStamped follower_grasp_pose_transformed;
         geometry_msgs::msg::PoseStamped leader_grasp_pose_transformed;
         follower_grasp_pose_transformed = getPoseTransform(follow_grasp_pose, "world");
@@ -1676,7 +1828,7 @@ mtc::Task MTCTaskNode::createTask(std::string& start_frame_name, std::string& go
       auto manip_vol = std::make_shared<moveit::task_constructor::cost::ManipulabilityVolumeCost>(
           /*group_ee=*/ik_hand_frames,
           /*group_weights=*/manipuability_weights,
-          /*translation_only=*/true,                  // or false for 6D
+          /*translation_only=*/false,                  // or false for 6D
           /*group_tcp_offsets=*/group_tcp_offsets,           // your task TCP
           /*lambda=*/1e-4,
           /*mu=*/0.0,                                 // tune so typical states ≈ cost 1
