@@ -102,6 +102,13 @@ public:
 
   void setSelectOrientation(bool select_orientation) { select_orientation_ = select_orientation; }
 
+  void saveClearanceToJson(const std::string& file_path)
+  {
+    std::ofstream ofs(file_path);
+    ofs << clearance_results_;
+    ofs.close();
+  }
+
   // void loadCustomScene(const std::string &path);
 
   // Robot group names
@@ -260,6 +267,11 @@ private:
   }
 
   void printACM(const collision_detection::AllowedCollisionMatrix& acm);
+
+  void evaluateClearance(
+    std::string clip_id,
+    std::string object_id,
+    std::vector<std::string> target_stages_and_indices);
 
   std::tuple<int, geometry_msgs::msg::PoseStamped, geometry_msgs::msg::PoseStamped> assignClipGoalsAlongConnection(const std::string& clip_frame,
                                                                                                                         const std::string& next_clip_frame,

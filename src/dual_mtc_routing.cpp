@@ -125,6 +125,12 @@ MTCTaskNode::MTCTaskNode(const rclcpp::NodeOptions& options)
                                         std::ref(follow_ee_pose_mutex_)                 // EE pose mutex
                                         );
 
+  
+  bool attach_pull = node_->get_parameter("attach_pull_cable").as_bool();
+  bool attach_transport = node_->get_parameter("attach_transport_cable").as_bool();
+  clearance_results_["attach_pull_cable"] = attach_pull;
+  clearance_results_["attach_transport_cable"] = attach_transport;
+
   // CAUTION: flange_to_tcp stands for the transform from panda_link_8 to TCP
   // In comparison to hand_to_tcp, there is additional rotation of 45 degree around z axis, and an optional z offset because of wrist snesor
   // adapt flange to TCP transform based on the wrist sensor's height
@@ -999,6 +1005,198 @@ void MTCTaskNode::printACM(const collision_detection::AllowedCollisionMatrix& ac
   RCLCPP_INFO(LOGGER, "-----------------------------------------");
 }
 
+void MTCTaskNode::evaluateClearance(
+    std::string clip_id,
+    std::string object_id,
+    std::vector<std::string> target_stages_and_indices)
+{
+  // JSON node for this clip
+  nlohmann::json& clip_clearance = clearance_results_[clip_id];
+
+  if (task_.solutions().empty()) {
+    RCLCPP_WARN(LOGGER, "No solutions; skip clearance eval");
+    return;
+  }
+
+  const auto& root = *task_.solutions().front();
+
+  // --------------------------------------------------------------------------
+  // 1) Parse targets:
+  //
+  //    If entry is "stage_subtraj_i":
+  //       stage_to_indices[stage] = { i }
+  //
+  //    If entry is "stage":
+  //       stage_to_indices[stage] = empty set  (meaning ALL subtrajectories)
+  //
+  // --------------------------------------------------------------------------
+  std::unordered_map<std::string, std::set<int>> stage_to_indices;
+
+  for (const auto& entry : target_stages_and_indices) {
+    const std::string pat = "_subtraj_";
+    auto pos = entry.rfind(pat);
+
+    if (pos == std::string::npos) {
+      // Pure stage name (no index)
+      stage_to_indices[entry] = {};  // empty set => all subtrajs
+      continue;
+    }
+
+    // Has index component
+    std::string stage_name = entry.substr(0, pos);
+    std::string idx_str    = entry.substr(pos + pat.size());
+
+    try {
+      int idx = std::stoi(idx_str);
+      stage_to_indices[stage_name].insert(idx);
+    } catch (...) {
+      RCLCPP_WARN_STREAM(LOGGER,
+                         "Cannot parse target entry '" << entry
+                         << "'; expected '<stage>_subtraj_<idx>'");
+    }
+  }
+
+  if (stage_to_indices.empty()) {
+    RCLCPP_WARN(LOGGER, "evaluateClearance: no valid targets parsed");
+    return;
+  }
+
+  // --------------------------------------------------------------------------
+  // 2) Recursively walk solution tree and evaluate matching subtrajectories
+  //
+  //    For each stage:
+  //      stage_seen_count keeps the current subtrajectory index
+  // --------------------------------------------------------------------------
+  std::unordered_map<std::string, int> stage_seen_count;
+
+  std::function<void(const mtc::SolutionBase&)> recurse;
+  recurse = [&](const mtc::SolutionBase& s)
+  {
+    // Leaf: SubTrajectory
+    if (auto* sub = dynamic_cast<const mtc::SubTrajectory*>(&s)) {
+      const auto* stage = sub->creator();
+      if (!stage) return;
+
+      const std::string stage_name = stage->name();
+
+      auto it = stage_to_indices.find(stage_name);
+      if (it != stage_to_indices.end()) {
+        // Count subtrajs for this stage
+        int this_idx = stage_seen_count[stage_name]++;
+        RCLCPP_INFO_STREAM(LOGGER,
+           "Stage '" << stage_name << "' subtraj index " << this_idx);
+
+        const auto& target_indices = it->second;
+
+        // Decide whether this subtraj should be evaluated
+        bool evaluate_this_subtraj = false;
+        if (target_indices.empty()) {
+          // Empty set means ALL subtrajectories
+          evaluate_this_subtraj = true;
+        } else {
+          // Only evaluate if index matches
+          evaluate_this_subtraj = target_indices.count(this_idx) > 0;
+        }
+
+        if (evaluate_this_subtraj) {
+          RCLCPP_INFO_STREAM(LOGGER,
+              "Evaluating clearance on stage '" << stage_name
+              << "', subtraj " << this_idx);
+
+          // JSON node for this stage
+          nlohmann::json& stage_json =
+              clip_clearance[stage_name];  // creates object automatically
+
+          // ----------------------------
+          // Same evaluation logic as before
+          // ----------------------------
+          const mtc::InterfaceState* start_interface_state = sub->start();
+          if (!start_interface_state) {
+            RCLCPP_WARN(LOGGER, "SubTrajectory has no start state");
+            return;
+          }
+
+          planning_scene::PlanningSceneConstPtr base_scene =
+              start_interface_state->scene();
+          const auto& rs = base_scene->getCurrentState();
+
+          // Build evaluation scene
+          planning_scene::PlanningScenePtr eval_scene = base_scene->diff();
+
+          Eigen::Isometry3d leader_hand_transform =
+              rs.getGlobalLinkTransform("right_panda_hand") *
+              lead_hand_to_tcp_transform_;
+          Eigen::Isometry3d follower_hand_transform =
+              rs.getGlobalLinkTransform("left_panda_hand") *
+              follow_hand_to_tcp_transform_;
+
+          Eigen::Vector3d cable_vec =
+              (leader_hand_transform.translation() -
+               follower_hand_transform.translation())
+                  .normalized();
+
+          attachCollisionCable(
+              eval_scene, object_id,
+              0.1, 0.01, cable_vec, "left_panda_hand",
+              {"left_panda_hand", "left_panda_leftfinger", "left_panda_rightfinger",
+               "right_panda_hand", "right_panda_leftfinger", "right_panda_rightfinger"},
+              true);
+
+          // Retrieve trajectory
+          auto traj_ptr = sub->trajectory();
+          if (!traj_ptr) {
+            RCLCPP_WARN(LOGGER, "SubTrajectory has no RobotTrajectory");
+            return;
+          }
+          const robot_trajectory::RobotTrajectory& traj = *traj_ptr;
+
+          collision_detection::AllowedCollisionMatrix acm_base =
+              eval_scene->getAllowedCollisionMatrix();
+
+          // ACM for robot-only (ignore cable)
+          collision_detection::AllowedCollisionMatrix acm_robot_only = acm_base;
+          acm_robot_only.setDefaultEntry(object_id, true);
+          acm_robot_only.setEntry(object_id, true);
+
+          // ACM for robot+cable
+          collision_detection::AllowedCollisionMatrix acm_with_object = acm_base;
+          acm_with_object.removeEntry(object_id);
+
+          // Compute
+          double clearance_robot_only =
+              computeMinClearance(eval_scene, traj, acm_robot_only);
+          double clearance_with_object =
+              computeMinClearance(eval_scene, traj, acm_with_object);
+
+          // double stage_cost = sub->cost();
+
+          // Print
+          RCLCPP_INFO_STREAM(LOGGER,
+              "[" << stage_name << ", subtraj " << this_idx
+              << "] clearance(robot only)=" << clearance_robot_only
+              << ", clearance(with object)=" << clearance_with_object);
+
+          // Store
+          stage_json["subtraj_" + std::to_string(this_idx)] = {
+            {"clearance_robot_only",  clearance_robot_only},
+            {"clearance_with_object", clearance_with_object}
+            // {"stage_cost",           stage_cost}
+          };
+        }
+      }
+    }
+
+    // Container → recurse
+    if (auto* seq = dynamic_cast<const mtc::SolutionSequence*>(&s)) {
+      for (const mtc::SolutionBase* child : seq->solutions())
+        recurse(*child);
+    }
+  };
+
+  recurse(root);
+}
+
+
 
 void MTCTaskNode::doTask(std::string& start_clip_id, std::string& goal_clip_id, bool execute, bool plan_for_dual, bool split, bool cartesian_connect, bool approach,
                         std::function<mtc::Task(std::string&, std::string&, bool, bool, bool, bool)> createTaskFn)
@@ -1030,98 +1228,13 @@ void MTCTaskNode::doTask(std::string& start_clip_id, std::string& goal_clip_id, 
     RCLCPP_WARN(LOGGER, "No solutions, skip clearance eval");
     return;
   }
- 
-  clearance_results_["clip_"+goal_clip_id] = json::object();
 
-  const auto& root = *task_.solutions().front();
-  const std::string object_id = "grasped_cable";
+  evaluateClearance(
+      "clip_" + goal_clip_id,
+      "grasped_cable",
+      {"move to align_subtraj_3"}
+  );
 
-  // Which subtrajectory index inside "move to align" we care about
-  const int target_idx = 3;  // adjust if you mean 0-based or 1-based
-  int seen_in_move_to_align = 0;
-
-  std::function<void(const mtc::SolutionBase&)> recurse;
-  recurse = [&](const mtc::SolutionBase& s)
-  {
-    // Leaf: SubTrajectory
-    if (auto* sub = dynamic_cast<const mtc::SubTrajectory*>(&s)) {
-      const auto* stage = sub->creator();
-      if (!stage) return;
-
-      if (stage->name() == "move to align") {
-        // Count subtrajectories for this stage
-        int this_idx = seen_in_move_to_align++;
-        RCLCPP_INFO_STREAM(LOGGER,
-            "Found 'move to align' SubTrajectory index " << this_idx);
-
-        if (this_idx == target_idx) {
-        // {
-          RCLCPP_INFO(LOGGER, "Evaluating clearance on target 'move to align' subtrajectory");
-
-          const mtc::InterfaceState* start_interface_state = sub->start();
-          if (!start_interface_state) {
-            RCLCPP_WARN(LOGGER, "SubTrajectory has no start state");
-            return;
-          }
-
-          // Base scene: no cable attached
-          planning_scene::PlanningSceneConstPtr base_scene = start_interface_state->scene();
-          const auto& rs    = base_scene->getCurrentState();
-
-          // Make a modifiable copy and attach cable for evaluation
-          planning_scene::PlanningScenePtr eval_scene = base_scene->diff();
-          Eigen::Isometry3d leader_hand_transform = rs.getGlobalLinkTransform("right_panda_hand") * lead_hand_to_tcp_transform_;
-          Eigen::Isometry3d follower_hand_transform = rs.getGlobalLinkTransform("left_panda_hand") * follow_hand_to_tcp_transform_;
-          Eigen::Vector3d cable_vector_in_world = (leader_hand_transform.translation() - follower_hand_transform.translation()).normalized();
-          attachCollisionCable(eval_scene, object_id, 0.1, 0.01, cable_vector_in_world, "left_panda_hand",
-                               {"left_panda_hand", "left_panda_leftfinger", "left_panda_rightfinger", "right_panda_hand", "right_panda_leftfinger", "right_panda_rightfinger"},
-                              true);
-
-          // Get the trajectory for THIS subtrajectory
-          auto traj_ptr = sub->trajectory();
-          if (!traj_ptr) {
-            RCLCPP_WARN(LOGGER, "SubTrajectory has no RobotTrajectory");
-            return;
-          }
-          const robot_trajectory::RobotTrajectory& traj = *traj_ptr;
-
-          // Base ACM from the eval scene
-          collision_detection::AllowedCollisionMatrix acm_base =
-              eval_scene->getAllowedCollisionMatrix();
-
-          // A) Robot-only clearance: ignore cable collisions
-          collision_detection::AllowedCollisionMatrix acm_robot_only = acm_base;
-          acm_robot_only.setDefaultEntry(object_id, true);
-          acm_robot_only.setEntry(object_id, true);
-
-          // B) Robot + cable clearance: enforce cable collisions
-          collision_detection::AllowedCollisionMatrix acm_with_object = acm_base;
-          acm_with_object.removeEntry(object_id);
-
-          // printACM(acm_base);
-          // printACM(acm_robot_only);
-          // printACM(acm_with_object);
-
-          double clearance_robot_only = computeMinClearance(eval_scene, traj, acm_robot_only);
-          double clearance_with_object = computeMinClearance(eval_scene, traj, acm_with_object);
-
-          RCLCPP_INFO_STREAM(LOGGER,
-              "[move to align, subtraj " << this_idx << "] Clearance (robot only): "
-              << clearance_robot_only
-              << " | Clearance (robot + grasped_cable): "
-              << clearance_with_object);
-        }
-      }
-    }
-
-    // Container: SolutionSequence → recurse into children
-    if (auto* seq = dynamic_cast<const mtc::SolutionSequence*>(&s)) {
-      for (const mtc::SolutionBase* child : seq->solutions())
-        recurse(*child);
-    }
-  };
-
-  recurse(root);
 
   // Publish the solution
   // task_.introspection().publishSolution(*task_.solutions().front(), publish_mtc_trajectory);
@@ -1828,7 +1941,7 @@ mtc::Task MTCTaskNode::createTask(std::string& start_frame_name, std::string& go
       auto manip_vol = std::make_shared<moveit::task_constructor::cost::ManipulabilityVolumeCost>(
           /*group_ee=*/ik_hand_frames,
           /*group_weights=*/manipuability_weights,
-          /*translation_only=*/false,                  // or false for 6D
+          /*translation_only=*/true,                  // or false for 6D
           /*group_tcp_offsets=*/group_tcp_offsets,           // your task TCP
           /*lambda=*/1e-4,
           /*mu=*/0.0,                                 // tune so typical states ≈ cost 1
@@ -2501,6 +2614,9 @@ int main(int argc, char** argv)
     }
 
   }
+
+  // save json locally
+  mtc_task_node->saveClearanceToJson("planning_clearance_results.json");
 
   // move back home
   std_msgs::msg::String task_id_msg;
