@@ -40,31 +40,6 @@ static const rclcpp::Logger LOGGER = rclcpp::get_logger("mtc_node");
 
 double desired_ee_distance = 0.12;
 
-// scene configuration
-std::vector<double> clip_size = {0.04, 0.04, 0.06}; // U clip: 0.4, 0.4, 0.11; C clip : 0.04, 0.04, 0.06
-double insertion_offset_magnitude = 0.03; 
-double grasp_follower_offset_magnitude = 0.04;
-double grasp_leader_offset_magnitude = desired_ee_distance + grasp_follower_offset_magnitude;
-double hold_y_offset = 0.04;
-double hold_z_offset = 0.01;
-// std::vector<double> leader_pre_insert_offset = {-(clip_size[0]/2+hold_x_offset), -clip_size[1]/2, clip_size[2]/2};
-// std::vector<double> follower_pre_insert_offset = {clip_size[0]/2+hold_x_offset, -clip_size[1]/2, clip_size[2]/2};
-
-// U-type Clip
-// std::vector<double> insertion_vector = {0, 0, -(insertion_offset_magnitude)}; // Caution: this doens't set insertion distance
-// std::vector<double> leader_pre_insert_offset = {0, -(clip_size[1]/2+hold_y_offset), clip_size[2]/2-2*hold_z_offset};
-// std::vector<double> follower_pre_insert_offset = {0, clip_size[1]/2+hold_y_offset, clip_size[2]/2-2*hold_z_offset}; 
-// std::vector<double> leader_grasp_offset_magnitude = {0, -(clip_size[1]/2+grasp_leader_offset_magnitude), clip_size[2]/2-2*hold_z_offset};
-// std::vector<double> follower_grasp_offset_magnitude = {0, -(clip_size[1]/2+grasp_follower_offset_magnitude), clip_size[2]/2-2*hold_z_offset};
-
-// // C-type Clip
-std::vector<double> insertion_vector = {-insertion_offset_magnitude, 0, 0};
-// offset in clip frame
-std::vector<double> leader_pre_insert_offset = {(-insertion_offset_magnitude+clip_size[0]/2), -(clip_size[1]/2+hold_y_offset), clip_size[2]/2+hold_z_offset};
-std::vector<double> follower_pre_insert_offset = {(-insertion_offset_magnitude+clip_size[0]/2), clip_size[1]/2+hold_y_offset, clip_size[2]/2+hold_z_offset}; 
-std::vector<double> leader_grasp_offset_magnitude = {0, (clip_size[1]/2+grasp_leader_offset_magnitude), clip_size[2]/2+hold_z_offset};
-std::vector<double> follower_grasp_offset_magnitude = {0, (clip_size[1]/2+grasp_follower_offset_magnitude), clip_size[2]/2+hold_z_offset};
-
 double default_franka_flange_to_tcp_z = 0.1034;
 double sensone_height = 0.036; 
 double extend_finger_length = 0.01;
@@ -101,6 +76,17 @@ MTCTaskNode::MTCTaskNode(const rclcpp::NodeOptions& options)
     rclcpp::sleep_for(std::chrono::milliseconds(100));
   }
   RCLCPP_INFO(LOGGER, "Joint states received.");
+
+  // scene configuration
+  insertion_offset_magnitude_ = 0.03; 
+  grasp_follower_offset_magnitude_ = 0.04;
+  grasp_leader_offset_magnitude_ = desired_ee_distance + grasp_follower_offset_magnitude_;
+  hold_y_offset_ = 0.04;
+  hold_z_offset_ = 0.01;
+  // std::vector<double> leader_pre_insert_offset_ = {-(clip_size[0]/2+hold_x_offset), -clip_size[1]/2, clip_size[2]/2};
+  // std::vector<double> follower_pre_insert_offset_ = {clip_size[0]/2+hold_x_offset, -clip_size[1]/2, clip_size[2]/2};
+  // update with default clip size
+  updateClipOffsets();
 
   // initialize udp sync with real-world
   udp_thread_lead_sync_ = std::thread(&MTCTaskNode::udpReceiverSync, // member function pointer
@@ -598,16 +584,16 @@ void MTCTaskNode::publishSolutionSubTraj(std::string goal_clip_name, const movei
       continue;
 
     // visualize trajectories
-    moveit_msgs::msg::RobotTrajectory robot_trajectory;
-    robot_trajectory.joint_trajectory = sub_trajectory.trajectory.joint_trajectory;
+    moveit_msgs::msg::RobotTrajectory robot_trajectory_msg;
+    robot_trajectory_msg.joint_trajectory = sub_trajectory.trajectory.joint_trajectory;
 
-    visual_tools_.publishTrajectoryLine(robot_trajectory, move_group_.getCurrentState()->getJointModelGroup(lead_arm_group_name),
+    visual_tools_.publishTrajectoryLine(robot_trajectory_msg, move_group_.getCurrentState()->getJointModelGroup(lead_arm_group_name),
                                         lead_flange_to_tcp_transform_, goal_clip_name, sub_trajectory.info.stage_id, index, 
                                         "/home/tp2/ws_humble/trajectories_leader", rviz_visual_tools::ORANGE, lead_base_frame);
-    visual_tools_.publishTrajectoryLine(robot_trajectory, move_group_.getCurrentState()->getJointModelGroup(follow_arm_group_name),
+    visual_tools_.publishTrajectoryLine(robot_trajectory_msg, move_group_.getCurrentState()->getJointModelGroup(follow_arm_group_name),
                                         follow_flange_to_tcp_transform_, goal_clip_name, sub_trajectory.info.stage_id, index, 
                                         "/home/tp2/ws_humble/trajectories_follower", rviz_visual_tools::BLUE, follow_base_frame);
-    // visual_tools_.publishTrajectoryLine(robot_trajectory, move_group_.getCurrentState()->getLinkModel(lead_hand_frame));
+    // visual_tools_.publishTrajectoryLine(robot_trajectory_msg, move_group_.getCurrentState()->getLinkModel(lead_hand_frame));
     visual_tools_.trigger();
 
     // renumber trajectory id
@@ -1005,13 +991,39 @@ void MTCTaskNode::printACM(const collision_detection::AllowedCollisionMatrix& ac
   RCLCPP_INFO(LOGGER, "-----------------------------------------");
 }
 
-void MTCTaskNode::evaluateClearance(
-    std::string clip_id,
-    std::string object_id,
-    std::vector<std::string> target_stages_and_indices)
+// Get JSON node at clip_clearance[ path[0] ][ path[1] ] ...
+static nlohmann::json& getJsonNode(nlohmann::json& root,
+                                   const std::vector<std::string>& path)
 {
-  // JSON node for this clip
-  nlohmann::json& clip_clearance = clearance_results_[clip_id];
+  nlohmann::json* node = &root;
+  for (const auto& key : path)
+    node = &((*node)[key]);  // creates object nodes as needed
+  return *node;
+}
+
+// Get JSON node at clip_clearance[ path... ][leaf_key]
+static nlohmann::json& getJsonNode(nlohmann::json& root,
+                                   const std::vector<std::string>& path,
+                                   const std::string& leaf_key)
+{
+  nlohmann::json* node = &root;
+  for (const auto& key : path)
+    node = &((*node)[key]);
+  return (*node)[leaf_key];  // creates leaf object as needed
+}
+
+
+void MTCTaskNode::evaluateClearance(
+    const std::string& task_name,                    // NEW
+    const std::string& clip_id,
+    const std::string& object_id,
+    const std::vector<std::string>& target_stages_and_indices)
+{
+  // Top-level: clip
+  nlohmann::json& clip_node = clearance_results_[clip_id];
+
+  // Under clip: task (e.g. "routing task", "post routing task")
+  nlohmann::json& task_clearance = clip_node[task_name];
 
   if (task_.solutions().empty()) {
     RCLCPP_WARN(LOGGER, "No solutions; skip clearance eval");
@@ -1019,16 +1031,15 @@ void MTCTaskNode::evaluateClearance(
   }
 
   const auto& root = *task_.solutions().front();
+  const std::string root_stage_name = task_.stages()->name();
+
+  // Total solution cost for THIS task and clip
+  task_clearance["total_solution_cost"] = root.cost();
 
   // --------------------------------------------------------------------------
   // 1) Parse targets:
-  //
-  //    If entry is "stage_subtraj_i":
-  //       stage_to_indices[stage] = { i }
-  //
-  //    If entry is "stage":
-  //       stage_to_indices[stage] = empty set  (meaning ALL subtrajectories)
-  //
+  //    "stage_subtraj_i" -> stage_to_indices[stage] = { i }
+  //    "stage"           -> stage_to_indices[stage] = empty set (ALL subtrajs)
   // --------------------------------------------------------------------------
   std::unordered_map<std::string, std::set<int>> stage_to_indices;
 
@@ -1037,22 +1048,21 @@ void MTCTaskNode::evaluateClearance(
     auto pos = entry.rfind(pat);
 
     if (pos == std::string::npos) {
-      // Pure stage name (no index)
-      stage_to_indices[entry] = {};  // empty set => all subtrajs
+      // pure stage name: all subtrajectories for that stage
+      stage_to_indices[entry] = {};
       continue;
     }
 
-    // Has index component
     std::string stage_name = entry.substr(0, pos);
     std::string idx_str    = entry.substr(pos + pat.size());
 
     try {
       int idx = std::stoi(idx_str);
       stage_to_indices[stage_name].insert(idx);
-    } catch (...) {
+    } catch (const std::exception& e) {
       RCLCPP_WARN_STREAM(LOGGER,
-                         "Cannot parse target entry '" << entry
-                         << "'; expected '<stage>_subtraj_<idx>'");
+          "evaluateClearance: cannot parse target entry '"
+          << entry << "': " << e.what());
     }
   }
 
@@ -1062,17 +1072,39 @@ void MTCTaskNode::evaluateClearance(
   }
 
   // --------------------------------------------------------------------------
-  // 2) Recursively walk solution tree and evaluate matching subtrajectories
-  //
-  //    For each stage:
-  //      stage_seen_count keeps the current subtrajectory index
+  // 2) Recursively walk the solution tree
+  //    - record stage_cost from *any* SolutionBase with a creator()
+  //    - compute clearance for matching SubTrajectories
   // --------------------------------------------------------------------------
   std::unordered_map<std::string, int> stage_seen_count;
 
   std::function<void(const mtc::SolutionBase&)> recurse;
   recurse = [&](const mtc::SolutionBase& s)
   {
-    // Leaf: SubTrajectory
+    // Stage-level cost (like MTC GUI)
+    if (const auto* stage = s.creator()) {
+      const std::string stage_name = stage->name();
+      double stage_cost = s.cost();   // what GUI shows on that node
+
+      // JSON node for this stage under THIS task
+      // SKIP writing stage costs for the TASK ROOT
+    if (stage_name == root_stage_name) {
+        // we still use its cost for total_solution_cost above
+        // but do NOT create a stage node with same name
+        // simply return and continue recursion
+    } else {
+        nlohmann::json& stage_json = task_clearance[stage_name];
+
+        if (!stage_json.contains("stage_cost")) {
+          stage_json["stage_cost"] = stage_cost;
+          RCLCPP_INFO_STREAM(LOGGER,
+              "Stage '" << stage_name << "' solution cost (GUI-style): "
+                        << stage_cost);
+        }
+      }
+    }
+
+    // Leaf: SubTrajectory -> clearance logic
     if (auto* sub = dynamic_cast<const mtc::SubTrajectory*>(&s)) {
       const auto* stage = sub->creator();
       if (!stage) return;
@@ -1081,20 +1113,18 @@ void MTCTaskNode::evaluateClearance(
 
       auto it = stage_to_indices.find(stage_name);
       if (it != stage_to_indices.end()) {
-        // Count subtrajs for this stage
+        // Count subtrajectories for this stage
         int this_idx = stage_seen_count[stage_name]++;
         RCLCPP_INFO_STREAM(LOGGER,
            "Stage '" << stage_name << "' subtraj index " << this_idx);
 
         const auto& target_indices = it->second;
-
-        // Decide whether this subtraj should be evaluated
         bool evaluate_this_subtraj = false;
+
         if (target_indices.empty()) {
-          // Empty set means ALL subtrajectories
+          // no specific index requested => ALL subtrajectories
           evaluate_this_subtraj = true;
         } else {
-          // Only evaluate if index matches
           evaluate_this_subtraj = target_indices.count(this_idx) > 0;
         }
 
@@ -1103,46 +1133,37 @@ void MTCTaskNode::evaluateClearance(
               "Evaluating clearance on stage '" << stage_name
               << "', subtraj " << this_idx);
 
-          // JSON node for this stage
-          nlohmann::json& stage_json =
-              clip_clearance[stage_name];  // creates object automatically
+          // JSON node for this stage under THIS task
+          nlohmann::json& stage_json = task_clearance[stage_name];
 
-          // ----------------------------
-          // Same evaluation logic as before
-          // ----------------------------
+          // -------- clearance computation (unchanged) --------
           const mtc::InterfaceState* start_interface_state = sub->start();
           if (!start_interface_state) {
             RCLCPP_WARN(LOGGER, "SubTrajectory has no start state");
             return;
           }
 
+          // Base scene: no cable attached
           planning_scene::PlanningSceneConstPtr base_scene =
               start_interface_state->scene();
           const auto& rs = base_scene->getCurrentState();
 
-          // Build evaluation scene
+          // Make a modifiable copy and attach cable for evaluation
           planning_scene::PlanningScenePtr eval_scene = base_scene->diff();
-
-          Eigen::Isometry3d leader_hand_transform =
-              rs.getGlobalLinkTransform("right_panda_hand") *
-              lead_hand_to_tcp_transform_;
+          Eigen::Isometry3d leader_hand_transform = rs.getGlobalLinkTransform("right_panda_hand") * lead_hand_to_tcp_transform_;
           Eigen::Isometry3d follower_hand_transform =
               rs.getGlobalLinkTransform("left_panda_hand") *
               follow_hand_to_tcp_transform_;
-
-          Eigen::Vector3d cable_vec =
-              (leader_hand_transform.translation() -
-               follower_hand_transform.translation())
-                  .normalized();
+          Eigen::Vector3d cable_vector_in_world = (leader_hand_transform.translation() - follower_hand_transform.translation()).normalized();
 
           attachCollisionCable(
               eval_scene, object_id,
-              0.1, 0.01, cable_vec, "left_panda_hand",
+              0.1, 0.01, cable_vector_in_world, "left_panda_hand",
               {"left_panda_hand", "left_panda_leftfinger", "left_panda_rightfinger",
                "right_panda_hand", "right_panda_leftfinger", "right_panda_rightfinger"},
               true);
 
-          // Retrieve trajectory
+          // Get the trajectory for THIS subtrajectory
           auto traj_ptr = sub->trajectory();
           if (!traj_ptr) {
             RCLCPP_WARN(LOGGER, "SubTrajectory has no RobotTrajectory");
@@ -1150,43 +1171,39 @@ void MTCTaskNode::evaluateClearance(
           }
           const robot_trajectory::RobotTrajectory& traj = *traj_ptr;
 
-          collision_detection::AllowedCollisionMatrix acm_base =
-              eval_scene->getAllowedCollisionMatrix();
+          // Base ACM from the eval scene
+          collision_detection::AllowedCollisionMatrix acm_base = eval_scene->getAllowedCollisionMatrix();
 
-          // ACM for robot-only (ignore cable)
+          // A) Robot-only clearance: ignore cable collisions
           collision_detection::AllowedCollisionMatrix acm_robot_only = acm_base;
           acm_robot_only.setDefaultEntry(object_id, true);
           acm_robot_only.setEntry(object_id, true);
 
-          // ACM for robot+cable
+          // B) Robot + cable clearance: enforce cable collisions
           collision_detection::AllowedCollisionMatrix acm_with_object = acm_base;
           acm_with_object.removeEntry(object_id);
 
-          // Compute
           double clearance_robot_only =
               computeMinClearance(eval_scene, traj, acm_robot_only);
           double clearance_with_object =
               computeMinClearance(eval_scene, traj, acm_with_object);
 
-          // double stage_cost = sub->cost();
-
-          // Print
           RCLCPP_INFO_STREAM(LOGGER,
               "[" << stage_name << ", subtraj " << this_idx
               << "] clearance(robot only)=" << clearance_robot_only
               << ", clearance(with object)=" << clearance_with_object);
 
-          // Store
+          // Store per-subtraj data under this stage
           stage_json["subtraj_" + std::to_string(this_idx)] = {
             {"clearance_robot_only",  clearance_robot_only},
             {"clearance_with_object", clearance_with_object}
-            // {"stage_cost",           stage_cost}
           };
+          // ------------------------------------------------------
         }
       }
     }
 
-    // Container → recurse
+    // Container: SolutionSequence → recurse into children
     if (auto* seq = dynamic_cast<const mtc::SolutionSequence*>(&s)) {
       for (const mtc::SolutionBase* child : seq->solutions())
         recurse(*child);
@@ -1198,10 +1215,10 @@ void MTCTaskNode::evaluateClearance(
 
 
 
-void MTCTaskNode::doTask(std::string& start_clip_id, std::string& goal_clip_id, bool execute, bool plan_for_dual, bool split, bool cartesian_connect, bool approach,
-                        std::function<mtc::Task(std::string&, std::string&, bool, bool, bool, bool)> createTaskFn)
+void MTCTaskNode::doTask(std::string& start_clip_id, std::string& goal_clip_id, bool execute, bool plan_for_dual, bool split, bool cartesian_connect, bool approach, bool clip_added_from_blender,
+                        std::function<mtc::Task(std::string&, std::string&, bool, bool, bool, bool, bool)> createTaskFn)
 {
-  task_ = createTaskFn(start_clip_id, goal_clip_id, plan_for_dual, split, cartesian_connect, approach);
+  task_ = createTaskFn(start_clip_id, goal_clip_id, plan_for_dual, split, cartesian_connect, approach, clip_added_from_blender);
 
   // publish solution for moveit servo
   bool publish_mtc_trajectory = !execute;
@@ -1230,7 +1247,8 @@ void MTCTaskNode::doTask(std::string& start_clip_id, std::string& goal_clip_id, 
   }
 
   evaluateClearance(
-      "clip_" + goal_clip_id,
+      task_.stages()->name(),
+      goal_clip_id,
       "grasped_cable",
       {"move to align_subtraj_3"}
   );
@@ -1285,7 +1303,8 @@ void MTCTaskNode::doTask(std::string& start_clip_id, std::string& goal_clip_id, 
   return;
 }
 
-mtc::Task MTCTaskNode::createTask(std::string& start_frame_name, std::string& goal_frame_name, bool if_use_dual, bool if_split_plan, bool if_cartesian_connect, bool if_approach)
+mtc::Task MTCTaskNode::createTask(std::string& start_frame_name, std::string& goal_frame_name, 
+                                  bool if_use_dual, bool if_split_plan, bool if_cartesian_connect, bool if_approach, bool clip_added_from_blender)
 {
   mtc::Task task;
   task.stages()->setName("routing task");
@@ -1305,18 +1324,23 @@ mtc::Task MTCTaskNode::createTask(std::string& start_frame_name, std::string& go
   visual_tools_.deleteAllMarkers();
   visual_tools_.trigger();
 
+  // update grasp offset based on current clip
+  std::vector<double> start_clip_size = getClipSizeFromScene(start_frame_name);
+  std::vector<double> goal_clip_size = getClipSizeFromScene(goal_frame_name);
+  updateClipOffsets(start_clip_size, goal_clip_size, clip_added_from_blender);
+
   // set target pose
-  // geometry_msgs::msg::PoseStamped lead_target_pose = createClipGoal(goal_frame_name, leader_pre_insert_offset);
-  // geometry_msgs::msg::PoseStamped follow_target_pose = createClipGoal(goal_frame_name, follower_pre_insert_offset);
+  // geometry_msgs::msg::PoseStamped lead_target_pose = createClipGoal(goal_frame_name, leader_pre_insert_offset_);
+  // geometry_msgs::msg::PoseStamped follow_target_pose = createClipGoal(goal_frame_name, follower_pre_insert_offset_);
   RCLCPP_INFO(LOGGER, "Grasping in clip frame : %s", start_frame_name.c_str());
   Eigen::Quaterniond quat_clip2ee;
   auto [clip_sign, lead_grasp_pose, follow_grasp_pose] = assignClipGoalsAlongConnection(start_frame_name, goal_frame_name,
-                                                                                      leader_grasp_offset_magnitude, follower_grasp_offset_magnitude,
+                                                                                      leader_grasp_offset_magnitude_, follower_grasp_offset_magnitude_,
                                                                                       true, M_PI/4, quat_clip2ee);
-  // auto [lead_grasp_pose, follow_grasp_pose] = assignClipGoalBiDirection(start_frame_name, leader_grasp_offset_magnitude, follower_grasp_offset_magnitude);
+  // auto [lead_grasp_pose, follow_grasp_pose] = assignClipGoalBiDirection(start_frame_name, leader_grasp_offset_magnitude_, follower_grasp_offset_magnitude_);
 
   RCLCPP_INFO(LOGGER, "Inserting in clip frame : %s", goal_frame_name.c_str());
-  auto [lead_target_pose, follow_target_pose] = assignClipGoal(goal_frame_name, leader_pre_insert_offset, follower_pre_insert_offset);
+  auto [lead_target_pose, follow_target_pose] = assignClipGoal(goal_frame_name, leader_pre_insert_offset_, follower_pre_insert_offset_);
 
 // Disable warnings for this line, as it's a variable that's set but not used in this example
 #pragma GCC diagnostic push
@@ -1563,7 +1587,7 @@ mtc::Task MTCTaskNode::createTask(std::string& start_frame_name, std::string& go
         // stage_move_to_align->properties().set("lead_grasp_pose", leader_grasp_pose_transformed);
         
         // stage_move_to_align->properties().set("track_offset", desired_ee_distance);
-        // stage_move_to_align->properties().set("follow_grasp_offset", grasp_follower_offset_magnitude);
+        // stage_move_to_align->properties().set("follow_grasp_offset", grasp_follower_offset_magnitude_);
         // // stage_move_to_align->properties().set("merge_mode", mtc::stages::ConnectMF::MergeMode::SEQUENTIAL);
         // stage_move_to_align->setEndEffector(ik_endeffectors);
 
@@ -1605,15 +1629,41 @@ mtc::Task MTCTaskNode::createTask(std::string& start_frame_name, std::string& go
         stage_move_to_align->properties().set("lead_grasp_pose", leader_grasp_pose_transformed);
         
         stage_move_to_align->properties().set("track_offset", desired_ee_distance);
-        stage_move_to_align->properties().set("follow_grasp_offset", follower_grasp_offset_magnitude[1]);
+        stage_move_to_align->properties().set("follow_grasp_offset", follower_grasp_offset_magnitude_[1]);
         stage_move_to_align->properties().set("clip_sign", clip_sign);
+        stage_move_to_align->properties().set("grasp_clip_size", start_clip_size);
         // stage_move_to_align->properties().set("merge_mode", mtc::stages::ConnectMF::MergeMode::SEQUENTIAL);
         stage_move_to_align->setEndEffector(ik_endeffectors);
 
         // set cost function
         std::vector<std::string> links = { follow_hand_frame, lead_hand_frame };
         std::vector<Eigen::Isometry3d> tcp_offsets = { follow_hand_to_tcp_transform_, lead_hand_to_tcp_transform_ };
-        stage_move_to_align->setCostTerm(std::make_unique<moveit::task_constructor::cost::LinkMotionSum>(links, tcp_offsets));
+        // stage_move_to_align->setCostTerm(std::make_unique<moveit::task_constructor::cost::LinkMotionSum>(links, tcp_offsets));
+
+        // joint path cost
+        // Lead arm joints
+        std::map<std::string, double> joint_weights = {
+          { "right_panda_joint1", 10.0 },
+          { "right_panda_joint2",  6.0 },
+          { "right_panda_joint3",  4.0 },
+          { "right_panda_joint4",  2.0 },
+          { "right_panda_joint5",  1.0 },
+          { "right_panda_joint6",  1.0 },
+          { "right_panda_joint7",  1.0 },
+
+          // Follower arm joints
+          { "left_panda_joint1", 10.0 },
+          { "left_panda_joint2",  6.0 },
+          { "left_panda_joint3",  4.0 },
+          { "left_panda_joint4",  2.0 },
+          { "left_panda_joint5",  1.0 },
+          { "left_panda_joint6",  1.0 },
+          { "left_panda_joint7",  1.0 },
+        };
+
+        auto joint_cost = std::make_shared<moveit::task_constructor::cost::JointRiemannianCost>(joint_weights);
+        stage_move_to_align->setCostTerm(joint_cost);
+
 
         // add path constraints
         // moveit_msgs::msg::Constraints follow_path_constraints = createBoxConstraints(follow_hand_frame, follow_target_pose, 0.3, 0.3, 0.2);        
@@ -1741,11 +1791,11 @@ mtc::Task MTCTaskNode::createTask(std::string& start_frame_name, std::string& go
       geometry_msgs::msg::Vector3Stamped vec; 
       vec.header.frame_id = goal_frame_name;
       // vec.vector.z = -0.05;
-      // vec.vector.z = -(insertion_offset_magnitude+0.02);
-      // vec.vector.x = -(insertion_offset_magnitude+0.02);
-      vec.vector.x = insertion_vector[0];
-      vec.vector.y = insertion_vector[1];
-      vec.vector.z = insertion_vector[2];
+      // vec.vector.z = -(insertion_offset_magnitude_+0.02);
+      // vec.vector.x = -(insertion_offset_magnitude_+0.02);
+      vec.vector.x = insertion_vector_[0];
+      vec.vector.y = insertion_vector_[1];
+      vec.vector.z = insertion_vector_[2];
       stage->setDirection(vec);
       // task.add(std::move(stage));
       align->insert(std::move(stage));
@@ -1908,9 +1958,9 @@ mtc::Task MTCTaskNode::createTask(std::string& start_frame_name, std::string& go
 
       geometry_msgs::msg::Vector3Stamped insertion_dir_vector; 
       insertion_dir_vector.header.frame_id = goal_frame_name;
-      insertion_dir_vector.vector.x = insertion_vector[0];
-      insertion_dir_vector.vector.y = insertion_vector[1];
-      insertion_dir_vector.vector.z = insertion_vector[2];
+      insertion_dir_vector.vector.x = insertion_vector_[0];
+      insertion_dir_vector.vector.y = insertion_vector_[1];
+      insertion_dir_vector.vector.z = insertion_vector_[2];
 
       // hard manipuability gate
       ik_wrapper->properties().set("singularity_threshold", 0.10);
@@ -2029,11 +2079,11 @@ mtc::Task MTCTaskNode::createTask(std::string& start_frame_name, std::string& go
   //     geometry_msgs::msg::Vector3Stamped vec; 
   //     vec.header.frame_id = goal_frame_name;
   //     // vec.vector.z = -0.05;
-  //     // vec.vector.z = -(insertion_offset_magnitude+0.02);
-  //     // vec.vector.x = -(insertion_offset_magnitude+0.02);
-  //     vec.vector.x = insertion_vector[0];
-  //     vec.vector.y = insertion_vector[1];
-  //     vec.vector.z = insertion_vector[2];
+  //     // vec.vector.z = -(insertion_offset_magnitude_+0.02);
+  //     // vec.vector.x = -(insertion_offset_magnitude_+0.02);
+  //     vec.vector.x = insertion_vector_[0];
+  //     vec.vector.y = insertion_vector_[1];
+  //     vec.vector.z = insertion_vector_[2];
   //     stage->setDirection(vec);
   //     // task.add(std::move(stage));
   //     align->insert(std::move(stage));
@@ -2100,13 +2150,13 @@ mtc::Task MTCTaskNode::createReverseTask(std::string& start_frame_name, std::str
   visual_tools_.trigger();
 
   // set target pose
-  // geometry_msgs::msg::PoseStamped lead_target_pose = createClipGoal(goal_frame_name, leader_pre_insert_offset);
-  // geometry_msgs::msg::PoseStamped follow_target_pose = createClipGoal(goal_frame_name, follower_pre_insert_offset);
+  // geometry_msgs::msg::PoseStamped lead_target_pose = createClipGoal(goal_frame_name, leader_pre_insert_offset_);
+  // geometry_msgs::msg::PoseStamped follow_target_pose = createClipGoal(goal_frame_name, follower_pre_insert_offset_);
   RCLCPP_INFO(LOGGER, "Grasping in clip frame : %s", start_frame_name.c_str());
-  auto [lead_grasp_pose, follow_grasp_pose] = assignClipGoalBiDirection(start_frame_name, leader_grasp_offset_magnitude, follower_grasp_offset_magnitude);
+  auto [lead_grasp_pose, follow_grasp_pose] = assignClipGoalBiDirection(start_frame_name, leader_grasp_offset_magnitude_, follower_grasp_offset_magnitude_);
 
   RCLCPP_INFO(LOGGER, "Inserting in clip frame : %s", goal_frame_name.c_str());
-  auto [lead_target_pose, follow_target_pose] = assignClipGoal(goal_frame_name, leader_pre_insert_offset, follower_pre_insert_offset);
+  auto [lead_target_pose, follow_target_pose] = assignClipGoal(goal_frame_name, leader_pre_insert_offset_, follower_pre_insert_offset_);
 
 // Disable warnings for this line, as it's a variable that's set but not used in this example
 #pragma GCC diagnostic push
@@ -2249,8 +2299,8 @@ mtc::Task MTCTaskNode::createTestWaypointTask(std::string& goal_frame_name, bool
   visual_tools_.trigger();
 
   // set target pose
-  geometry_msgs::msg::PoseStamped lead_target_pose = createClipGoal(goal_frame_name, leader_pre_insert_offset);
-  geometry_msgs::msg::PoseStamped follow_target_pose = createClipGoal(goal_frame_name, follower_pre_insert_offset);
+  geometry_msgs::msg::PoseStamped lead_target_pose = createClipGoal(goal_frame_name, leader_pre_insert_offset_);
+  geometry_msgs::msg::PoseStamped follow_target_pose = createClipGoal(goal_frame_name, follower_pre_insert_offset_);
 
 // Disable warnings for this line, as it's a variable that's set but not used in this example
 #pragma GCC diagnostic push
@@ -2330,7 +2380,8 @@ mtc::Stage* pre_move_stage_ptr = nullptr;
   return task;
 }
 
-mtc::Task MTCTaskNode::createPostTask(std::string& start_frame_name, std::string& goal_frame_name, bool if_use_dual, bool if_split_plan, bool if_cartesian_connect, bool if_approach)
+mtc::Task MTCTaskNode::createPostTask(std::string& start_frame_name, std::string& goal_frame_name,
+                                     bool if_use_dual, bool if_split_plan, bool if_cartesian_connect, bool if_approach, bool clip_added_from_blender)
 {
   mtc::Task task;
   task.stages()->setName("post routing task");
@@ -2344,8 +2395,8 @@ mtc::Task MTCTaskNode::createPostTask(std::string& start_frame_name, std::string
   visual_tools_.trigger();
 
   // set target pose
-  geometry_msgs::msg::PoseStamped lead_target_pose = createClipGoal(goal_frame_name, leader_pre_insert_offset);
-  geometry_msgs::msg::PoseStamped follow_target_pose = createClipGoal(goal_frame_name, follower_pre_insert_offset);
+  geometry_msgs::msg::PoseStamped lead_target_pose = createClipGoal(goal_frame_name, leader_pre_insert_offset_);
+  geometry_msgs::msg::PoseStamped follow_target_pose = createClipGoal(goal_frame_name, follower_pre_insert_offset_);
 
 // Disable warnings for this line, as it's a variable that's set but not used in this example
 #pragma GCC diagnostic push
@@ -2402,7 +2453,7 @@ mtc::Task MTCTaskNode::createPostTask(std::string& start_frame_name, std::string
   return task;
 }
 
-mtc::Task MTCTaskNode::createHomingTask(std::string& start_frame_name, std::string& goal_frame_name, bool if_use_dual, bool if_split_plan, bool if_cartesian_connect, bool if_approach)
+mtc::Task MTCTaskNode::createHomingTask(std::string& start_frame_name, std::string& goal_frame_name, bool if_use_dual, bool if_split_plan, bool if_cartesian_connect, bool if_approach, bool clip_added_from_blender)
 {
   mtc::Task task;
   task.stages()->setName("homing task");
@@ -2496,8 +2547,14 @@ int main(int argc, char** argv)
   bool response_received = false;
 
   // List of clip IDs to process
-  std::vector<int> clip_id_number_list = {5, 6, 7, 8}; // "clip5", "clip6", "clip7 or 8"
+  std::vector<int64_t> clip_id_number_list;
+  if (!mtc_task_node->getROSParam("clip_id_number_list", clip_id_number_list)){
+    RCLCPP_ERROR(LOGGER, "Failed to get 'clip_id_number_list' parameter. Using default values.");
+    clip_id_number_list = {5, 6, 7, 8}; // Default values
+  }
+  // std::vector<int> clip_id_number_list = {5, 6, 7, 8}; // "clip5", "clip6", "clip7 or 8"
   // std::vector<std::string> clip_ids = {"clip5", "clip6", "clip7", "clip8"}; //"clip5", "clip6", "clip7 or 8"
+  std::string initial_clip_id = "clip" + std::to_string(clip_id_number_list[0]);
   
   bool skip_first_clip = false; // Set to true to skip the first clip
   // initial clip
@@ -2517,20 +2574,24 @@ int main(int argc, char** argv)
     RCLCPP_INFO(LOGGER, "Updating planning scene after MTC execution.");
     mtc_task_node->updatePlanningScene();
 
-    if (i>0){
-      // from the second clip on, set the orientation and add approach
-      mtc_task_node->setSelectOrientation(true);
+    // from the second clip on, set the orientation and add approach
+    mtc_task_node->setSelectOrientation(true);
 
-      mtc_task_node->doTask(prev_clip_id, clip_id, true, true, false, true, true,
-                      [mtc_task_node](std::string& start, std::string& goal, bool dual, bool split, bool cartesian, bool approach) {
-                      return mtc_task_node->createTask(start, goal, dual, split, cartesian, approach);
+    bool clip_added_from_blender = false;
+    mtc_task_node->getROSParam("clip_added_from_blender", clip_added_from_blender);
+
+    if (i>0){
+
+      mtc_task_node->doTask(prev_clip_id, clip_id, true, true, false, true, true, clip_added_from_blender,
+                      [mtc_task_node](std::string& start, std::string& goal, bool dual, bool split, bool cartesian, bool approach, bool clip_from_blender) {
+                      return mtc_task_node->createTask(start, goal, dual, split, cartesian, approach, clip_from_blender);
                       });
       
     }else{
       if (!skip_first_clip){
-          mtc_task_node->doTask(prev_clip_id, clip_id, false, true, false, false, false,
-            [mtc_task_node](std::string& start, std::string& goal, bool dual, bool split, bool cartesian, bool approach) {
-            return mtc_task_node->createTask(start, goal, dual, split, cartesian, approach);
+          mtc_task_node->doTask(prev_clip_id, clip_id, false, true, false, false, false, clip_added_from_blender,
+            [mtc_task_node](std::string& start, std::string& goal, bool dual, bool split, bool cartesian, bool approach, bool clip_from_blender) {
+            return mtc_task_node->createTask(start, goal, dual, split, cartesian, approach, clip_from_blender);
             });
       }
       
@@ -2557,11 +2618,14 @@ int main(int argc, char** argv)
       // Skip the first clip, so we don't need to create a post task for it
       continue;
     }else{
-      mtc_task_node->doTask(prev_clip_id, clip_id, false, true, false, false, false,
-        [mtc_task_node](std::string& start, std::string& goal, bool dual, bool split, bool cartesian, bool approach) {
-        return mtc_task_node->createPostTask(start, goal, dual, split, cartesian, approach);
+      mtc_task_node->doTask(prev_clip_id, clip_id, false, true, false, false, false, clip_added_from_blender,
+        [mtc_task_node](std::string& start, std::string& goal, bool dual, bool split, bool cartesian, bool approach, bool clip_from_blender) {
+        return mtc_task_node->createPostTask(start, goal, dual, split, cartesian, approach, clip_from_blender);
         });
     }
+
+    // save json locally
+    mtc_task_node->saveClearanceToJson("planning_clearance_results.json");
     
     clip_names.push_back(clip_id);
 
@@ -2603,7 +2667,7 @@ int main(int argc, char** argv)
     // Reset the response flag for the next request
     response_received = false;
 
-    if (clip_id == "clip5")
+    if (clip_id == initial_clip_id)
     {
       // // Use visul tools to control the movement from one clip to another
       mtc_task_node->getVisualTools().prompt("After moving to initial positions, press 'next' in the RvizVisualToolsGui window to start servo");
@@ -2612,11 +2676,7 @@ int main(int argc, char** argv)
       start_tracking_msg.data = true;
       tracking_start_pub->publish(start_tracking_msg);
     }
-
   }
-
-  // save json locally
-  mtc_task_node->saveClearanceToJson("planning_clearance_results.json");
 
   // move back home
   std_msgs::msg::String task_id_msg;
@@ -2625,9 +2685,9 @@ int main(int argc, char** argv)
   taskid_publisher->publish(task_id_msg);
 
   std::string clip_id_place_holder = "clip0";
-  mtc_task_node->doTask(clip_id_place_holder, clip_id_place_holder, false, true, false, false, false,
-  [mtc_task_node](std::string& start, std::string& goal, bool dual, bool split, bool cartesian, bool approach) {
-  return mtc_task_node->createHomingTask(start, goal, dual, split, cartesian, approach);
+  mtc_task_node->doTask(clip_id_place_holder, clip_id_place_holder, false, true, false, false, false, false,
+  [mtc_task_node](std::string& start, std::string& goal, bool dual, bool split, bool cartesian, bool approach, bool clip_from_blender) {
+  return mtc_task_node->createHomingTask(start, goal, dual, split, cartesian, approach, clip_from_blender);
   });
 
 

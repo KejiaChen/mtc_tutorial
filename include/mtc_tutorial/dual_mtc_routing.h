@@ -58,11 +58,11 @@ public:
   moveit_visual_tools::MoveItVisualTools& getVisualTools();
 
   // Compose an MTC task from a series of stages.
-  mtc::Task createTask(std::string& start_frame_name, std::string& goal_frame_name, bool if_use_dual, bool if_split_plan, bool if_cartesian_connect, bool if_approach);
+  mtc::Task createTask(std::string& start_frame_name, std::string& goal_frame_name, bool if_use_dual, bool if_split_plan, bool if_cartesian_connect, bool if_approach, bool clip_added_from_blender);
   mtc::Task createReverseTask(std::string& start_frame_name, std::string& goal_frame_name, bool if_use_dual, bool if_split_plan, bool if_cartesian_connect, bool if_approach);
-  mtc::Task createPostTask(std::string& start_frame_name, std::string& goal_frame_name, bool if_use_dual, bool if_split_plan, bool if_cartesian_connect, bool if_approach);
+  mtc::Task createPostTask(std::string& start_frame_name, std::string& goal_frame_name, bool if_use_dual, bool if_split_plan, bool if_cartesian_connect, bool if_approach, bool clip_added_from_blender);
   mtc::Task createTestWaypointTask(std::string& goal_frame_name, bool if_use_dual, bool if_split_plan, bool if_cartesian_connect, bool if_approach);
-  mtc::Task createHomingTask(std::string& start_frame_name, std::string& goal_frame_name, bool if_use_dual, bool if_split_plan, bool if_cartesian_connect, bool if_approach);
+  mtc::Task createHomingTask(std::string& start_frame_name, std::string& goal_frame_name, bool if_use_dual, bool if_split_plan, bool if_cartesian_connect, bool if_approach, bool clip_added_from_blender);
 
   // synchronization with real-world
   void udpReceiverSync(const std::string& host, int port,
@@ -96,8 +96,8 @@ public:
   // publish mtc sub_trajectory
   void publishSolutionSubTraj(std::string goal_clip_name, const moveit_task_constructor_msgs::msg::Solution& msg);
 
-  void doTask(std::string& start_clip_id, std::string& goal_clip_id, bool execute, bool plan_for_dual, bool split, bool cartesian_connect, 
-            bool approach, std::function<mtc::Task(std::string&, std::string&, bool, bool, bool, bool)> createTaskFn);
+  void doTask(std::string& start_clip_id, std::string& goal_clip_id, bool execute, bool plan_for_dual, bool split, bool cartesian_connect,
+            bool approach, bool clip_added_from_blender, std::function<mtc::Task(std::string&, std::string&, bool, bool, bool, bool, bool)> createTaskFn);
   void updatePlanningScene();
 
   void setSelectOrientation(bool select_orientation) { select_orientation_ = select_orientation; }
@@ -109,7 +109,259 @@ public:
     ofs.close();
   }
 
+  template <typename T>
+  bool getROSParam(const std::string& name, T& value) {
+    // returns false if parameter not set or wrong type
+    return node_->get_parameter(name, value);
+  }
+
+  // If you want a "get or default" version:
+  template <typename T>
+  T getROSParamOr(const std::string& name, const T& default_value) {
+    T v = default_value;
+    node_->get_parameter(name, v);  // leaves v as default_value if unset
+    return v;
+  }
   // void loadCustomScene(const std::string &path);
+
+  std::vector<double> getClipSizeFromScene(const std::string& clip_id_prefix = "clip")
+  {
+    moveit::planning_interface::PlanningSceneInterface psi;
+
+    // 1) Get all object names
+    std::vector<std::string> names = psi.getKnownObjectNames();
+
+    // 2) Filter for clips (e.g., "clip_1", "clip_foo", etc.)
+    std::vector<std::string> clip_ids;
+    for (const auto& name : names)
+    {
+      if (name.rfind(clip_id_prefix, 0) == 0) // starts with "clip"
+        clip_ids.push_back(name);
+    }
+
+    if (clip_ids.empty())
+    {
+      throw std::runtime_error("No objects with prefix '" + clip_id_prefix + "' found in planning scene.");
+    }
+
+    // 3) Retrieve their CollisionObjects
+    std::map<std::string, moveit_msgs::msg::CollisionObject> objects_map = psi.getObjects(clip_ids);
+
+    if (objects_map.empty())
+    {
+      throw std::runtime_error("getObjects() returned empty map for clips.");
+    }
+
+    // For simplicity: just take the first clip
+    const auto& co = objects_map.begin()->second;
+
+    if (co.primitives.empty())
+    {
+      throw std::runtime_error("Clip collision object has no primitives (maybe it is a mesh?).");
+    }
+
+    const auto& prim = co.primitives[0];
+    if (prim.type != shape_msgs::msg::SolidPrimitive::BOX)
+    {
+      throw std::runtime_error("Clip is not a BOX primitive.");
+    }
+
+    if (prim.dimensions.size() < 3)
+    {
+      throw std::runtime_error("Clip BOX primitive has fewer than 3 dimensions.");
+    }
+
+    double dx = prim.dimensions[shape_msgs::msg::SolidPrimitive::BOX_X];
+    double dy = prim.dimensions[shape_msgs::msg::SolidPrimitive::BOX_Y];
+    double dz = prim.dimensions[shape_msgs::msg::SolidPrimitive::BOX_Z];
+
+    return {dx, dy, dz};
+  }
+
+
+  void updateClipOffsets(std::vector<double> start_clip_size= {0.04, 0.04, 0.06}, std::vector<double> goal_clip_size= {0.04, 0.04, 0.06},
+                        bool clip_added_from_blender = false)
+  {
+    // U-type Clip
+    // std::vector<double> insertion_vector_ = {0, 0, -(insertion_offset_magnitude_)}; // Caution: this doens't set insertion distance
+    // std::vector<double> leader_pre_insert_offset_ = {0, -(clip_size[1]/2+hold_y_offset_), clip_size[2]/2-2*hold_z_offset_};
+    // std::vector<double> follower_pre_insert_offset_ = {0, clip_size[1]/2+hold_y_offset_, clip_size[2]/2-2*hold_z_offset_}; 
+    // std::vector<double> leader_grasp_offset_magnitude_ = {0, -(clip_size[1]/2+grasp_leader_offset_magnitude_), clip_size[2]/2-2*hold_z_offset_};
+    // std::vector<double> follower_grasp_offset_magnitude_ = {0, -(clip_size[1]/2+grasp_follower_offset_magnitude_), clip_size[2]/2-2*hold_z_offset_};
+
+    // // // C-type Clip
+    if (!clip_added_from_blender){
+      insertion_vector_ = {-insertion_offset_magnitude_, 0, 0};
+      // insertion offset in goal clip frame
+      leader_pre_insert_offset_ = {(-insertion_offset_magnitude_+goal_clip_size[0]/2), -(goal_clip_size[1]/2+hold_y_offset_), goal_clip_size[2]/2+hold_z_offset_};
+      follower_pre_insert_offset_ = {(-insertion_offset_magnitude_+goal_clip_size[0]/2), goal_clip_size[1]/2+hold_y_offset_, goal_clip_size[2]/2+hold_z_offset_}; 
+      // grasp offset in start clip frame
+      leader_grasp_offset_magnitude_ = {0, (start_clip_size[1]/2+grasp_leader_offset_magnitude_), start_clip_size[2]/2+hold_z_offset_};
+      follower_grasp_offset_magnitude_ = {0, (start_clip_size[1]/2+grasp_follower_offset_magnitude_), start_clip_size[2]/2+hold_z_offset_};
+    }else{
+      insertion_vector_ = {-insertion_offset_magnitude_, 0, 0};
+      // insertion offset in goal clip frame
+      leader_pre_insert_offset_ = {(-insertion_offset_magnitude_+goal_clip_size[0]/2), -(goal_clip_size[1]/2+hold_y_offset_), -goal_clip_size[2]/2+hold_z_offset_};
+      follower_pre_insert_offset_ = {(-insertion_offset_magnitude_+goal_clip_size[0]/2), goal_clip_size[1]/2+hold_y_offset_, -goal_clip_size[2]/2+hold_z_offset_}; 
+      // grasp offset in start clip frame
+      leader_grasp_offset_magnitude_ = {0, (start_clip_size[1]/2+grasp_leader_offset_magnitude_), -start_clip_size[2]/2+hold_z_offset_};
+      follower_grasp_offset_magnitude_ = {0, (start_clip_size[1]/2+grasp_follower_offset_magnitude_), -start_clip_size[2]/2+hold_z_offset_};
+    }
+  }
+
+  void stretchRobotTrajectoryInPlace(
+    robot_trajectory::RobotTrajectory& robot_trajectory,
+    double extension_distance,
+    double ik_timeout=1.0)
+{
+  const moveit::core::RobotModelConstPtr& model = robot_trajectory.getRobotModel();
+
+  const auto* lead_jmg   = model->getJointModelGroup(lead_arm_group_name);
+  const auto* follow_jmg = model->getJointModelGroup(follow_arm_group_name);
+
+  if (!lead_jmg || !follow_jmg)
+    throw std::runtime_error("JointModelGroup not found");
+
+  moveit::core::RobotState state(model);
+
+  for (size_t i = 0; i < robot_trajectory.getWayPointCount(); ++i)
+  {
+    state = robot_trajectory.getWayPoint(i);   // copy waypoint state
+
+    // --- FK ---
+    Eigen::Isometry3d T_lead_ee_in_world   = state.getGlobalLinkTransform(lead_hand_frame);
+    Eigen::Isometry3d T_follow_ee_in_world = state.getGlobalLinkTransform(follow_hand_frame);
+
+    Eigen::Isometry3d T_lead_tcp_in_world   = T_lead_ee_in_world  * lead_hand_to_tcp_transform_;
+    Eigen::Isometry3d T_follow_tcp_in_world = T_follow_ee_in_world * follow_hand_to_tcp_transform_;
+
+    Eigen::Vector3d dir =
+        safeNormalize(T_lead_tcp_in_world.translation() - T_follow_tcp_in_world.translation());
+    if (dir.isZero()) continue;
+
+    // --- Stretch TCP ---
+    Eigen::Isometry3d T_lead_tcp_des = T_lead_tcp_in_world;
+    T_lead_tcp_des.translation() += extension_distance * dir;
+
+    // --- Back to hand pose ---
+    Eigen::Isometry3d T_lead_hand_des =
+        T_lead_tcp_des * lead_hand_to_tcp.inverse();
+
+    // --- Seed from current waypoint ---
+    std::vector<double> seed;
+    state.copyJointGroupPositions(lead_jmg, seed);
+
+    bool ik_ok = state.setFromIK(
+        lead_jmg,
+        T_lead_hand_des,
+        lead_hand_link,
+        ik_timeout);
+
+    if (!ik_ok)
+      continue;
+
+    // --- Write back ---
+    robot_trajectory.setWayPoint(i, state);
+  }
+}
+
+inline bool dumpTrajectoryTXT(const robot_trajectory::RobotTrajectory& traj,
+                              const std::string& joint_filename,
+                              const std::string& tcp_filename,
+                              const std::string& group_name = "",
+                              const Eigen::Isometry3d &offset = Eigen::Isometry3d::Identity(),
+                              std::string base_link_name = "base_link",
+                              char delim = ' ',          // use ' ' for space-separated
+                              int precision = 6,
+                              double fallback_dt = -1.0) // e.g., 0.05 if times are all zero
+{
+  const std::string group = group_name.empty() ? traj.getGroupName() : group_name;
+  const auto* jmg = traj.getRobotModel()->getJointModelGroup(group);
+  if (!jmg) return false;
+
+  std::vector<const moveit::core::LinkModel*> tips;
+  if (!jmg->getEndEffectorTips(tips) || tips.empty())
+  {
+    RCLCPP_ERROR(rclcpp::get_logger("RobotTrajectory"), "Unable to get end effector tips from jmg");
+    return false;
+  }
+
+  const auto& names = jmg->getVariableNames();
+  const size_t N = names.size();
+  const size_t M = traj.getWayPointCount();
+  if (M == 0 || N == 0) return false;
+
+  std::filesystem::create_directories(std::filesystem::path(joint_filename).parent_path());
+  std::ofstream joint_out(joint_filename);
+  if (!joint_out) return false;
+  joint_out.setf(std::ios::fixed, std::ios::floatfield);
+  joint_out << std::setprecision(precision);
+
+  std::filesystem::create_directories(std::filesystem::path(tcp_filename).parent_path());
+  std::ofstream tcp_out(tcp_filename);
+  if (!tcp_out) return false;
+  tcp_out.setf(std::ios::fixed, std::ios::floatfield);
+  tcp_out << std::setprecision(precision);
+
+  // // Header
+  // out << "# time";
+  // for (auto& n : names) out << delim << "q/" << n;
+  // for (auto& n : names) out << delim << "dq/" << n;
+  // out << "\n";
+
+  // Gather data
+  std::vector<double> T(M, 0.0);
+  std::vector<std::vector<double>> Q(M, std::vector<double>(N, 0.0));
+  std::vector<std::vector<double>> dQ(M, std::vector<double>(N, 0.0));
+  std::vector<Eigen::Isometry3d> TCP_pose_in_world(M, Eigen::Isometry3d::Identity());
+  std::vector<Eigen::Isometry3d> TCP_pose_in_base(M, Eigen::Isometry3d::Identity());
+
+  bool any_velocity = false;
+  Eigen::Isometry3d robot_base_pose = traj.getWayPoint(0).getGlobalLinkTransform(base_link_name);
+  for (size_t i = 0; i < M; ++i) {
+    const auto& s = traj.getWayPoint(i);
+    T[i] = traj.getWayPointDurationFromStart(i);
+    s.copyJointGroupPositions(jmg, Q[i]);
+    s.copyJointGroupVelocities(jmg, dQ[i]); // zeros if not set
+
+    for (const moveit::core::LinkModel* ee_parent_link : tips){
+      // pose in world frame for publishing
+      Eigen::Isometry3d ee_pose_in_world= s.getGlobalLinkTransform(ee_parent_link);
+      // Apply the translation in the z-axis
+      Eigen::Isometry3d tcp_pose_in_world = ee_pose_in_world*offset;
+      TCP_pose_in_world[i] = tcp_pose_in_world;
+
+      // ee_pose in robot base frame for storage 
+      Eigen::Isometry3d ee_pose_in_base = robot_base_pose.inverse()*ee_pose_in_world;
+      // Apply the translation in the z-axiss
+      Eigen::Isometry3d tcp_pose_in_base = ee_pose_in_base*offset;
+      TCP_pose_in_base[i] = tcp_pose_in_base;
+    }
+
+    for (double v : dQ[i]) if (std::abs(v) > 1e-12) { any_velocity = true; break; }
+  }
+
+  // Dump rows
+  for (size_t i = 0; i < M; ++i) {
+    joint_out << T[i];
+    for (size_t j = 0; j < N; ++j) joint_out << delim << Q[i][j];
+    for (size_t j = 0; j < N; ++j) joint_out << delim << dQ[i][j];
+    joint_out << "\n";
+  }
+
+  // Dump TCP poses
+  for (size_t i = 0; i < M; ++i) {
+    tcp_out << T[i];
+    for (int col = 0; col < 4; ++col) {
+      for (int row = 0; row < 4; ++row) {
+        tcp_out << delim << TCP_pose_in_base[i](row, col);
+      }
+    }
+    tcp_out << "\n";  // Newline for the next matrix
+  }
+
+  return true;
+}
 
   // Robot group names
   std::string lead_arm_group_name;
@@ -269,9 +521,10 @@ private:
   void printACM(const collision_detection::AllowedCollisionMatrix& acm);
 
   void evaluateClearance(
-    std::string clip_id,
-    std::string object_id,
-    std::vector<std::string> target_stages_and_indices);
+    const std::string& task_name,                    
+    const std::string& clip_id,
+    const std::string& object_id,
+    const std::vector<std::string>& target_stages_and_indices);
 
   std::tuple<int, geometry_msgs::msg::PoseStamped, geometry_msgs::msg::PoseStamped> assignClipGoalsAlongConnection(const std::string& clip_frame,
                                                                                                                         const std::string& next_clip_frame,
@@ -352,6 +605,30 @@ private:
   std::vector<std::string> follow_franka_joint_names_ = {"left_panda_joint1", "left_panda_joint2", "left_panda_joint3", "left_panda_joint4", "left_panda_joint5", "left_panda_joint6", "left_panda_joint7"};
   std::atomic<bool> sync_udp_running_{true}; // Flag to control the UDP sync thread
   nlohmann::json clearance_results_ = nlohmann::json::object();
+
+  // scene configuration
+  double insertion_offset_magnitude_; 
+  double grasp_follower_offset_magnitude_;
+  double grasp_leader_offset_magnitude_;
+  double hold_y_offset_;
+  double hold_z_offset_;
+  // std::vector<double> leader_pre_insert_offset_ = {-(clip_size[0]/2+hold_x_offset), -clip_size[1]/2, clip_size[2]/2};
+  // std::vector<double> follower_pre_insert_offset_ = {clip_size[0]/2+hold_x_offset, -clip_size[1]/2, clip_size[2]/2};
+
+  // U-type Clip
+  // std::vector<double> insertion_vector_ = {0, 0, -(insertion_offset_magnitude_)}; // Caution: this doens't set insertion distance
+  // std::vector<double> leader_pre_insert_offset_ = {0, -(clip_size[1]/2+hold_y_offset_), clip_size[2]/2-2*hold_z_offset_};
+  // std::vector<double> follower_pre_insert_offset_ = {0, clip_size[1]/2+hold_y_offset_, clip_size[2]/2-2*hold_z_offset_}; 
+  // std::vector<double> leader_grasp_offset_magnitude_ = {0, -(clip_size[1]/2+grasp_leader_offset_magnitude_), clip_size[2]/2-2*hold_z_offset_};
+  // std::vector<double> follower_grasp_offset_magnitude_ = {0, -(clip_size[1]/2+grasp_follower_offset_magnitude_), clip_size[2]/2-2*hold_z_offset_};
+
+  // // C-type Clip
+  std::vector<double> insertion_vector_;
+  // offset in clip frame
+  std::vector<double> leader_pre_insert_offset_;
+  std::vector<double> follower_pre_insert_offset_;
+  std::vector<double> leader_grasp_offset_magnitude_;
+  std::vector<double> follower_grasp_offset_magnitude_;
 };
 
 #endif  // MTC_TASK_NODE_H
