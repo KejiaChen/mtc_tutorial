@@ -49,6 +49,59 @@ Eigen::Isometry3d transformStampedToEigen(const geometry_msgs::msg::TransformSta
   return transform;
 }
 
+std::vector<double> getClipSizeFromScene(const std::string& clip_id_prefix = "clip")
+  {
+    moveit::planning_interface::PlanningSceneInterface psi;
+
+    // 1) Get all object names
+    std::vector<std::string> names = psi.getKnownObjectNames();
+
+    // 2) Filter for clips (e.g., "clip_1", "clip_foo", etc.)
+    std::vector<std::string> clip_ids;
+    for (const auto& name : names)
+    {
+      if (name.rfind(clip_id_prefix, 0) == 0) // starts with "clip"
+        clip_ids.push_back(name);
+    }
+
+    if (clip_ids.empty())
+    {
+      throw std::runtime_error("No objects with prefix '" + clip_id_prefix + "' found in planning scene.");
+    }
+
+    // 3) Retrieve their CollisionObjects
+    std::map<std::string, moveit_msgs::msg::CollisionObject> objects_map = psi.getObjects(clip_ids);
+
+    if (objects_map.empty())
+    {
+      throw std::runtime_error("getObjects() returned empty map for clips.");
+    }
+
+    // For simplicity: just take the first clip
+    const auto& co = objects_map.begin()->second;
+
+    if (co.primitives.empty())
+    {
+      throw std::runtime_error("Clip collision object has no primitives (maybe it is a mesh?).");
+    }
+
+    const auto& prim = co.primitives[0];
+    if (prim.type != shape_msgs::msg::SolidPrimitive::BOX)
+    {
+      throw std::runtime_error("Clip is not a BOX primitive.");
+    }
+
+    if (prim.dimensions.size() < 3)
+    {
+      throw std::runtime_error("Clip BOX primitive has fewer than 3 dimensions.");
+    }
+
+    double dx = prim.dimensions[shape_msgs::msg::SolidPrimitive::BOX_X];
+    double dy = prim.dimensions[shape_msgs::msg::SolidPrimitive::BOX_Y];
+    double dz = prim.dimensions[shape_msgs::msg::SolidPrimitive::BOX_Z];
+
+    return {dx, dy, dz};
+  }
 
 Eigen::Isometry3d poseToIsometry(const geometry_msgs::msg::Pose& pose_msg, geometry_msgs::msg::Vector3& offset) {
     Eigen::Isometry3d isometry = Eigen::Isometry3d::Identity();
@@ -333,11 +386,15 @@ int main(int argc, char** argv) {
                 for (size_t i = 0; i < clip_names.size(); ++i) {
                     const auto& start_clip = clip_names[i];
                     if (clip_poses.count(start_clip)){
+                        // get clip size
+                        std::vector<double> clip_size = getClipSizeFromScene("clip");
+                        RCLCPP_INFO(LOGGER, " Clip size: %f, %f, %f", clip_size[0], clip_size[1], clip_size[2]);
+
                         // start pose is clip_poses[start_clip] with an offset
                         geometry_msgs::msg::Vector3 offset;
                         offset.x = 0.0;
                         offset.y = 0.0;
-                        offset.z = 0.03;
+                        offset.z = clip_size[2]/2;  // half of clip height
 
                         line_start_pose = poseToIsometry(clip_poses[start_clip], offset);
                         line_starts.push_back(line_start_pose.translation());
