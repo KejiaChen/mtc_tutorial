@@ -42,12 +42,28 @@ TrajAdaptTestNode::TrajAdaptTestNode(const rclcpp::NodeOptions& options)
   robot_model_loader_(std::make_shared<robot_model_loader::RobotModelLoader>(node_, "robot_description")),
   robot_model_(robot_model_loader_->getModel()),
   // MoveGroupInterface needs a planning group; we’ll set it after params load
-  move_group_(node_, "dual_arm")
-  // visual_tools_(node_, "world")
+  move_group_(node_, "dual_arm"),
+  visual_tools_(node_, "world")
 {
   if (!robot_model_) {
     throw std::runtime_error("Failed to load RobotModel from robot_description");
   }
+
+  subtrajectory_publisher_ = node_->create_publisher<moveit_task_constructor_msgs::msg::SubTrajectory>(
+		    "/mtc_sub_trajectory", rclcpp::QoS(1).transient_local());
+
+  // Subscription to the joint states
+  joint_state_sub_ = node_->create_subscription<sensor_msgs::msg::JointState>(
+      "/joint_states", 10, std::bind(&TrajAdaptTestNode::jointStateCallback, this, std::placeholders::_1));
+
+  // Wait until joint states are received
+  RCLCPP_INFO(LOGGER, "Waiting for joint states...");
+  while (!current_joint_state_)
+  {
+    rclcpp::spin_some(node_);
+    rclcpp::sleep_for(std::chrono::milliseconds(100));
+  }
+  RCLCPP_INFO(LOGGER, "Joint states received.");
 
   initializeTransforms(/*default_franka_flange_to_tcp_z*/ 0.1034,
                         /*sensone_height*/ 0.036,
@@ -55,9 +71,9 @@ TrajAdaptTestNode::TrajAdaptTestNode(const rclcpp::NodeOptions& options)
 
   initializeGroups();
 
-  // visual_tools_.loadRemoteControl();
-  // visual_tools_.deleteAllMarkers();
-  // visual_tools_.trigger();
+  visual_tools_.loadRemoteControl();
+  visual_tools_.deleteAllMarkers();
+  visual_tools_.trigger();
 }
 
 void TrajAdaptTestNode::initializeGroups()
@@ -120,6 +136,77 @@ void TrajAdaptTestNode::initializeTransforms(double default_franka_flange_to_tcp
   }
 
 }
+
+void TrajAdaptTestNode::publishDualTraj(
+    const std::string& goal_clip_name,
+    const robot_trajectory::RobotTrajectory& dual_traj,
+    int stage_id /*= 0*/,
+    int id /*= 0*/)
+{
+  if (dual_traj.getWayPointCount() == 0) {
+    RCLCPP_WARN(LOGGER, "publishDualTraj: dual_traj has 0 waypoints");
+    return;
+  }
+
+  // Convert RobotTrajectory -> ROS msg
+  moveit_msgs::msg::RobotTrajectory robot_trajectory_msg;
+  dual_traj.getRobotTrajectoryMsg(robot_trajectory_msg);
+
+  if (robot_trajectory_msg.joint_trajectory.points.empty()) {
+    RCLCPP_WARN(LOGGER, "publishDualTraj: joint_trajectory has 0 points");
+    return;
+  }
+
+  // ---- Visualize leader & follower exactly like before ----
+  // visual_tools_.publishTrajectoryLine(
+  //     robot_trajectory_msg,
+  //     move_group_.getCurrentState()->getJointModelGroup(lead_arm_group_name),
+  //     lead_flange_to_tcp_transform_,
+  //     goal_clip_name,
+  //     stage_id,
+  //     id,
+  //     "/home/tp2/ws_humble/trajectories_leader",
+  //     rviz_visual_tools::ORANGE,
+  //     lead_base_frame);
+
+  // visual_tools_.publishTrajectoryLine(
+  //     robot_trajectory_msg,
+  //     move_group_.getCurrentState()->getJointModelGroup(follow_arm_group_name),
+  //     follow_flange_to_tcp_transform_,
+  //     goal_clip_name,
+  //     stage_id,
+  //     id,
+  //     "/home/tp2/ws_humble/trajectories_follower",
+  //     rviz_visual_tools::BLUE,
+  //     follow_base_frame);
+
+  // visual_tools_.trigger();
+
+  // ---- Publish as ONE SubTrajectory (so your existing subscriber still works) ----
+  moveit_task_constructor_msgs::msg::SubTrajectory out;
+  out.info.id = id;
+  out.info.stage_id = stage_id;
+  out.info.cost = 0.0;  // optional; no MTC cost available
+
+  out.trajectory.joint_trajectory = robot_trajectory_msg.joint_trajectory;
+
+  subtrajectory_publisher_->publish(out);
+
+  // ---- Logs (same style as before) ----
+  RCLCPP_INFO(LOGGER, "Dual trajectory includes the following joints:");
+  for (const auto& joint_name : out.trajectory.joint_trajectory.joint_names)
+    RCLCPP_INFO(LOGGER, "  %s", joint_name.c_str());
+
+  RCLCPP_INFO_STREAM(LOGGER,
+      "Published dual trajectory as SubTrajectory id " << out.info.id
+      << " stage " << out.info.stage_id
+      << " with " << out.trajectory.joint_trajectory.points.size()
+      << " waypoints");
+
+  visual_tools_.prompt("[Publishing] Press 'next' to continue");
+  rclcpp::sleep_for(std::chrono::milliseconds(100));
+}
+
 
 // -------------------- File readers --------------------
 
@@ -316,7 +403,116 @@ void TrajAdaptTestNode::stretchRobotTrajectoryInPlace(
   robot_trajectory = new_traj;
 }
 
+void TrajAdaptTestNode::moveRobotToFirstWaypoint(const robot_trajectory::RobotTrajectory& traj)
+{
+  if (traj.getWayPointCount() == 0) {
+    RCLCPP_WARN(LOGGER, "Trajectory has 0 waypoints, cannot move robot");
+    return;
+  }
+
+  const moveit::core::RobotState& first_wp = traj.getWayPoint(0);
+  std::vector<double> joint_positions;
+  first_wp.copyJointGroupPositions(dual_arm_group_name, joint_positions);
+
+  move_group_.setJointValueTarget(joint_positions);
+  moveit::planning_interface::MoveGroupInterface::Plan plan;
+  bool success = (move_group_.plan(plan) == moveit::planning_interface::MoveItErrorCode::SUCCESS);
+  if (!success) {
+    RCLCPP_ERROR(LOGGER, "Failed to plan to first waypoint");
+    return;
+  }
+
+  visual_tools_.prompt("Press Next to move robot to first waypoint...");
+  success = (move_group_.execute(plan) == moveit::planning_interface::MoveItErrorCode::SUCCESS);
+  if (!success) {
+    RCLCPP_ERROR(LOGGER, "Failed to execute plan to first waypoint");
+    return;
+  }
+
+  RCLCPP_INFO(LOGGER, "Robot moved to first waypoint successfully");
+}
+
+void TrajAdaptTestNode::evaluateClearanceForTrajectory(
+    const planning_scene::PlanningSceneConstPtr& base_scene,
+    const robot_trajectory::RobotTrajectory& traj,
+    const std::string& object_id)
+{
+  if (!base_scene) {
+    RCLCPP_WARN(rclcpp::get_logger("Clearance"), "Base PlanningScene is null");
+    return;
+  }
+  if (traj.getWayPointCount() == 0) {
+    RCLCPP_WARN(rclcpp::get_logger("Clearance"), "Trajectory has 0 waypoints");
+    return;
+  }
+
+  // --- Build evaluation scene with cable attached ---
+  planning_scene::PlanningScenePtr eval_scene = base_scene->diff();
+  const auto& rs = base_scene->getCurrentState();
+  Eigen::Isometry3d leader_hand_transform = rs.getGlobalLinkTransform(lead_hand_frame) * lead_hand_to_tcp_transform_;
+  Eigen::Isometry3d follower_hand_transform = rs.getGlobalLinkTransform(follow_hand_frame) * follow_hand_to_tcp_transform_;
+  Eigen::Vector3d cable_vector_in_world = (leader_hand_transform.translation() - follower_hand_transform.translation()).normalized();
+
+  attachCollisionCable(
+      eval_scene, 
+      object_id,
+      /*length=*/0.1,
+      /*radius=*/0.01,
+      cable_vector_in_world,
+      /*attach_link=*/follow_hand_frame,
+      {follow_hand_frame, "left_panda_leftfinger", "left_panda_rightfinger",
+       lead_hand_frame, "right_panda_leftfinger", "right_panda_rightfinger"},
+      /*attach_to_robot=*/true);
+
+  // --- ACM variants (same as before) ---
+  collision_detection::AllowedCollisionMatrix acm_base = eval_scene->getAllowedCollisionMatrix();
+
+  collision_detection::AllowedCollisionMatrix acm_robot_only = acm_base;
+  acm_robot_only.setDefaultEntry(object_id, true);
+  acm_robot_only.setEntry(object_id, true);
+
+  collision_detection::AllowedCollisionMatrix acm_with_object = acm_base;
+  acm_with_object.removeEntry(object_id);
+
+  // --- Compute clearances ---
+  double clearance_robot_only  = computeMinClearance(eval_scene, traj, acm_robot_only);
+  double clearance_with_object = computeMinClearance(eval_scene, traj, acm_with_object);
+
+  traj_clearance_["clearance_robot_only"]  = clearance_robot_only;
+  traj_clearance_["clearance_with_object"] = clearance_with_object;
+
+  RCLCPP_INFO_STREAM(rclcpp::get_logger("Clearance"),
+       "clearance(robot only)=" << clearance_robot_only
+      << ", clearance(with object)=" << clearance_with_object);
+}
+
+
 // -------------------- Main API: read → stretch → dump --------------------
+
+void TrajAdaptTestNode::updatePlanningScene()
+{
+  if (!current_joint_state_)
+  {
+    RCLCPP_WARN(LOGGER, "Joint state not yet received, cannot update planning scene.");
+    return;
+  }
+
+  // Retrieve the current robot state from MoveGroup
+  moveit::core::RobotStatePtr robot_state = move_group_.getCurrentState();
+
+  // Update robot state with the latest joint positions
+  const std::vector<std::string>& joint_names = current_joint_state_->name;
+  const std::vector<double>& joint_positions = current_joint_state_->position;
+
+  for (size_t i = 0; i < joint_names.size(); ++i)
+  {
+    robot_state->setJointPositions(joint_names[i], &joint_positions[i]);
+  }
+
+  // Apply the updated state to the planning scene
+  move_group_.setStartState(*robot_state);
+  RCLCPP_INFO(LOGGER, "Planning scene successfully updated.");
+}
 
 void TrajAdaptTestNode::runFromFiles(
     const std::string& leader_joint_txt,
@@ -336,8 +532,35 @@ void TrajAdaptTestNode::runFromFiles(
   // Build a dual-arm trajectory so every waypoint contains both arms
   robot_trajectory::RobotTrajectory dual_traj = buildDualRobotTrajectory(lead_j, fol_j);
 
-  // Stretch
+  // Stretch the leader trajectory by the specified distance
   stretchRobotTrajectoryInPlace(dual_traj, stretch_distance[0], ik_timeout);
+
+  // Move robot to first waypoint before clearance evaluation
+  moveRobotToFirstWaypoint(dual_traj);
+  updatePlanningScene();
+
+  visual_tools_.prompt("Press Next to evaluate clearance after stretching...");
+
+  publishDualTraj("stretched_clip", dual_traj, /*stage_id=*/0, /*id=*/0);
+
+  // evaluate clearance after stretching
+  planning_scene_monitor::PlanningSceneMonitor psm(node_, "robot_description");
+  psm.startSceneMonitor();
+  // psm.startWorldGeometryMonitor();
+  psm.startStateMonitor();
+
+  auto base_scene = psm.getPlanningScene();   // or however you get it
+  nlohmann::json stretched_traj_clearance = nlohmann::json::object();
+
+  planning_scene::PlanningScenePtr base_mut = base_scene->diff();
+  base_mut->getCurrentStateNonConst() = dual_traj.getWayPoint(0);
+  base_mut->getCurrentStateNonConst().update();
+
+  evaluateClearanceForTrajectory(
+      base_mut,
+      dual_traj,
+      "grasped_cable"
+  );
 
   // Dump out: leader and follower groups separately, using your existing helper
   dumpTrajectoryTXTIndexed(
@@ -394,6 +617,8 @@ int main(int argc, char** argv)
   std::string dump_dir_str = traj_path + "_stretched";
   std::filesystem::create_directory(dump_dir_str);
   std::filesystem::path dump_dir(dump_dir_str);
+
+  traj_adapt_node->getVisualTools().prompt("[Planning] Press 'next' in the RvizVisualToolsGui window to continue adaption...");
 
   double ik_timeout = 0.5; // seconds
   std::vector<double> stretch_distance_vector;
