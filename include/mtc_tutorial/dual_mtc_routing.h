@@ -21,7 +21,6 @@
 #include <moveit_msgs/msg/planning_scene.hpp>
 #include <moveit/planning_scene_monitor/planning_scene_monitor.h>
 #include <moveit/collision_detection/collision_matrix.h>
-#include <nlohmann/json.hpp>
 
 
 #if __has_include(<tf2_geometry_msgs/tf2_geometry_msgs.hpp>)
@@ -43,6 +42,324 @@ using GroupPoseDict = std::map<std::string, geometry_msgs::msg::PoseStamped>;
 using GroupPoseMatrixDict = std::map<std::string, Eigen::Isometry3d>;
 using GroupStringDict = std::map<std::string, std::string>;
 using GroupVectorDict = std::map<std::string, std::vector<double>>;
+
+inline bool dumpTrajectoryTXT(const robot_trajectory::RobotTrajectory& traj,
+                              const std::string& joint_filename,
+                              const std::string& tcp_filename,
+                              const std::string& group_name = "",
+                              const Eigen::Isometry3d &offset = Eigen::Isometry3d::Identity(),
+                              std::string base_link_name = "base_link",
+                              char delim = ' ',          // use ' ' for space-separated
+                              int precision = 6,
+                              double fallback_dt = -1.0) // e.g., 0.05 if times are all zero
+{
+  const std::string group = group_name.empty() ? traj.getGroupName() : group_name;
+  const auto* jmg = traj.getRobotModel()->getJointModelGroup(group);
+  if (!jmg) return false;
+
+  std::vector<const moveit::core::LinkModel*> tips;
+  if (!jmg->getEndEffectorTips(tips) || tips.empty())
+  {
+    RCLCPP_ERROR(rclcpp::get_logger("RobotTrajectory"), "Unable to get end effector tips from jmg");
+    return false;
+  }
+
+  const auto& names = jmg->getVariableNames();
+  const size_t N = names.size();
+  const size_t M = traj.getWayPointCount();
+  if (M == 0 || N == 0) return false;
+
+  std::filesystem::create_directories(std::filesystem::path(joint_filename).parent_path());
+  std::ofstream joint_out(joint_filename);
+  if (!joint_out) return false;
+  joint_out.setf(std::ios::fixed, std::ios::floatfield);
+  joint_out << std::setprecision(precision);
+
+  std::filesystem::create_directories(std::filesystem::path(tcp_filename).parent_path());
+  std::ofstream tcp_out(tcp_filename);
+  if (!tcp_out) return false;
+  tcp_out.setf(std::ios::fixed, std::ios::floatfield);
+  tcp_out << std::setprecision(precision);
+
+  // // Header
+  // out << "# time";
+  // for (auto& n : names) out << delim << "q/" << n;
+  // for (auto& n : names) out << delim << "dq/" << n;
+  // out << "\n";
+
+  // Gather data
+  std::vector<double> T(M, 0.0);
+  std::vector<std::vector<double>> Q(M, std::vector<double>(N, 0.0));
+  std::vector<std::vector<double>> dQ(M, std::vector<double>(N, 0.0));
+  std::vector<Eigen::Isometry3d> TCP_pose_in_world(M, Eigen::Isometry3d::Identity());
+  std::vector<Eigen::Isometry3d> TCP_pose_in_base(M, Eigen::Isometry3d::Identity());
+
+  bool any_velocity = false;
+  Eigen::Isometry3d robot_base_pose = traj.getWayPoint(0).getGlobalLinkTransform(base_link_name);
+  for (size_t i = 0; i < M; ++i) {
+    const auto& s = traj.getWayPoint(i);
+    T[i] = traj.getWayPointDurationFromStart(i);
+    s.copyJointGroupPositions(jmg, Q[i]);
+    s.copyJointGroupVelocities(jmg, dQ[i]); // zeros if not set
+
+    for (const moveit::core::LinkModel* ee_parent_link : tips){
+      // pose in world frame for publishing
+      Eigen::Isometry3d ee_pose_in_world= s.getGlobalLinkTransform(ee_parent_link);
+      // Apply the translation in the z-axis
+      Eigen::Isometry3d tcp_pose_in_world = ee_pose_in_world*offset;
+      TCP_pose_in_world[i] = tcp_pose_in_world;
+
+      // ee_pose in robot base frame for storage 
+      Eigen::Isometry3d ee_pose_in_base = robot_base_pose.inverse()*ee_pose_in_world;
+      // Apply the translation in the z-axiss
+      Eigen::Isometry3d tcp_pose_in_base = ee_pose_in_base*offset;
+      TCP_pose_in_base[i] = tcp_pose_in_base;
+    }
+
+    for (double v : dQ[i]) if (std::abs(v) > 1e-12) { any_velocity = true; break; }
+  }
+
+  // Dump rows
+  for (size_t i = 0; i < M; ++i) {
+    joint_out << T[i];
+    for (size_t j = 0; j < N; ++j) joint_out << delim << Q[i][j];
+    for (size_t j = 0; j < N; ++j) joint_out << delim << dQ[i][j];
+    joint_out << "\n";
+  }
+
+  // Dump TCP poses
+  for (size_t i = 0; i < M; ++i) {
+    tcp_out << T[i];
+    for (int col = 0; col < 4; ++col) {
+      for (int row = 0; row < 4; ++row) {
+        tcp_out << delim << TCP_pose_in_base[i](row, col);
+      }
+    }
+    tcp_out << "\n";  // Newline for the next matrix
+  }
+
+  return true;
+}
+
+inline std::filesystem::path nextIndexedFile(const std::filesystem::path& dir,
+                                            const std::string& prefix,
+                                            const std::string& ext = ".txt",
+                                            int width = 3,
+                                            int start_index = 1)
+{
+  std::filesystem::create_directories(dir);
+  int max_idx = start_index - 1;
+
+  for (const auto& entry : std::filesystem::directory_iterator(dir)) {
+    if (!entry.is_regular_file()) continue;
+    const auto name = entry.path().filename().string();
+
+    // check prefix_
+    if (name.size() < prefix.size() + 1 + ext.size()) continue;
+    if (name.compare(0, prefix.size(), prefix) != 0) continue;
+    if (name[prefix.size()] != '_') continue;
+
+    // check suffix .ext
+    if (name.compare(name.size() - ext.size(), ext.size(), ext) != 0) continue;
+
+    // digits in the middle
+    const auto digits = name.substr(prefix.size() + 1,
+                                    name.size() - prefix.size() - 1 - ext.size());
+    if (digits.empty() || !std::all_of(digits.begin(), digits.end(),
+                                      [](unsigned char c){ return std::isdigit(c); }))
+      continue;
+
+    int idx = std::stoi(digits);
+    if (idx > max_idx) max_idx = idx;
+  }
+
+  const int next = std::max(start_index, max_idx + 1);
+  std::ostringstream oss;
+  oss << prefix << "_" << std::setw(width) << std::setfill('0') << next << ext;
+  return dir / oss.str();
+}
+
+inline bool dumpTrajectoryTXTIndexed(const robot_trajectory::RobotTrajectory& traj,
+                                    const std::string& prefix,
+                                    const std::string& group_name = "",
+                                    const std::filesystem::path& dir = std::filesystem::current_path(),
+                                    const Eigen::Isometry3d &offset = Eigen::Isometry3d::Identity(),
+                                      std::string base_link_name = "base_link",
+                                    char delim = ' ', int precision = 6,
+                                    double fallback_dt = 0.05, // pick something reasonable
+                                    int width = 3, int start_index = 1)
+{
+  // const auto joint_path = nextIndexedFile(dir, prefix + "_joint", ".txt", width, start_index);
+  // const auto tcp_path = nextIndexedFile(dir, prefix + "_tcp", ".txt", width, start_index);
+
+  std::ostringstream joint_oss;
+  joint_oss << prefix << "_joint.txt";
+  const auto joint_path = dir / joint_oss.str();
+  std::ostringstream tcp_oss;
+  tcp_oss << prefix << "_tcp.txt";
+  const auto tcp_path = dir / tcp_oss.str();
+
+  RCLCPP_INFO(rclcpp::get_logger("RobotTrajectory"),
+            "Dumping trajectory to %s", joint_path.string().c_str());
+  return dumpTrajectoryTXT(traj, joint_path.string(), tcp_path.string(), group_name, offset, base_link_name, delim, precision, fallback_dt);
+}
+
+void printACM(const collision_detection::AllowedCollisionMatrix& acm)
+{
+  rclcpp::Logger ACM_logger = rclcpp::get_logger("ACM");
+  RCLCPP_INFO(ACM_logger, "----- AllowedCollisionMatrix dump -----");
+
+  std::vector<std::string> entries;
+  acm.getAllEntryNames(entries);
+
+  // 1. Print entry names
+  RCLCPP_INFO(ACM_logger, "ACM contains %zu entries:", entries.size());
+  for (const auto& name : entries)
+    RCLCPP_INFO_STREAM(ACM_logger, "  • " << name);
+
+  // 2. Pairwise entries (explicit rules)
+  RCLCPP_INFO(ACM_logger, "Pairwise collision rules (explicit entries):");
+  for (size_t i = 0; i < entries.size(); ++i) {
+    for (size_t j = i; j < entries.size(); ++j) {
+      const auto& a = entries[i];
+      const auto& b = entries[j];
+
+      collision_detection::AllowedCollision::Type type;
+      bool has_entry = acm.getEntry(a, b, type);  // <--- 3-arg version
+
+      if (!has_entry) {
+        // No explicit rule; skip or mark as unspecified
+        continue;
+        // or:
+        // RCLCPP_INFO_STREAM(LOGGER,
+        //   "  (" << a << ", " << b << ") : UNSPECIFIED");
+      } else {
+        std::string type_str;
+        switch (type) {
+          case collision_detection::AllowedCollision::ALWAYS:
+            type_str = "ALWAYS (ALLOWED)";
+            break;
+          case collision_detection::AllowedCollision::NEVER:
+            type_str = "NEVER (NOT ALLOWED)";
+            break;
+          case collision_detection::AllowedCollision::CONDITIONAL:
+            type_str = "CONDITIONAL";
+            break;
+          default:
+            type_str = "UNKNOWN";
+            break;
+        }
+
+        RCLCPP_INFO_STREAM(ACM_logger,
+          "  (" << a << ", " << b << ") : " << type_str);
+      }
+    }
+  }
+
+  RCLCPP_INFO(ACM_logger, "-----------------------------------------");
+}
+
+// Get JSON node at clip_clearance[ path[0] ][ path[1] ] ...
+static nlohmann::json& getJsonNode(nlohmann::json& root,
+                                   const std::vector<std::string>& path)
+{
+  nlohmann::json* node = &root;
+  for (const auto& key : path)
+    node = &((*node)[key]);  // creates object nodes as needed
+  return *node;
+}
+
+// Get JSON node at clip_clearance[ path... ][leaf_key]
+static nlohmann::json& getJsonNode(nlohmann::json& root,
+                                   const std::vector<std::string>& path,
+                                   const std::string& leaf_key)
+{
+  nlohmann::json* node = &root;
+  for (const auto& key : path)
+    node = &((*node)[key]);
+  return (*node)[leaf_key];  // creates leaf object as needed
+}
+
+static std::unordered_map<std::string, std::set<int>> parseStageTargets(const std::vector<std::string>& targets)
+{
+  std::unordered_map<std::string, std::set<int>> stage_to_indices;
+
+  for (const auto& entry : targets) {
+    const std::string pat = "_subtraj_";
+    auto pos = entry.rfind(pat);
+
+    if (pos == std::string::npos) {
+      // pure stage name: all subtrajectories for that stage
+      stage_to_indices[entry] = {};
+      continue;
+    }
+
+    std::string stage_name = entry.substr(0, pos);
+    std::string idx_str    = entry.substr(pos + pat.size());
+
+    try {
+      int idx = std::stoi(idx_str);
+      stage_to_indices[stage_name].insert(idx);
+    } catch (const std::exception& e) {
+      RCLCPP_WARN_STREAM(rclcpp::get_logger("RobotTrajectory"),
+          "evaluateClearance: cannot parse target entry '"
+          << entry << "': " << e.what());
+    }
+  }
+
+  return stage_to_indices;
+}
+
+// returns normalized or zero
+static Eigen::Vector3d safeNormalize(const Eigen::Vector3d& v, double eps = 1e-9)
+{
+  const double n = v.norm();
+  if (n < eps) return Eigen::Vector3d::Zero();
+  return v / n;
+}
+
+static inline void assignQuat(geometry_msgs::msg::Pose& pose,
+                            const Eigen::Quaterniond& q)
+{
+  Eigen::Quaterniond nq = q.normalized();
+  pose.orientation.w = nq.w();
+  pose.orientation.x = nq.x();
+  pose.orientation.y = nq.y();
+  pose.orientation.z = nq.z();
+}
+
+double computeMinClearance(
+    const planning_scene::PlanningScenePtr& scene,   // note: non-const now
+    const robot_trajectory::RobotTrajectory& traj,
+    const collision_detection::AllowedCollisionMatrix& acm)
+{
+  collision_detection::CollisionRequest req;
+  collision_detection::CollisionResult res;
+  req.distance = true;
+
+  double min_d = std::numeric_limits<double>::infinity();
+
+  // Use the scene's current state, which has the attached cable
+  moveit::core::RobotState& scene_state = scene->getCurrentStateNonConst();
+
+  for (size_t i = 0; i < traj.getWayPointCount(); ++i) {
+    const moveit::core::RobotState& wp_state = traj.getWayPoint(i);
+
+    // Copy joint values from the waypoint into the scene state
+    scene_state.setVariablePositions(wp_state.getVariablePositions());
+    scene_state.update();  // update transforms
+
+    res.clear();
+    scene->checkCollision(req, res, scene_state, acm);
+
+    if (res.collision)
+      min_d = 0.0;  // by convention; res.distance is usually 0 in collision
+    else
+      min_d = std::min(min_d, res.distance);
+  }
+
+  return min_d;
+}
 
 class MTCTaskNode
 {
@@ -179,7 +496,8 @@ public:
   }
 
 
-  void updateClipOffsets(std::vector<double> start_clip_size= {0.04, 0.04, 0.06}, std::vector<double> goal_clip_size= {0.04, 0.04, 0.06},
+  void updateClipOffsets(std::vector<double> start_clip_size= {0.04, 0.04, 0.06}, 
+                        std::vector<double> goal_clip_size= {0.04, 0.04, 0.06},
                         bool clip_added_from_blender = false)
   {
     // U-type Clip
@@ -209,159 +527,6 @@ public:
     }
   }
 
-  void stretchRobotTrajectoryInPlace(
-    robot_trajectory::RobotTrajectory& robot_trajectory,
-    double extension_distance,
-    double ik_timeout=1.0)
-{
-  const moveit::core::RobotModelConstPtr& model = robot_trajectory.getRobotModel();
-
-  const auto* lead_jmg   = model->getJointModelGroup(lead_arm_group_name);
-  const auto* follow_jmg = model->getJointModelGroup(follow_arm_group_name);
-
-  if (!lead_jmg || !follow_jmg)
-    throw std::runtime_error("JointModelGroup not found");
-
-  moveit::core::RobotState state(model);
-
-  for (size_t i = 0; i < robot_trajectory.getWayPointCount(); ++i)
-  {
-    state = robot_trajectory.getWayPoint(i);   // copy waypoint state
-
-    // --- FK ---
-    Eigen::Isometry3d T_lead_ee_in_world   = state.getGlobalLinkTransform(lead_hand_frame);
-    Eigen::Isometry3d T_follow_ee_in_world = state.getGlobalLinkTransform(follow_hand_frame);
-
-    Eigen::Isometry3d T_lead_tcp_in_world   = T_lead_ee_in_world  * lead_hand_to_tcp_transform_;
-    Eigen::Isometry3d T_follow_tcp_in_world = T_follow_ee_in_world * follow_hand_to_tcp_transform_;
-
-    Eigen::Vector3d dir =
-        safeNormalize(T_lead_tcp_in_world.translation() - T_follow_tcp_in_world.translation());
-    if (dir.isZero()) continue;
-
-    // --- Stretch TCP ---
-    Eigen::Isometry3d T_lead_tcp_des = T_lead_tcp_in_world;
-    T_lead_tcp_des.translation() += extension_distance * dir;
-
-    // --- Back to hand pose ---
-    Eigen::Isometry3d T_lead_hand_des =
-        T_lead_tcp_des * lead_hand_to_tcp.inverse();
-
-    // --- Seed from current waypoint ---
-    std::vector<double> seed;
-    state.copyJointGroupPositions(lead_jmg, seed);
-
-    bool ik_ok = state.setFromIK(
-        lead_jmg,
-        T_lead_hand_des,
-        lead_hand_link,
-        ik_timeout);
-
-    if (!ik_ok)
-      continue;
-
-    // --- Write back ---
-    robot_trajectory.setWayPoint(i, state);
-  }
-}
-
-inline bool dumpTrajectoryTXT(const robot_trajectory::RobotTrajectory& traj,
-                              const std::string& joint_filename,
-                              const std::string& tcp_filename,
-                              const std::string& group_name = "",
-                              const Eigen::Isometry3d &offset = Eigen::Isometry3d::Identity(),
-                              std::string base_link_name = "base_link",
-                              char delim = ' ',          // use ' ' for space-separated
-                              int precision = 6,
-                              double fallback_dt = -1.0) // e.g., 0.05 if times are all zero
-{
-  const std::string group = group_name.empty() ? traj.getGroupName() : group_name;
-  const auto* jmg = traj.getRobotModel()->getJointModelGroup(group);
-  if (!jmg) return false;
-
-  std::vector<const moveit::core::LinkModel*> tips;
-  if (!jmg->getEndEffectorTips(tips) || tips.empty())
-  {
-    RCLCPP_ERROR(rclcpp::get_logger("RobotTrajectory"), "Unable to get end effector tips from jmg");
-    return false;
-  }
-
-  const auto& names = jmg->getVariableNames();
-  const size_t N = names.size();
-  const size_t M = traj.getWayPointCount();
-  if (M == 0 || N == 0) return false;
-
-  std::filesystem::create_directories(std::filesystem::path(joint_filename).parent_path());
-  std::ofstream joint_out(joint_filename);
-  if (!joint_out) return false;
-  joint_out.setf(std::ios::fixed, std::ios::floatfield);
-  joint_out << std::setprecision(precision);
-
-  std::filesystem::create_directories(std::filesystem::path(tcp_filename).parent_path());
-  std::ofstream tcp_out(tcp_filename);
-  if (!tcp_out) return false;
-  tcp_out.setf(std::ios::fixed, std::ios::floatfield);
-  tcp_out << std::setprecision(precision);
-
-  // // Header
-  // out << "# time";
-  // for (auto& n : names) out << delim << "q/" << n;
-  // for (auto& n : names) out << delim << "dq/" << n;
-  // out << "\n";
-
-  // Gather data
-  std::vector<double> T(M, 0.0);
-  std::vector<std::vector<double>> Q(M, std::vector<double>(N, 0.0));
-  std::vector<std::vector<double>> dQ(M, std::vector<double>(N, 0.0));
-  std::vector<Eigen::Isometry3d> TCP_pose_in_world(M, Eigen::Isometry3d::Identity());
-  std::vector<Eigen::Isometry3d> TCP_pose_in_base(M, Eigen::Isometry3d::Identity());
-
-  bool any_velocity = false;
-  Eigen::Isometry3d robot_base_pose = traj.getWayPoint(0).getGlobalLinkTransform(base_link_name);
-  for (size_t i = 0; i < M; ++i) {
-    const auto& s = traj.getWayPoint(i);
-    T[i] = traj.getWayPointDurationFromStart(i);
-    s.copyJointGroupPositions(jmg, Q[i]);
-    s.copyJointGroupVelocities(jmg, dQ[i]); // zeros if not set
-
-    for (const moveit::core::LinkModel* ee_parent_link : tips){
-      // pose in world frame for publishing
-      Eigen::Isometry3d ee_pose_in_world= s.getGlobalLinkTransform(ee_parent_link);
-      // Apply the translation in the z-axis
-      Eigen::Isometry3d tcp_pose_in_world = ee_pose_in_world*offset;
-      TCP_pose_in_world[i] = tcp_pose_in_world;
-
-      // ee_pose in robot base frame for storage 
-      Eigen::Isometry3d ee_pose_in_base = robot_base_pose.inverse()*ee_pose_in_world;
-      // Apply the translation in the z-axiss
-      Eigen::Isometry3d tcp_pose_in_base = ee_pose_in_base*offset;
-      TCP_pose_in_base[i] = tcp_pose_in_base;
-    }
-
-    for (double v : dQ[i]) if (std::abs(v) > 1e-12) { any_velocity = true; break; }
-  }
-
-  // Dump rows
-  for (size_t i = 0; i < M; ++i) {
-    joint_out << T[i];
-    for (size_t j = 0; j < N; ++j) joint_out << delim << Q[i][j];
-    for (size_t j = 0; j < N; ++j) joint_out << delim << dQ[i][j];
-    joint_out << "\n";
-  }
-
-  // Dump TCP poses
-  for (size_t i = 0; i < M; ++i) {
-    tcp_out << T[i];
-    for (int col = 0; col < 4; ++col) {
-      for (int row = 0; row < 4; ++row) {
-        tcp_out << delim << TCP_pose_in_base[i](row, col);
-      }
-    }
-    tcp_out << "\n";  // Newline for the next matrix
-  }
-
-  return true;
-}
 
   // Robot group names
   std::string lead_arm_group_name;
@@ -404,50 +569,6 @@ private:
     const double dot_y = v_c.normalized().dot(Eigen::Vector3d::UnitY());
     return (dot_y >= 0.0) ? +1 : -1;
   }
-
-  static inline void assignQuat(geometry_msgs::msg::Pose& pose,
-                              const Eigen::Quaterniond& q)
-  {
-    Eigen::Quaterniond nq = q.normalized();
-    pose.orientation.w = nq.w();
-    pose.orientation.x = nq.x();
-    pose.orientation.y = nq.y();
-    pose.orientation.z = nq.z();
-  }
-
-  double computeMinClearance(
-      const planning_scene::PlanningScenePtr& scene,   // note: non-const now
-      const robot_trajectory::RobotTrajectory& traj,
-      const collision_detection::AllowedCollisionMatrix& acm)
-  {
-    collision_detection::CollisionRequest req;
-    collision_detection::CollisionResult res;
-    req.distance = true;
-
-    double min_d = std::numeric_limits<double>::infinity();
-
-    // Use the scene's current state, which has the attached cable
-    moveit::core::RobotState& scene_state = scene->getCurrentStateNonConst();
-
-    for (size_t i = 0; i < traj.getWayPointCount(); ++i) {
-      const moveit::core::RobotState& wp_state = traj.getWayPoint(i);
-
-      // Copy joint values from the waypoint into the scene state
-      scene_state.setVariablePositions(wp_state.getVariablePositions());
-      scene_state.update();  // update transforms
-
-      res.clear();
-      scene->checkCollision(req, res, scene_state, acm);
-
-      if (res.collision)
-        min_d = 0.0;  // by convention; res.distance is usually 0 in collision
-      else
-        min_d = std::min(min_d, res.distance);
-    }
-
-    return min_d;
-  }
-
 
   void attachCollisionCable(planning_scene::PlanningScenePtr scene,
                                               const std::string& id, 
@@ -518,13 +639,99 @@ private:
 
   }
 
-  void printACM(const collision_detection::AllowedCollisionMatrix& acm);
-
   void evaluateClearance(
     const std::string& task_name,                    
     const std::string& clip_id,
     const std::string& object_id,
     const std::vector<std::string>& target_stages_and_indices);
+
+  void stretchRobotTrajectoryInPlace(
+      robot_trajectory::RobotTrajectory& robot_trajectory,
+      double extension_distance,
+      double ik_timeout)
+  {
+    const moveit::core::RobotModelConstPtr& model = robot_trajectory.getRobotModel();
+    if (!model)
+      throw std::runtime_error("RobotTrajectory has null RobotModel");
+
+    const auto* lead_jmg   = model->getJointModelGroup(lead_arm_group_name);
+    const auto* follow_jmg = model->getJointModelGroup(follow_arm_group_name);
+    if (!lead_jmg || !follow_jmg)
+      throw std::runtime_error("JointModelGroup not found");
+
+    const size_t M = robot_trajectory.getWayPointCount();
+    if (M == 0)
+      return;
+
+    // Build a brand new trajectory with the same model+group
+    robot_trajectory::RobotTrajectory new_traj(model, robot_trajectory.getGroupName());
+
+    // Helper: compute dt between waypoints (works across MoveIt variants)
+    auto duration_from_prev = [&](size_t i) -> double {
+      // waypoint 0 is absolute start
+      if (i == 0) return 0.0;
+
+      // Prefer duration-from-previous if available in your version
+      // If this doesn't compile in your branch, comment it out and use the fallback below.
+      return robot_trajectory.getWayPointDurationFromPrevious(i);
+
+      // Fallback (if needed):
+      // const double t_i   = robot_trajectory.getWayPointDurationFromStart(i);
+      // const double t_im1 = robot_trajectory.getWayPointDurationFromStart(i - 1);
+      // return std::max(0.0, t_i - t_im1);
+    };
+
+    for (size_t i = 0; i < M; ++i)
+    {
+      moveit::core::RobotState state = robot_trajectory.getWayPoint(i); // copy
+
+      // --- FK on the hand frames ---
+      const Eigen::Isometry3d T_lead_ee_in_world   = state.getGlobalLinkTransform(lead_hand_frame);
+      const Eigen::Isometry3d T_follow_ee_in_world = state.getGlobalLinkTransform(follow_hand_frame);
+
+      // --- TCP frames ---
+      const Eigen::Isometry3d T_lead_tcp_in_world   = T_lead_ee_in_world   * lead_hand_to_tcp_transform_;
+      const Eigen::Isometry3d T_follow_tcp_in_world = T_follow_ee_in_world * follow_hand_to_tcp_transform_;
+
+      Eigen::Vector3d dir = safeNormalize(T_lead_tcp_in_world.translation() - T_follow_tcp_in_world.translation());
+
+      if (!dir.isZero())
+      {
+        // --- Stretch TCP ---
+        Eigen::Isometry3d T_lead_tcp_des = T_lead_tcp_in_world;
+        T_lead_tcp_des.translation() += extension_distance * dir;
+
+        // --- Convert back to desired hand pose (IK target) ---
+        const Eigen::Isometry3d T_lead_hand_des =
+            T_lead_tcp_des * lead_hand_to_tcp_transform_.inverse();
+
+        // --- Seed from current waypoint (already in 'state') ---
+        bool ik_ok = state.setFromIK(
+            lead_jmg,
+            T_lead_hand_des,
+            lead_hand_frame,
+            ik_timeout);
+
+        // If IK fails, keep original state (the copy we started with)
+        (void)ik_ok;
+      }
+
+      // Preserve timing by adding the same dt as original
+      const double dt = duration_from_prev(i);
+      new_traj.addSuffixWayPoint(state, dt);
+    }
+
+    // Replace the original trajectory with the new one
+    robot_trajectory = new_traj;
+  }
+
+  void generateAndDumpStretchedTargets(
+    const std::string& task_name,
+    const std::string& clip_id,
+    const std::vector<std::string>& target_stages_and_indices,
+    double extension_distance,
+    double ik_timeout,
+    const std::string& dump_prefix);
 
   std::tuple<int, geometry_msgs::msg::PoseStamped, geometry_msgs::msg::PoseStamped> assignClipGoalsAlongConnection(const std::string& clip_frame,
                                                                                                                         const std::string& next_clip_frame,
@@ -580,6 +787,9 @@ private:
   // Helper methods for internal setup
   void initializeGroups();
   void initializePlanners();
+  void initializeTransforms(double default_franka_flange_to_tcp_z,
+                          double sensone_height,
+                          double extend_finger_length);
 
   // synchronization variables
   std::thread udp_thread_lead_sync_;

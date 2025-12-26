@@ -40,10 +40,6 @@ static const rclcpp::Logger LOGGER = rclcpp::get_logger("mtc_node");
 
 double desired_ee_distance = 0.12;
 
-double default_franka_flange_to_tcp_z = 0.1034;
-double sensone_height = 0.036; 
-double extend_finger_length = 0.01;
-
 rclcpp::node_interfaces::NodeBaseInterface::SharedPtr MTCTaskNode::getNodeBaseInterface()
 {
   return node_->get_node_base_interface();
@@ -117,44 +113,9 @@ MTCTaskNode::MTCTaskNode(const rclcpp::NodeOptions& options)
   clearance_results_["attach_pull_cable"] = attach_pull;
   clearance_results_["attach_transport_cable"] = attach_transport;
 
-  // CAUTION: flange_to_tcp stands for the transform from panda_link_8 to TCP
-  // In comparison to hand_to_tcp, there is additional rotation of 45 degree around z axis, and an optional z offset because of wrist snesor
-  // adapt flange to TCP transform based on the wrist sensor's height
-  follow_flange_to_tcp_transform_.translation().z() = default_franka_flange_to_tcp_z; 
-  if (node_->get_parameter("use_sensone_left").as_bool()){
-    follow_flange_to_tcp_transform_.translation().z() += sensone_height;
-  }
-  // set rotation to 45 degree around z axis
-  follow_flange_to_tcp_transform_.rotate(Eigen::AngleAxisd(-M_PI/4, Eigen::Vector3d::UnitZ())); // link8 rotates 45 degree around z axis to tcp
-  RCLCPP_INFO(LOGGER, "Follower flange to TCP transform z: %f", follow_flange_to_tcp_transform_.translation().z());
-  
-  lead_flange_to_tcp_transform_.translation().z() = default_franka_flange_to_tcp_z; 
-  if (node_->get_parameter("use_sensone_right").as_bool()){
-    lead_flange_to_tcp_transform_.translation().z() += sensone_height; 
-  }
-  lead_flange_to_tcp_transform_.rotate(Eigen::AngleAxisd(-M_PI/4, Eigen::Vector3d::UnitZ())); // link8 rotates 45 degree around z axis to tcp
-  RCLCPP_INFO(LOGGER, "Leader flange to TCP transform z: %f", lead_flange_to_tcp_transform_.translation().z());
-  
-  // hand_to_TCP transform is different from flange_to_TCP transform, it is usually a fixed value if franka hand is not changed
-  follow_hand_to_tcp_transform_ = Eigen::Isometry3d::Identity();
-  follow_hand_to_tcp_transform_.translation().z() = default_franka_flange_to_tcp_z; // 0.1034 is the default value for panda hand
-  if (node_->get_parameter("alter_finger_left").as_bool()){
-    follow_hand_to_tcp_transform_.translation().z() += extend_finger_length*0.5;
-    follow_flange_to_tcp_transform_.translation().z() += extend_finger_length*0.5; // 0.1034 is the default value for panda flange
-    RCLCPP_INFO(LOGGER, "Altered follower hand to TCP transform z: %f", follow_hand_to_tcp_transform_.translation().z());
-  }else{
-    RCLCPP_INFO(LOGGER, "Default follower hand to TCP transform z: %f", follow_hand_to_tcp_transform_.translation().z());
-  }
-
-  lead_hand_to_tcp_transform_ = Eigen::Isometry3d::Identity();
-  lead_hand_to_tcp_transform_.translation().z() = default_franka_flange_to_tcp_z; // 0.1034 is the default value for panda hand
-  if (node_->get_parameter("alter_finger_right").as_bool()){
-    lead_hand_to_tcp_transform_.translation().z() += extend_finger_length*0.5; // 0.1034 is the default value for panda hand
-    lead_flange_to_tcp_transform_.translation().z() += extend_finger_length*0.5; // 0.1034 is the default value for panda flange
-    RCLCPP_INFO(LOGGER, "Altered leader hand to TCP transform z: %f", lead_hand_to_tcp_transform_.translation().z());
-  }else{
-    RCLCPP_INFO(LOGGER, "Default leader hand to TCP transform z: %f", lead_hand_to_tcp_transform_.translation().z());
-  }
+  initializeTransforms(/*default_franka_flange_to_tcp_z*/ 0.1034,
+                        /*sensone_height*/ 0.036,
+                        /*extend_finger_length*/ 0.01);
 
   // hand_to_tcp_transform_ = Eigen::Isometry3d::Identity();
   // hand_to_tcp_transform_.translation().z() = 0.1034; // 0.1034 is the default value for panda hand
@@ -240,6 +201,51 @@ void MTCTaskNode::initializePlanners()
     follow_chomp_planner = std::make_shared<mtc::solvers::PipelinePlanner>(node_, chomp_pipeline_name);
     follow_chomp_planner->setMaxVelocityScalingFactor(0.05);
     follow_chomp_planner->setMaxAccelerationScalingFactor(0.05);
+}
+
+void MTCTaskNode::initializeTransforms(double default_franka_flange_to_tcp_z,
+                          double sensone_height,
+                          double extend_finger_length)
+{
+  // CAUTION: flange_to_tcp stands for the transform from panda_link_8 to TCP
+  // In comparison to hand_to_tcp, there is additional rotation of 45 degree around z axis, and an optional z offset because of wrist snesor
+  // adapt flange to TCP transform based on the wrist sensor's height
+  follow_flange_to_tcp_transform_.translation().z() = default_franka_flange_to_tcp_z; 
+  if (node_->get_parameter("use_sensone_left").as_bool()){
+    follow_flange_to_tcp_transform_.translation().z() += sensone_height;
+  }
+  // set rotation to 45 degree around z axis
+  follow_flange_to_tcp_transform_.rotate(Eigen::AngleAxisd(-M_PI/4, Eigen::Vector3d::UnitZ())); // link8 rotates 45 degree around z axis to tcp
+  RCLCPP_INFO(LOGGER, "Follower flange to TCP transform z: %f", follow_flange_to_tcp_transform_.translation().z());
+  
+  lead_flange_to_tcp_transform_.translation().z() = default_franka_flange_to_tcp_z; 
+  if (node_->get_parameter("use_sensone_right").as_bool()){
+    lead_flange_to_tcp_transform_.translation().z() += sensone_height; 
+  }
+  lead_flange_to_tcp_transform_.rotate(Eigen::AngleAxisd(-M_PI/4, Eigen::Vector3d::UnitZ())); // link8 rotates 45 degree around z axis to tcp
+  RCLCPP_INFO(LOGGER, "Leader flange to TCP transform z: %f", lead_flange_to_tcp_transform_.translation().z());
+  
+  // hand_to_TCP transform is different from flange_to_TCP transform, it is usually a fixed value if franka hand is not changed
+  follow_hand_to_tcp_transform_ = Eigen::Isometry3d::Identity();
+  follow_hand_to_tcp_transform_.translation().z() = default_franka_flange_to_tcp_z; // 0.1034 is the default value for panda hand
+  if (node_->get_parameter("alter_finger_left").as_bool()){
+    follow_hand_to_tcp_transform_.translation().z() += extend_finger_length*0.5;
+    follow_flange_to_tcp_transform_.translation().z() += extend_finger_length*0.5; // 0.1034 is the default value for panda flange
+    RCLCPP_INFO(LOGGER, "Altered follower hand to TCP transform z: %f", follow_hand_to_tcp_transform_.translation().z());
+  }else{
+    RCLCPP_INFO(LOGGER, "Default follower hand to TCP transform z: %f", follow_hand_to_tcp_transform_.translation().z());
+  }
+
+  lead_hand_to_tcp_transform_ = Eigen::Isometry3d::Identity();
+  lead_hand_to_tcp_transform_.translation().z() = default_franka_flange_to_tcp_z; // 0.1034 is the default value for panda hand
+  if (node_->get_parameter("alter_finger_right").as_bool()){
+    lead_hand_to_tcp_transform_.translation().z() += extend_finger_length*0.5; // 0.1034 is the default value for panda hand
+    lead_flange_to_tcp_transform_.translation().z() += extend_finger_length*0.5; // 0.1034 is the default value for panda flange
+    RCLCPP_INFO(LOGGER, "Altered leader hand to TCP transform z: %f", lead_hand_to_tcp_transform_.translation().z());
+  }else{
+    RCLCPP_INFO(LOGGER, "Default leader hand to TCP transform z: %f", lead_hand_to_tcp_transform_.translation().z());
+  }
+
 }
 
  void MTCTaskNode::jointStateCallback(const sensor_msgs::msg::JointState::SharedPtr msg)
@@ -937,82 +943,6 @@ geometry_msgs::msg::PoseStamped MTCTaskNode::createClipGoal(const std::string& g
   return goal_pose;
 }
 
-void MTCTaskNode::printACM(const collision_detection::AllowedCollisionMatrix& acm)
-{
-  RCLCPP_INFO(LOGGER, "----- AllowedCollisionMatrix dump -----");
-
-  std::vector<std::string> entries;
-  acm.getAllEntryNames(entries);
-
-  // 1. Print entry names
-  RCLCPP_INFO(LOGGER, "ACM contains %zu entries:", entries.size());
-  for (const auto& name : entries)
-    RCLCPP_INFO_STREAM(LOGGER, "  • " << name);
-
-  // 2. Pairwise entries (explicit rules)
-  RCLCPP_INFO(LOGGER, "Pairwise collision rules (explicit entries):");
-  for (size_t i = 0; i < entries.size(); ++i) {
-    for (size_t j = i; j < entries.size(); ++j) {
-      const auto& a = entries[i];
-      const auto& b = entries[j];
-
-      collision_detection::AllowedCollision::Type type;
-      bool has_entry = acm.getEntry(a, b, type);  // <--- 3-arg version
-
-      if (!has_entry) {
-        // No explicit rule; skip or mark as unspecified
-        continue;
-        // or:
-        // RCLCPP_INFO_STREAM(LOGGER,
-        //   "  (" << a << ", " << b << ") : UNSPECIFIED");
-      } else {
-        std::string type_str;
-        switch (type) {
-          case collision_detection::AllowedCollision::ALWAYS:
-            type_str = "ALWAYS (ALLOWED)";
-            break;
-          case collision_detection::AllowedCollision::NEVER:
-            type_str = "NEVER (NOT ALLOWED)";
-            break;
-          case collision_detection::AllowedCollision::CONDITIONAL:
-            type_str = "CONDITIONAL";
-            break;
-          default:
-            type_str = "UNKNOWN";
-            break;
-        }
-
-        RCLCPP_INFO_STREAM(LOGGER,
-          "  (" << a << ", " << b << ") : " << type_str);
-      }
-    }
-  }
-
-  RCLCPP_INFO(LOGGER, "-----------------------------------------");
-}
-
-// Get JSON node at clip_clearance[ path[0] ][ path[1] ] ...
-static nlohmann::json& getJsonNode(nlohmann::json& root,
-                                   const std::vector<std::string>& path)
-{
-  nlohmann::json* node = &root;
-  for (const auto& key : path)
-    node = &((*node)[key]);  // creates object nodes as needed
-  return *node;
-}
-
-// Get JSON node at clip_clearance[ path... ][leaf_key]
-static nlohmann::json& getJsonNode(nlohmann::json& root,
-                                   const std::vector<std::string>& path,
-                                   const std::string& leaf_key)
-{
-  nlohmann::json* node = &root;
-  for (const auto& key : path)
-    node = &((*node)[key]);
-  return (*node)[leaf_key];  // creates leaf object as needed
-}
-
-
 void MTCTaskNode::evaluateClearance(
     const std::string& task_name,                    // NEW
     const std::string& clip_id,
@@ -1041,30 +971,7 @@ void MTCTaskNode::evaluateClearance(
   //    "stage_subtraj_i" -> stage_to_indices[stage] = { i }
   //    "stage"           -> stage_to_indices[stage] = empty set (ALL subtrajs)
   // --------------------------------------------------------------------------
-  std::unordered_map<std::string, std::set<int>> stage_to_indices;
-
-  for (const auto& entry : target_stages_and_indices) {
-    const std::string pat = "_subtraj_";
-    auto pos = entry.rfind(pat);
-
-    if (pos == std::string::npos) {
-      // pure stage name: all subtrajectories for that stage
-      stage_to_indices[entry] = {};
-      continue;
-    }
-
-    std::string stage_name = entry.substr(0, pos);
-    std::string idx_str    = entry.substr(pos + pat.size());
-
-    try {
-      int idx = std::stoi(idx_str);
-      stage_to_indices[stage_name].insert(idx);
-    } catch (const std::exception& e) {
-      RCLCPP_WARN_STREAM(LOGGER,
-          "evaluateClearance: cannot parse target entry '"
-          << entry << "': " << e.what());
-    }
-  }
+  auto stage_to_indices = parseStageTargets(target_stages_and_indices);
 
   if (stage_to_indices.empty()) {
     RCLCPP_WARN(LOGGER, "evaluateClearance: no valid targets parsed");
@@ -1150,10 +1057,8 @@ void MTCTaskNode::evaluateClearance(
 
           // Make a modifiable copy and attach cable for evaluation
           planning_scene::PlanningScenePtr eval_scene = base_scene->diff();
-          Eigen::Isometry3d leader_hand_transform = rs.getGlobalLinkTransform("right_panda_hand") * lead_hand_to_tcp_transform_;
-          Eigen::Isometry3d follower_hand_transform =
-              rs.getGlobalLinkTransform("left_panda_hand") *
-              follow_hand_to_tcp_transform_;
+          Eigen::Isometry3d leader_hand_transform = rs.getGlobalLinkTransform(lead_hand_frame) * lead_hand_to_tcp_transform_;
+          Eigen::Isometry3d follower_hand_transform = rs.getGlobalLinkTransform(follow_hand_frame) * follow_hand_to_tcp_transform_;
           Eigen::Vector3d cable_vector_in_world = (leader_hand_transform.translation() - follower_hand_transform.translation()).normalized();
 
           attachCollisionCable(
@@ -1213,6 +1118,88 @@ void MTCTaskNode::evaluateClearance(
   recurse(root);
 }
 
+void MTCTaskNode::generateAndDumpStretchedTargets(
+    const std::string& task_name,
+    const std::string& clip_id,
+    const std::vector<std::string>& target_stages_and_indices,
+    double extension_distance,
+    double ik_timeout,
+    const std::string& dump_prefix)
+{
+  if (task_.solutions().empty()) {
+    RCLCPP_WARN(LOGGER, "No solutions; skip stretched dump");
+    return;
+  }
+
+  const auto& root = *task_.solutions().front();
+  const std::string root_stage_name = task_.stages()->name();
+
+  auto stage_to_indices = parseStageTargets(target_stages_and_indices);
+  if (stage_to_indices.empty()) {
+    RCLCPP_WARN(LOGGER, "No valid targets parsed; skip stretched dump");
+    return;
+  }
+
+  std::unordered_map<std::string, int> stage_seen_count;
+
+  std::function<void(const mtc::SolutionBase&)> recurse;
+  recurse = [&](const mtc::SolutionBase& s)
+  {
+    // Leaf
+    if (auto* sub = dynamic_cast<const mtc::SubTrajectory*>(&s)) {
+      const auto* stage = sub->creator();
+      if (!stage) return;
+
+      const std::string stage_name = stage->name();
+      auto it = stage_to_indices.find(stage_name);
+      if (it == stage_to_indices.end()) return;
+
+      int this_idx = stage_seen_count[stage_name]++;
+
+      const auto& target_indices = it->second;
+      const bool match =
+          target_indices.empty() ? true : (target_indices.count(this_idx) > 0);
+
+      if (!match) return;
+
+      // Get RobotTrajectory from MTC
+      auto traj_ptr = sub->trajectory();
+      if (!traj_ptr) {
+        RCLCPP_WARN(LOGGER, "SubTrajectory has no RobotTrajectory");
+        return;
+      }
+
+      // Copy so we don't affect anything else
+      robot_trajectory::RobotTrajectory stretched = *traj_ptr;
+
+      // Stretch in-place (your function)
+      stretchRobotTrajectoryInPlace(stretched, extension_distance, ik_timeout);
+
+      // Dump with an informative name
+      const std::string tag =
+          "stretched_" + task_name + "_" + clip_id + "_" + stage_name + "_subtraj_" + std::to_string(this_idx);
+
+      dumpTrajectoryTXTIndexed(
+          stretched,
+          tag,                         // e.g. "routing task__clip7__move to align_subtraj_3"
+          lead_arm_group_name,
+          dump_prefix,                 // e.g. "MTC_connect_visualization"
+          lead_flange_to_tcp_transform_,
+          lead_base_frame);
+
+      RCLCPP_INFO_STREAM(LOGGER, "Dumped stretched: " << tag);
+      return;
+    }
+
+    // Container
+    if (auto* seq = dynamic_cast<const mtc::SolutionSequence*>(&s)) {
+      for (const mtc::SolutionBase* child : seq->solutions())
+        recurse(*child);
+    }
+  };
+
+  recurse(root);
+}
 
 
 void MTCTaskNode::doTask(std::string& start_clip_id, std::string& goal_clip_id, bool execute, bool plan_for_dual, bool split, bool cartesian_connect, bool approach, bool clip_added_from_blender,
@@ -1253,6 +1240,14 @@ void MTCTaskNode::doTask(std::string& start_clip_id, std::string& goal_clip_id, 
       {"move to align_subtraj_3"}
   );
 
+  // generateAndDumpStretchedTargets(
+  //   task_.stages()->name(),
+  //   goal_clip_id,
+  //   {"move to align_subtraj_3"},
+  //   /*extension_distance=*/0.02,
+  //   /*ik_timeout=*/0.2,
+  //   /*dump_prefix=*/"trajectories_leader");
+
 
   // Publish the solution
   // task_.introspection().publishSolution(*task_.solutions().front(), publish_mtc_trajectory);
@@ -1291,14 +1286,16 @@ void MTCTaskNode::doTask(std::string& start_clip_id, std::string& goal_clip_id, 
 //                 std::to_string(joint_positions.size()).c_str());
 //   }
 
-  if (execute){
-    auto result = task_.execute(*task_.solutions().front());
-    if (result.val != moveit_msgs::msg::MoveItErrorCodes::SUCCESS)
-    {
-      RCLCPP_ERROR_STREAM(LOGGER, "Task execution failed");
-      return;
-    }
-  }
+  // if (execute){
+  //   auto result = task_.execute(*task_.solutions().front());
+  //   if (result.val != moveit_msgs::msg::MoveItErrorCodes::SUCCESS)
+  //   {
+  //     RCLCPP_ERROR_STREAM(LOGGER, "Task execution failed");
+  //     return;
+  //   }
+  // }
+
+  // publishSolutionSubTraj(goal_clip_id, msg);
   
   return;
 }
@@ -1618,16 +1615,19 @@ mtc::Task MTCTaskNode::createTask(std::string& start_frame_name, std::string& go
         stage_move_to_align->properties().set("attach_pull_cable", node_->get_parameter("attach_pull_cable").as_bool());
         stage_move_to_align->properties().set("attach_transport_cable", node_->get_parameter("attach_transport_cable").as_bool());
 
-        geometry_msgs::msg::PoseStamped follower_grasp_pose_transformed;
-        geometry_msgs::msg::PoseStamped leader_grasp_pose_transformed;
-        follower_grasp_pose_transformed = getPoseTransform(follow_grasp_pose, "world");
-        leader_grasp_pose_transformed = getPoseTransform(lead_grasp_pose, "world");
-        RCLCPP_INFO(LOGGER, "Follower grasp pose transformed: x: %f, y: %f, z: %f", follower_grasp_pose_transformed.pose.position.x, 
-                    follower_grasp_pose_transformed.pose.position.y, follower_grasp_pose_transformed.pose.position.z);
+        // geometry_msgs::msg::PoseStamped follower_grasp_pose_transformed;
+        // geometry_msgs::msg::PoseStamped leader_grasp_pose_transformed;
+        // follower_grasp_pose_transformed = getPoseTransform(follow_grasp_pose, "world");
+        // leader_grasp_pose_transformed = getPoseTransform(lead_grasp_pose, "world");
+        // RCLCPP_INFO(LOGGER, "Follower grasp pose transformed: x: %f, y: %f, z: %f", follower_grasp_pose_transformed.pose.position.x, 
+        //             follower_grasp_pose_transformed.pose.position.y, follower_grasp_pose_transformed.pose.position.z);
 
-        stage_move_to_align->properties().set("follow_grasp_pose", follower_grasp_pose_transformed);
-        stage_move_to_align->properties().set("lead_grasp_pose", leader_grasp_pose_transformed);
+        // stage_move_to_align->properties().set("follow_grasp_pose", follower_grasp_pose_transformed);
+        // stage_move_to_align->properties().set("lead_grasp_pose", leader_grasp_pose_transformed);
         
+        stage_move_to_align->properties().set("leader_grasp_offset_magnitude", leader_grasp_offset_magnitude_);
+        stage_move_to_align->properties().set("follower_grasp_offset_magnitude", follower_grasp_offset_magnitude_);
+
         stage_move_to_align->properties().set("track_offset", desired_ee_distance);
         stage_move_to_align->properties().set("follow_grasp_offset", follower_grasp_offset_magnitude_[1]);
         stage_move_to_align->properties().set("clip_sign", clip_sign);
@@ -1638,7 +1638,8 @@ mtc::Task MTCTaskNode::createTask(std::string& start_frame_name, std::string& go
         // set cost function
         std::vector<std::string> links = { follow_hand_frame, lead_hand_frame };
         std::vector<Eigen::Isometry3d> tcp_offsets = { follow_hand_to_tcp_transform_, lead_hand_to_tcp_transform_ };
-        // stage_move_to_align->setCostTerm(std::make_unique<moveit::task_constructor::cost::LinkMotionSum>(links, tcp_offsets));
+        auto cartesian_cost = std::make_shared<moveit::task_constructor::cost::LinkMotionSum>(links, tcp_offsets);
+        // stage_move_to_align->setCostTerm(cartesian_cost);
 
         // joint path cost
         // Lead arm joints
@@ -1660,10 +1661,13 @@ mtc::Task MTCTaskNode::createTask(std::string& start_frame_name, std::string& go
           { "left_panda_joint6",  1.0 },
           { "left_panda_joint7",  1.0 },
         };
-
         auto joint_cost = std::make_shared<moveit::task_constructor::cost::JointRiemannianCost>(joint_weights);
-        stage_move_to_align->setCostTerm(joint_cost);
+        // stage_move_to_align->setCostTerm(joint_cost);
 
+        auto combo = std::make_shared<moveit::task_constructor::cost::WeightedSumTrajectoryCost>();
+        combo->add(joint_cost,  /*alpha=*/1.0);
+        combo->add(cartesian_cost, /*beta =*/0.1);
+        stage_move_to_align->setCostTerm(combo);
 
         // add path constraints
         // moveit_msgs::msg::Constraints follow_path_constraints = createBoxConstraints(follow_hand_frame, follow_target_pose, 0.3, 0.3, 0.2);        
