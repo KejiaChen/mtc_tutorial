@@ -304,6 +304,11 @@ moveit_visual_tools::MoveItVisualTools& MTCTaskNode::getVisualTools()
   return visual_tools_;
 }
 
+moveit::core::RobotModelConstPtr MTCTaskNode::getRobotModel()
+{
+  return move_group_.getRobotModel();
+}
+
 void MTCTaskNode::udpReceiverSync(const std::string& host, int port,
   // std::array<double, 6>& joint_positions,
   std::vector<double>& joint_positions,
@@ -2498,6 +2503,54 @@ mtc::Task MTCTaskNode::createHomingTask(std::string& start_frame_name, std::stri
   return task;
 }
 
+mtc::Task MTCTaskNode::createDebugJointPositionTask(std::string& start_frame_name, std::string& goal_frame_name, bool if_use_dual, bool if_split_plan, bool if_cartesian_connect, bool if_approach, bool clip_added_from_blender)
+{
+  mtc::Task task;
+  task.stages()->setName("debug joint position task");
+  task.loadRobotModel(node_);
+
+  // Initialize robot groups
+  initializeGroups();
+
+  // delete markers
+  visual_tools_.deleteAllMarkers();
+  visual_tools_.trigger();
+
+  // 1) Current state stage
+  {
+    auto stage_state_current = std::make_unique<mtc::stages::CurrentState>("current");
+    task.add(std::move(stage_state_current));
+
+    // pre_move_stage_ptr = stage_state_current.get();
+  }
+
+  // Set up planners
+  initializePlanners();
+
+  // 2) Move follower arm to joint target
+  // set follower joint goal
+    std::map<std::string, double> follow_joint_positions = {
+        { "left_panda_joint1", -0.40375599944604745 },
+        { "left_panda_joint2", 0.4190511823081292 },
+        { "left_panda_joint3", 0.7341487722275769 },
+        { "left_panda_joint4", -2.2520388388200834 },
+        { "left_panda_joint5", -0.6183823940072086 },
+        { "left_panda_joint6", 2.841838078133553 },
+        { "left_panda_joint7", 1.0305886845477694 }
+    };
+  auto move_follower = std::make_unique<mtc::stages::MoveTo>("move follower to joints", follow_sampling_planner);
+  move_follower->properties().configureInitFrom(mtc::Stage::PARENT);
+  move_follower->setGroup(follow_arm_group_name);
+  move_follower->setGoal(follow_joint_positions);
+
+  // these are the “try more” knobs that actually matter:
+  move_follower->setTimeout(10.0);               // more planning time budget
+
+  task.add(std::move(move_follower));
+    
+  return task;
+}
+
 int main(int argc, char** argv)
 {
   rclcpp::init(argc, argv);
@@ -2535,6 +2588,8 @@ int main(int argc, char** argv)
     executor.spin();
     executor.remove_node(mtc_task_node->getNodeBaseInterface());
   });
+
+  mtc_task_node->initPlanningSceneMonitor();
 
   // Synchronize with RealWolrd
   bool sync_with_real_world = false;
@@ -2585,7 +2640,6 @@ int main(int argc, char** argv)
     mtc_task_node->getROSParam("clip_added_from_blender", clip_added_from_blender);
 
     if (i>0){
-
       mtc_task_node->doTask(prev_clip_id, clip_id, true, true, false, true, true, clip_added_from_blender,
                       [mtc_task_node](std::string& start, std::string& goal, bool dual, bool split, bool cartesian, bool approach, bool clip_from_blender) {
                       return mtc_task_node->createTask(start, goal, dual, split, cartesian, approach, clip_from_blender);

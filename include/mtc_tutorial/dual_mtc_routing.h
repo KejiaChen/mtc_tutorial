@@ -373,6 +373,105 @@ public:
   rclcpp::Node::SharedPtr getNode();
   moveit::planning_interface::MoveGroupInterface& getMoveGroup();
   moveit_visual_tools::MoveItVisualTools& getVisualTools();
+  moveit::core::RobotModelConstPtr getRobotModel();
+
+  void initPlanningSceneMonitor()
+  {
+    // "robot_description" must exist (it does if MoveIt is running)
+    psm_ = std::make_shared<planning_scene_monitor::PlanningSceneMonitor>(node_, "robot_description");
+
+    if (!psm_ || !psm_->getPlanningScene()) {
+      throw std::runtime_error("Failed to create PlanningSceneMonitor");
+    }
+
+    // These are the standard monitors MoveIt uses
+    psm_->startSceneMonitor("/planning_scene");
+    psm_->startWorldGeometryMonitor();      // collision_objects, octomap, etc.
+    psm_->startStateMonitor("/joint_states");
+
+    // Optional: wait until we have at least one complete state
+    psm_->waitForCurrentRobotState(node_->now(), 2.0);
+  }
+
+    void attachPullCableGlobally(
+      const moveit::core::RobotModelConstPtr& robot_model,
+      const std::string& tmp_object_id,                  // "pull_cable"
+      const std::string& grasp_frame,            // your grasp_frame (object id)
+      const std::vector<double>& clip_size          // [x,y,z])
+  )
+  {
+    RCLCPP_INFO_STREAM(rclcpp::get_logger("debug_grasping"), "Attaching cable object '" << tmp_object_id << "' globally");
+    // 1) Fetch current global scene
+    auto base_scene = snapshotScene();
+    if (!base_scene) return;
+
+    // 2) Create a diff scene we can modify
+    auto scene = base_scene->diff();
+
+    Eigen::Isometry3d T_world_fixture = scene->getFrameTransform(grasp_frame);
+    Eigen::Isometry3d T_world_leader_tcp = scene->getFrameTransform(lead_hand_frame) * lead_hand_to_tcp_transform_;
+
+    // --- 2) Endpoints in world
+    Eigen::Vector3d A = T_world_leader_tcp.translation();  // TCP point
+    Eigen::Vector3d B = T_world_fixture.translation()
+                      + Eigen::Vector3d(0, 0, 0.5 * clip_size.at(2)); // slightly above fixture frame
+
+    Eigen::Vector3d dir_world = (B - A);
+    double full_len = dir_world.norm();
+
+    Eigen::Vector3d dir_world_unit;
+    if (full_len > 1e-9) {
+      dir_world_unit = dir_world / full_len;
+    } else {
+      dir_world_unit = Eigen::Vector3d::UnitX();
+    }
+
+    // --- 3) Length & margins
+    const double radius = 0.015;            // cable radius
+    const double end_margin = 0.0; // margin on EACH end
+    double use_len = std::max(1e-3, full_len - end_margin);
+
+    // --- 4) Touch links for right hand (no self-collision with cable)
+    std::vector<std::string> leader_touch = {
+      "right_panda_hand",
+      "right_panda_link7",
+      "right_panda_leftfinger",
+      "right_panda_rightfinger"
+    };
+
+    // --- 5) Attach the cylinder (your helper)
+    // IMPORTANT: your attachCollisionCableGeneric() should interpret vec_in_world as WORLD direction
+    // and should place the cylinder along +Z with translation (0,0,0.5*len) in TCP frame after alignment.
+    attachCollisionCableGeneric(scene,
+                                tmp_object_id,
+                                use_len,
+                                radius,
+                                dir_world_unit,                   // direction in WORLD
+                                lead_hand_frame,                      // attach link
+                                lead_hand_to_tcp_transform_, // hand->tcp
+                                leader_touch);
+
+      // Also allow collisions with the grasp fixture object (so cable doesn't collide with it)
+    auto& acm = scene->getAllowedCollisionMatrixNonConst();
+    acm.setEntry(tmp_object_id, grasp_frame, true);
+
+    const std::vector<std::string> forbid_links = {
+      "left_panda_link0", "left_panda_link1", "left_panda_link2", "left_panda_link3",
+      "left_panda_link4", "left_panda_link5", "left_panda_link6", "left_panda_link7",
+      "left_panda_hand", "left_panda_leftfinger", "left_panda_rightfinger"
+    };
+
+    for (const auto& link : forbid_links)
+      acm.setEntry(tmp_object_id, link, false);
+
+    // 7) Apply diff globally
+    applySceneDiffGlobally(scene);
+
+    if (!waitForAttachedObject(tmp_object_id, 1.0)) {
+      RCLCPP_WARN_STREAM(rclcpp::get_logger("debug_grasping"), "Cable attach '" << tmp_object_id << "' not found after attach");
+    }
+  }
+
 
   // Compose an MTC task from a series of stages.
   mtc::Task createTask(std::string& start_frame_name, std::string& goal_frame_name, bool if_use_dual, bool if_split_plan, bool if_cartesian_connect, bool if_approach, bool clip_added_from_blender);
@@ -380,6 +479,7 @@ public:
   mtc::Task createPostTask(std::string& start_frame_name, std::string& goal_frame_name, bool if_use_dual, bool if_split_plan, bool if_cartesian_connect, bool if_approach, bool clip_added_from_blender);
   mtc::Task createTestWaypointTask(std::string& goal_frame_name, bool if_use_dual, bool if_split_plan, bool if_cartesian_connect, bool if_approach);
   mtc::Task createHomingTask(std::string& start_frame_name, std::string& goal_frame_name, bool if_use_dual, bool if_split_plan, bool if_cartesian_connect, bool if_approach, bool clip_added_from_blender);
+  mtc::Task createDebugJointPositionTask(std::string& start_frame_name, std::string& goal_frame_name, bool if_use_dual, bool if_split_plan, bool if_cartesian_connect, bool if_approach, bool clip_added_from_blender);
 
   // synchronization with real-world
   void udpReceiverSync(const std::string& host, int port,
@@ -527,6 +627,16 @@ public:
     }
   }
 
+  void moveDualArmToJointPosition(const std::vector<double>& lead_joint_positions, 
+                                  const std::vector<double>& follow_joint_positions)
+  {
+    // Move both arms to the specified joint positions
+    std::vector<double> combined_joint_positions;
+    combined_joint_positions.insert(combined_joint_positions.end(), follow_joint_positions.begin(), follow_joint_positions.end());
+    combined_joint_positions.insert(combined_joint_positions.end(), lead_joint_positions.begin(), lead_joint_positions.end());
+    move_group_.setJointValueTarget(combined_joint_positions);
+    move_group_.move();
+  }
 
   // Robot group names
   std::string lead_arm_group_name;
@@ -637,6 +747,98 @@ private:
       visual_tools_.publishCylinder(pose_msg_world, rviz_visual_tools::ORANGE, length, radius);
       visual_tools_.trigger();
 
+  }
+
+  bool waitForAttachedObject(const std::string& object_id, double timeout_s)
+  {
+    const auto t0 = getNode()->now();
+    rclcpp::Rate r(50);
+
+    while ((getNode()->now() - t0).seconds() < timeout_s) {
+      auto snap = snapshotScene();
+      if (snap) {
+      std::vector<const moveit::core::AttachedBody*> bodies;
+      snap->getCurrentState().getAttachedBodies(bodies);
+
+      for (const auto* b : bodies) {
+        if (b && b->getName() == object_id)
+          return true;
+      }
+    }
+      r.sleep();
+    }
+    return false;
+  }
+
+
+  void attachCollisionCableGeneric(planning_scene::PlanningScenePtr scene,
+                                  const std::string& id,
+                                  double length,
+                                  double radius,
+                                  const Eigen::Vector3d& vec_in_world,
+                                  const std::string& attach_link,
+                                  const Eigen::Isometry3d& hand_to_tcp_transform,
+                                  const std::vector<std::string>& touch_links)
+  {
+    moveit_msgs::msg::AttachedCollisionObject attach_msg;
+    attach_msg.link_name = attach_link;
+    attach_msg.object.header.frame_id = attach_link;
+    attach_msg.object.id = id;
+
+    shape_msgs::msg::SolidPrimitive prim;
+    prim.type = prim.CYLINDER;
+    prim.dimensions = {length, radius}; // height (along local +Z), radius
+
+    // 1) Pose in TCP frame: +Z aligned to vec_in_world (expressed in attach_link)
+    Eigen::Isometry3d cylinder_pose_tcp = Eigen::Isometry3d::Identity();
+    Eigen::Isometry3d world_to_hand = scene->getFrameTransform(attach_link).inverse();
+    Eigen::Vector3d vec_in_hand = world_to_hand.linear() * vec_in_world.normalized();
+    Eigen::Quaterniond align_quat = Eigen::Quaterniond::FromTwoVectors(Eigen::Vector3d::UnitZ(), vec_in_hand);
+    cylinder_pose_tcp.linear() = align_quat.toRotationMatrix();
+    cylinder_pose_tcp.translation() = vec_in_hand.normalized() * (0.5 * length);
+
+    // 2) Pose in hand frame (hand→TCP offset)
+    Eigen::Isometry3d cylinder_pose_in_hand = hand_to_tcp_transform * cylinder_pose_tcp;
+
+    // 3) To msg
+    geometry_msgs::msg::Pose pose_msg = tf2::toMsg(cylinder_pose_in_hand);
+
+    attach_msg.object.primitives.push_back(prim);
+    attach_msg.object.primitive_poses.push_back(pose_msg);
+    attach_msg.object.operation = moveit_msgs::msg::CollisionObject::ADD;
+
+    // Leader touch links = no collision with leader
+    attach_msg.touch_links = touch_links;
+
+    scene->processAttachedCollisionObjectMsg(attach_msg);
+
+    // viz (world pose)
+    Eigen::Isometry3d pose_in_world = scene->getFrameTransform(attach_link) * cylinder_pose_in_hand;
+    geometry_msgs::msg::Pose pose_msg_world = tf2::toMsg(pose_in_world);
+    visual_tools_.publishCylinder(pose_msg_world, rviz_visual_tools::BLUE, length, radius);
+    visual_tools_.trigger();
+
+    RCLCPP_INFO_STREAM(rclcpp::get_logger("debug_grasping"), "Attached temp cable '" << id << "' to " << attach_link
+                          << " len=" << length << " r=" << radius);
+  }
+
+  void applySceneDiffGlobally(const planning_scene::PlanningScenePtr& scene)
+  {
+    moveit_msgs::msg::PlanningScene diff_msg;
+    scene->getPlanningSceneDiffMsg(diff_msg);   // diff from its parent (if any)
+    diff_msg.is_diff = true;
+
+    moveit::planning_interface::PlanningSceneInterface psi;
+    psi.applyPlanningScene(diff_msg);
+
+    RCLCPP_INFO(rclcpp::get_logger("debug_grasping"), "Applied PlanningScene diff globally");
+  }
+
+  planning_scene::PlanningScenePtr snapshotScene() const
+  {
+    planning_scene_monitor::LockedPlanningSceneRO ls(psm_);
+    if (!ls) return nullptr;
+    return ls->diff();   // give caller a modifiable copy
   }
 
   void evaluateClearance(
@@ -757,6 +959,7 @@ private:
   // interfaces
   moveit::planning_interface::MoveGroupInterface move_group_;
   moveit_visual_tools::MoveItVisualTools visual_tools_;
+  planning_scene_monitor::PlanningSceneMonitorPtr psm_;
 
   // TF2 components
   tf2_ros::Buffer tf_buffer_;
