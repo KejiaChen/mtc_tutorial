@@ -53,6 +53,30 @@ def generate_launch_description():
         description="Whether to alter the right robot model's finger configuration",
     )
 
+    attach_pull_cable = DeclareLaunchArgument(
+        "attach_pull_cable",
+        default_value="true",
+        description="Whether to attach the pull cable to robot as a collision object during motion planning",
+    )
+
+    attach_transport_cable = DeclareLaunchArgument(
+        "attach_transport_cable",
+        default_value="true",
+        description="Whether to attach the transport cable to robot as a collision object during motion planning",
+    )
+
+    clip_ids = DeclareLaunchArgument(
+        "clip_ids",
+        default_value="[5, 6, 7, 8]",
+        description="List of clip numbers"
+    )
+    
+    clip_added_from_blender = DeclareLaunchArgument(
+        "clip_added_from_blender",
+        default_value="false",
+        description="Whether the clips are added from blender with correct orientation"
+    )
+
     exe_arg = DeclareLaunchArgument(name="exe")
     # scene_file_arg = DeclareLaunchArgument("scene_file",
     #                                         default_value="/home/tp2/ws_humble/scene/mongodb_8.scene",  # Default file path
@@ -80,6 +104,7 @@ def generate_launch_description():
                     "alter_finger_left": LaunchConfiguration("alter_finger_left"),
                     "use_sensone_right": LaunchConfiguration("use_sensone_right"),
                     "alter_finger_right": LaunchConfiguration("alter_finger_right"),
+                    "clip_added_from_blender": LaunchConfiguration("clip_added_from_blender"),
             },
         )
         .robot_description_semantic(
@@ -89,6 +114,7 @@ def generate_launch_description():
                 "alter_finger_left": LaunchConfiguration("alter_finger_left"),
                 "use_sensone_right": LaunchConfiguration("use_sensone_right"),
                 "alter_finger_right": LaunchConfiguration("alter_finger_right"),
+                "clip_added_from_blender": LaunchConfiguration("clip_added_from_blender"),
             },
         )
         .trajectory_execution(file_path="config/moveit_controllers.yaml")
@@ -112,6 +138,10 @@ def generate_launch_description():
             {"alter_finger_left": LaunchConfiguration("alter_finger_left")},
             {"use_sensone_right": LaunchConfiguration("use_sensone_right")},
             {"alter_finger_right": LaunchConfiguration("alter_finger_right")},
+            {"attach_pull_cable": LaunchConfiguration("attach_pull_cable")},
+            {"attach_transport_cable": LaunchConfiguration("attach_transport_cable")},
+            {"clip_id_number_list": LaunchConfiguration("clip_ids")},
+            {"clip_added_from_blender": LaunchConfiguration("clip_added_from_blender")},
             ompl_planning_yaml,
             chomp_planning_yaml,
         ],
@@ -136,5 +166,9 @@ def generate_launch_description():
                               alter_finger_left, 
                               use_sensone_right, 
                               alter_finger_right, 
+                              attach_pull_cable,
+                              attach_transport_cable,
+                              clip_ids,
+                              clip_added_from_blender,
                               distance_monitor, 
                               pick_place_demo])
