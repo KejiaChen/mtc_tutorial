@@ -167,13 +167,18 @@ bool readOrientLine(std::string ori_line, bool is_use_qb_board_coordinate, doubl
         return false;
     }else{
         if (is_use_qb_board_coordinate){  
-            // Only consider num_z, which is the angle in degree
-            double Euler_z = num_z * M_PI / 180.0; // Convert to radians
+            double Euler_x, Euler_y, Euler_z;
+            Euler_x = num_x * M_PI / 180.0; // Convert to radians
+            Euler_y = num_y * M_PI / 180.0; // Convert to radians
+            Euler_z = num_z * M_PI / 180.0; // Convert to radians
             // Obtain quaternion from Euler angles
-            qx = 0.0;
-            qy = 0.0;
-            qz = sin(Euler_z / 2.0);
-            qw = cos(Euler_z / 2.0);
+            tf2::Quaternion quat;
+            quat.setRPY(Euler_x, Euler_y, Euler_z); // Roll, Pitch, Yaw
+            quat.normalize();
+            qx = quat.x();
+            qy = quat.y();
+            qz = quat.z();
+            qw = quat.w();
         }else{
             qx = num_x;
             qy = num_y;
@@ -374,12 +379,23 @@ std::vector<moveit_msgs::msg::CollisionObject> loadCustomScene(const std::string
                 throw std::runtime_error("Unexpected end of file after orientation for object: " + object_name);
 
             // Read shape type (assuming it's always "box")
-            if (!std::getline(fin, shape_line) || (shape_line != "box" && shape_line != "mesh"))
+            if (!std::getline(fin, shape_line) || (shape_line != "box" && shape_line != "mesh" && shape_line != "cylinder"))
                 throw std::runtime_error("Invalid or unsupported shape type for object: " + object_name);
 
             // Read dimensions
-            if (!std::getline(fin, dim_line) || !(std::istringstream(dim_line) >> dx >> dy >> dz))
+            if (!std::getline(fin, dim_line))
                 throw std::runtime_error("Invalid dimensions line for object: " + object_name);
+
+            dz = 0.0;  // default if missing
+            std::istringstream dim_iss(dim_line);
+            if (!(dim_iss >> dx >> dy))
+                throw std::runtime_error("Invalid dimensions line for object: " + object_name);
+            if (!(dim_iss >> dz)) {
+                // dz missing, keep default 0.0 (or log a warning if you want)
+                // RCLCPP_WARN(rclcpp::get_logger("load_scene"),
+                //             "No dz provided for object '%s'; defaulting dz = 0.0",
+                //             object_name.c_str());
+            }
 
             // Skip the remaining unused lines in the block
             for (int i = 0; i < 4; ++i)
@@ -405,6 +421,17 @@ std::vector<moveit_msgs::msg::CollisionObject> loadCustomScene(const std::string
                 primitive.dimensions[primitive.BOX_X] = dx;
                 primitive.dimensions[primitive.BOX_Y] = dy;
                 primitive.dimensions[primitive.BOX_Z] = dz;
+
+                collision_object.primitives.push_back(primitive);
+                collision_object.primitive_poses.push_back(pose);
+                collision_object.operation = collision_object.ADD;
+
+            } else if (shape_line == "cylinder"){
+                shape_msgs::msg::SolidPrimitive primitive;
+                primitive.type = primitive.CYLINDER;
+                primitive.dimensions.resize(2);
+                primitive.dimensions[primitive.CYLINDER_HEIGHT] = dy; // height
+                primitive.dimensions[primitive.CYLINDER_RADIUS] = dx / 2.0; // radius
 
                 collision_object.primitives.push_back(primitive);
                 collision_object.primitive_poses.push_back(pose);
@@ -517,6 +544,11 @@ void loadObjectHats(std::vector<moveit_msgs::msg::CollisionObject> &collision_ob
 
     for (const auto &collision_object : collision_objects)
     {   
+        // only add for objects with name "clip_*"
+        if (collision_object.id.find("clip") == std::string::npos)
+        {
+            continue;
+        }
         // get collision obejct's name and size
         std::string object_name = collision_object.id;
         double dx = collision_object.primitives[0].dimensions[shape_msgs::msg::SolidPrimitive::BOX_X];
