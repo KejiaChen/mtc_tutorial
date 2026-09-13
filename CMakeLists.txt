@@ -23,6 +23,7 @@ find_package(tf2_ros REQUIRED)
 find_package(tf2 REQUIRED)
 find_package(tf2_geometry_msgs REQUIRED)
 find_package(sensor_msgs REQUIRED)
+find_package(std_msgs REQUIRED)
 
 # declare a demo consisting of a single cpp file
 function(demo name)
@@ -42,6 +43,13 @@ endfunction()
 demo(mtc_tutorial)
 demo(dual_mtc_tutorial)
 demo(dual_mtc_routing)
+demo(dual_adapt_and_test)
+
+add_executable(prior_single_arm_planner src/prior_single_arm_planner.cpp)
+ament_target_dependencies(prior_single_arm_planner
+  rclcpp std_msgs geometry_msgs moveit_ros_planning_interface moveit_task_constructor_msgs)
+target_compile_features(prior_single_arm_planner PUBLIC cxx_std_17)
+install(TARGETS prior_single_arm_planner DESTINATION lib/${PROJECT_NAME})
 
 add_executable(load_scene src/load_scene.cpp)
 ament_target_dependencies(load_scene
@@ -85,6 +93,9 @@ ament_target_dependencies(dlo_line_model
 install(TARGETS dlo_line_model DESTINATION lib/${PROJECT_NAME})
 
 install(DIRECTORY launch DESTINATION share/${PROJECT_NAME})
+install(PROGRAMS scripts/prior_subtrajectory_subscriber.py
+  DESTINATION lib/${PROJECT_NAME}
+  RENAME prior_subtrajectory_subscriber)
 
 if(BUILD_TESTING)
 find_package(ament_lint_auto REQUIRED)
