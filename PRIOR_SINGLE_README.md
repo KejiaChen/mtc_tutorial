@@ -128,25 +128,77 @@ Expected topics:
 ```text
 /prior_transition/plan_request
 /prior_transition/plan_response
+/prior_transition/sync_state_request
+/prior_transition/sync_state_response
+/prior_transition/execute_request
+/prior_transition/execute_response
 /prior_transition/follower_subtrajectory
 /prior_transition/trajectory_ready
 ```
 
+Before each plan request, the runner sends a separate state-synchronization
+request. The planner publishes the real-robot arm state to `/joint_states`,
+then executes the same state as a `dual_arm` MoveIt joint goal on mock
+hardware. The follower hand is opened separately. Only after this execution
+finishes does the planner return the synchronization response and accept the
+plan request. This makes the visible RViz state match the planning state.
+
 ## Run Experiment
 
-Start ORT with the open-loop ramp baseline, then run:
+The runner prepares and prompts for a new ORT open-loop-ramp episode before
+each attachment attempt. Then run:
 
 ```bash
 python3 /home/tp2/Documents/mios-wiring/python/shape_control_clip_fixing_prior.py \
+  --scene-file /home/tp2/ws_humble/scene/trans/trans_clip_2_adapt_z.scene \
   --detect
 ```
+
+The default clip order is `5 6 7 8`. Clip 5 is the initial direct Cartesian
+setup; clips 6-8 use the single-arm planning workflow. The scene file is read in the same format as the transaction workflow. With
+`--detect`, the top Kinect supplies the current DLO grasp point; without it,
+the follower goal is placed 0.06 m from the measured leader goal toward the
+previous fixture center, using the scene clip positions.
+
+At startup, both MIOS robots are moved to the `home` named states from the
+MoveIt SRDF, so homing does not depend on a trajectory file. Clip 5 then uses
+the synchronized `real_world_task_5_stage_4_traj_1.txt` movement from the
+transactions workflow to avoid independent-arm collision during initial setup.
+Use
+`--skip-homing` only when the robots are already positioned correctly.
 
 The runner performs:
 
 ```text
-leader transport
+clip 5 synchronized setup; compute and execute leader target for later clips
 top-camera grasp detection
 single-arm follower planning
-follower trajectory execution
+r/y/q trajectory review
+MoveIt and follower trajectory execution after accept
 ramped-force attachment
 ```
+
+Press `y` to execute the candidate trajectory, `r` to replan, or `q` to stop.
+Replanning sends a new complete request for the same task and stage. The new
+candidate overwrites the previous unaccepted follower trajectory file.
+
+For transition planning and execution without attachment:
+
+```bash
+python3 /home/tp2/Documents/mios-wiring/python/shape_control_clip_fixing_prior.py \
+  --only-motion-planning
+```
+
+This still executes the leader transition and accepted follower plan, but skips
+grasping, ORT startup, and ramped-force attachment.
+
+For unattended execution:
+
+```bash
+python3 /home/tp2/Documents/mios-wiring/python/shape_control_clip_fixing_prior.py \
+  --detect \
+  --auto-accept
+```
+
+The communication test also performs a replan by default. Use
+`--no-replan` to test only one planning request.

@@ -19,6 +19,7 @@ def generate_launch_description():
     follower_port = DeclareLaunchArgument("follower_port", default_value="12345")
     publish_legacy_topic = DeclareLaunchArgument("publish_legacy_topic", default_value="false")
     start_move_group = DeclareLaunchArgument("start_move_group", default_value="false")
+    sync_via_move_group = DeclareLaunchArgument("sync_via_move_group", default_value="true")
 
     moveit_config = (
         MoveItConfigsBuilder("dual_arm_panda")
@@ -60,7 +61,9 @@ def generate_launch_description():
         executable="prior_single_arm_planner",
         output="screen",
         parameters=[moveit_config.to_dict(), ompl, chomp,
-                    {"publish_legacy_topic": LaunchConfiguration("publish_legacy_topic")}],
+                    {"publish_legacy_topic": LaunchConfiguration("publish_legacy_topic"),
+                     "alter_finger_left": LaunchConfiguration("alter_finger_left"),
+                     "sync_via_move_group": LaunchConfiguration("sync_via_move_group")}],
     )
     subscriber = Node(
         package="mtc_tutorial",
@@ -75,6 +78,7 @@ def generate_launch_description():
     return LaunchDescription([
         use_sensone_left, use_sensone_right, alter_finger_left, alter_finger_right,
         send_to_robot, follower_ip, follower_port, publish_legacy_topic, start_move_group,
+        sync_via_move_group,
         move_group, planner, subscriber,
     ])
 

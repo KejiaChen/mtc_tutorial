@@ -1,14 +1,19 @@
 #include <atomic>
+#include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <mutex>
 #include <stdexcept>
 #include <string>
 #include <vector>
 
+#include <Eigen/Geometry>
 #include <nlohmann/json.hpp>
 #include <rclcpp/rclcpp.hpp>
 #include <std_msgs/msg/string.hpp>
 #include <geometry_msgs/msg/pose.hpp>
+#include <sensor_msgs/msg/joint_state.hpp>
+#include <visualization_msgs/msg/marker.hpp>
 #include <moveit/move_group_interface/move_group_interface.h>
 #include <moveit_task_constructor_msgs/msg/sub_trajectory.hpp>
 
@@ -17,7 +22,12 @@ using json = nlohmann::json;
 namespace {
 constexpr char kRequestTopic[] = "/prior_transition/plan_request";
 constexpr char kResponseTopic[] = "/prior_transition/plan_response";
+constexpr char kSyncRequestTopic[] = "/prior_transition/sync_state_request";
+constexpr char kSyncResponseTopic[] = "/prior_transition/sync_state_response";
+constexpr char kExecuteRequestTopic[] = "/prior_transition/execute_request";
+constexpr char kExecuteResponseTopic[] = "/prior_transition/execute_response";
 constexpr char kTrajectoryTopic[] = "/prior_transition/follower_subtrajectory";
+constexpr char kGoalMarkerTopic[] = "/prior_transition/follower_goal_marker";
 }
 
 class PriorSingleArmPlanner final : public rclcpp::Node {
@@ -30,9 +40,26 @@ public:
     planning_time_(declare_parameter<double>("planning_time", 10.0)),
     planning_attempts_(declare_parameter<int>("planning_attempts", 5)),
     publish_legacy_topic_(declare_parameter<bool>("publish_legacy_topic", false)),
+    alter_finger_left_(declare_parameter<bool>("alter_finger_left", false)),
+    extended_finger_length_(declare_parameter<double>("extended_finger_length", 0.01)),
+    tcp_offset_x_(declare_parameter<double>("tcp_offset_x", 0.0)),
+    tcp_offset_y_(declare_parameter<double>("tcp_offset_y", 0.0)),
+    tcp_offset_z_(declare_parameter<double>("tcp_offset_z", 0.1034)),
+    open_follower_gripper_(declare_parameter<bool>("open_follower_gripper", true)),
+    open_gripper_width_(declare_parameter<double>("open_gripper_width", 0.035)),
+    sync_joint_state_(declare_parameter<bool>("sync_joint_state", true)),
+    sync_via_move_group_(declare_parameter<bool>("sync_via_move_group", true)),
     // Keep MoveGroupInterface on this node so launch parameters are visible.
-    move_group_(std::shared_ptr<rclcpp::Node>(this, [](rclcpp::Node*) {}), follower_group_) {
+    move_group_(std::shared_ptr<rclcpp::Node>(this, [](rclcpp::Node*) {}), follower_group_),
+    gripper_group_(std::shared_ptr<rclcpp::Node>(this, [](rclcpp::Node*) {}), "left_hand"),
+    sync_group_(std::shared_ptr<rclcpp::Node>(this, [](rclcpp::Node*) {}), "dual_arm") {
     response_publisher_ = create_publisher<std_msgs::msg::String>(kResponseTopic, 10);
+    sync_response_publisher_ = create_publisher<std_msgs::msg::String>(kSyncResponseTopic, 10);
+    execute_response_publisher_ = create_publisher<std_msgs::msg::String>(kExecuteResponseTopic, 10);
+    joint_state_publisher_ = create_publisher<sensor_msgs::msg::JointState>(
+      "/joint_states", rclcpp::QoS(10).reliable());
+    goal_marker_publisher_ = create_publisher<visualization_msgs::msg::Marker>(
+      kGoalMarkerTopic, rclcpp::QoS(1).transient_local());
     trajectory_publisher_ = create_publisher<moveit_task_constructor_msgs::msg::SubTrajectory>(
       kTrajectoryTopic, rclcpp::QoS(1).transient_local());
     if (publish_legacy_topic_) {
@@ -45,8 +72,16 @@ public:
     move_group_.setNumPlanningAttempts(planning_attempts_);
     move_group_.setMaxVelocityScalingFactor(declare_parameter<double>("velocity_scaling", 0.05));
     move_group_.setMaxAccelerationScalingFactor(declare_parameter<double>("acceleration_scaling", 0.05));
+    sync_group_.setPlanningTime(planning_time_);
+    sync_group_.setNumPlanningAttempts(planning_attempts_);
+    sync_group_.setMaxVelocityScalingFactor(0.1);
+    sync_group_.setMaxAccelerationScalingFactor(0.1);
     request_subscription_ = create_subscription<std_msgs::msg::String>(
       kRequestTopic, 10, std::bind(&PriorSingleArmPlanner::requestCallback, this, std::placeholders::_1));
+    sync_request_subscription_ = create_subscription<std_msgs::msg::String>(
+      kSyncRequestTopic, 10, std::bind(&PriorSingleArmPlanner::syncRequestCallback, this, std::placeholders::_1));
+    execute_request_subscription_ = create_subscription<std_msgs::msg::String>(
+      kExecuteRequestTopic, 10, std::bind(&PriorSingleArmPlanner::executeCallback, this, std::placeholders::_1));
     RCLCPP_INFO(get_logger(), "Listening on %s (group=%s, link=%s)", kRequestTopic,
                 follower_group_.c_str(), follower_link_.c_str());
   }
@@ -93,6 +128,164 @@ private:
     response_publisher_->publish(message);
   }
 
+  void publishExecuteResponse(const json& response) {
+    std_msgs::msg::String message;
+    message.data = response.dump();
+    execute_response_publisher_->publish(message);
+  }
+
+  void publishSyncResponse(const json& response) {
+    std_msgs::msg::String message;
+    message.data = response.dump();
+    sync_response_publisher_->publish(message);
+  }
+
+  void publishSynchronizedJointState(const moveit::core::RobotState& state, int repeats = 1) {
+    if (!sync_joint_state_ || !joint_state_publisher_) {
+      return;
+    }
+    sensor_msgs::msg::JointState message;
+    message.name = state.getVariableNames();
+    const double* positions = state.getVariablePositions();
+    message.position.assign(positions, positions + message.name.size());
+    for (int i = 0; i < repeats; ++i) {
+      message.header.stamp = now();
+      joint_state_publisher_->publish(message);
+      rclcpp::sleep_for(std::chrono::milliseconds(50));
+    }
+    RCLCPP_INFO(get_logger(), "Published synchronized request state to /joint_states (%zu joints, repeats=%d)",
+                message.name.size(), repeats);
+  }
+
+  moveit::core::RobotStatePtr makeRequestState(const json& request) {
+    if (!request.contains("follower_joints") || !request.contains("leader_joints")) {
+      throw std::runtime_error("request must include leader_joints and follower_joints");
+    }
+    auto state = std::make_shared<moveit::core::RobotState>(move_group_.getRobotModel());
+    state->setToDefaultValues();
+    setJointVector(*state, follower_group_, readVector(request, "follower_joints", 7));
+    setJointVector(*state, "right_panda_arm", readVector(request, "leader_joints", 7));
+    if (open_follower_gripper_) {
+      state->setVariablePosition("left_panda_finger_joint1", open_gripper_width_);
+      state->setVariablePosition("left_panda_finger_joint2", open_gripper_width_);
+    }
+    state->update();
+    return state;
+  }
+
+  void syncRequestCallback(const std_msgs::msg::String::SharedPtr message) {
+    std::lock_guard<std::mutex> lock(plan_mutex_);
+    json request;
+    try {
+      request = json::parse(message->data);
+      const std::string task_id = request.value("task_id", "prior_transition");
+      auto state = makeRequestState(request);
+      last_start_state_ = std::make_shared<moveit::core::RobotState>(*state);
+      publishSynchronizedJointState(*state, 6);
+      if (sync_via_move_group_) {
+        RCLCPP_INFO(get_logger(), "Synchronizing RViz through MoveIt dual_arm joint goal");
+        sync_group_.clearPoseTargets();
+        std::vector<double> dual_arm_positions;
+        state->copyJointGroupPositions("dual_arm", dual_arm_positions);
+        RCLCPP_INFO(get_logger(), "Dual-arm synchronization target has %zu joints", dual_arm_positions.size());
+        if (!sync_group_.setJointValueTarget(dual_arm_positions)) {
+          throw std::runtime_error("MoveIt rejected synchronized dual_arm arm-joint goal");
+        }
+        const auto arm_result = sync_group_.move();
+        RCLCPP_INFO(get_logger(), "MoveIt dual_arm synchronization result=%d", arm_result.val);
+        if (arm_result != moveit::core::MoveItErrorCode::SUCCESS) {
+          throw std::runtime_error("MoveIt failed to execute synchronized dual_arm joint goal");
+        }
+        if (open_follower_gripper_) {
+          if (!gripper_group_.setNamedTarget("open")) {
+            throw std::runtime_error("MoveIt rejected synchronized left_hand open goal");
+          }
+          const auto gripper_result = gripper_group_.move();
+          RCLCPP_INFO(get_logger(), "MoveIt left_hand synchronization result=%d", gripper_result.val);
+          if (gripper_result != moveit::core::MoveItErrorCode::SUCCESS) {
+            throw std::runtime_error("MoveIt failed to execute synchronized left_hand open goal");
+          }
+        }
+      }
+      publishSyncResponse({{"task_id", task_id}, {"ok", true}, {"stage", "state_synchronized"},
+                           {"joint_count", state->getVariableNames().size()},
+                           {"rviz_synchronized", sync_via_move_group_}});
+      RCLCPP_INFO(get_logger(), "State synchronization complete for task %s", task_id.c_str());
+    } catch (const std::exception& error) {
+      publishSyncResponse({{"task_id", request.value("task_id", "")}, {"ok", false},
+                           {"stage", "state_synchronization"}, {"error", error.what()}});
+      RCLCPP_ERROR(get_logger(), "State synchronization failed: %s", error.what());
+    }
+  }
+
+  void publishGoalMarker(const geometry_msgs::msg::Pose& pose, const std::string& task_id) {
+    visualization_msgs::msg::Marker marker;
+    marker.header.frame_id = default_frame_;
+    marker.header.stamp = now();
+    marker.ns = "prior_follower_goal";
+    marker.id = 0;
+    marker.type = visualization_msgs::msg::Marker::SPHERE;
+    marker.action = visualization_msgs::msg::Marker::ADD;
+    marker.pose = pose;
+    marker.scale.x = 0.025;
+    marker.scale.y = 0.025;
+    marker.scale.z = 0.025;
+    marker.color.r = 0.1f;
+    marker.color.g = 0.95f;
+    marker.color.b = 0.2f;
+    marker.color.a = 1.0f;
+    marker.text = task_id;
+    goal_marker_publisher_->publish(marker);
+    RCLCPP_INFO(get_logger(), "Published follower goal marker for task %s at (%.4f, %.4f, %.4f)",
+                task_id.c_str(), pose.position.x, pose.position.y, pose.position.z);
+  }
+
+  Eigen::Vector3d effectiveTcpOffset() const {
+    return Eigen::Vector3d(
+      tcp_offset_x_, tcp_offset_y_,
+      tcp_offset_z_ + (alter_finger_left_ ? 0.5 * extended_finger_length_ : 0.0));
+  }
+
+  // Requests contain the physical TCP pose. MoveGroupInterface expects the
+  // pose of the selected link, so convert TCP -> hand using the same offset
+  // convention as dual_mtc_routing.cpp.
+  geometry_msgs::msg::Pose tcpPoseToHandPose(const geometry_msgs::msg::Pose& tcp_pose) const {
+    const double norm = std::sqrt(
+      tcp_pose.orientation.x * tcp_pose.orientation.x +
+      tcp_pose.orientation.y * tcp_pose.orientation.y +
+      tcp_pose.orientation.z * tcp_pose.orientation.z +
+      tcp_pose.orientation.w * tcp_pose.orientation.w);
+    if (norm < 1e-9) {
+      throw std::runtime_error("follower_pose has a zero-length quaternion");
+    }
+
+    Eigen::Quaterniond tcp_orientation(
+      tcp_pose.orientation.w / norm,
+      tcp_pose.orientation.x / norm,
+      tcp_pose.orientation.y / norm,
+      tcp_pose.orientation.z / norm);
+    const Eigen::Vector3d tcp_position(
+      tcp_pose.position.x, tcp_pose.position.y, tcp_pose.position.z);
+    const Eigen::Vector3d hand_position = tcp_position - tcp_orientation * effectiveTcpOffset();
+
+    geometry_msgs::msg::Pose hand_pose = tcp_pose;
+    hand_pose.position.x = hand_position.x();
+    hand_pose.position.y = hand_position.y();
+    hand_pose.position.z = hand_position.z();
+    hand_pose.orientation.x = tcp_orientation.x();
+    hand_pose.orientation.y = tcp_orientation.y();
+    hand_pose.orientation.z = tcp_orientation.z();
+    hand_pose.orientation.w = tcp_orientation.w();
+    return hand_pose;
+  }
+
+  void logPose(const char* label, const geometry_msgs::msg::Pose& pose) const {
+    RCLCPP_INFO(get_logger(),
+                "%s position=(%.5f, %.5f, %.5f), orientation=(%.5f, %.5f, %.5f, %.5f)",
+                label, pose.position.x, pose.position.y, pose.position.z,
+                pose.orientation.x, pose.orientation.y, pose.orientation.z, pose.orientation.w);
+  }
+
   void requestCallback(const std_msgs::msg::String::SharedPtr message) {
     std::lock_guard<std::mutex> lock(plan_mutex_);
     json request;
@@ -103,34 +296,67 @@ private:
         throw std::runtime_error("only frame_id='" + default_frame_ + "' is supported");
       }
 
-      auto start_state = move_group_.getCurrentState(2.0);
-      if (!start_state) {
-        // The real prior runner sends both arm joint vectors in the request.
-        // This also supports mock controllers that publish /joint_states with
-        // a zero timestamp, which MoveIt correctly rejects as stale.
-        if (!request.contains("follower_joints") || !request.contains("leader_joints")) {
-          throw std::runtime_error(
-            "MoveIt did not provide a current robot state; include leader_joints and follower_joints in the request");
-        }
-        start_state = std::make_shared<moveit::core::RobotState>(move_group_.getRobotModel());
-        start_state->setToDefaultValues();
-        RCLCPP_WARN(get_logger(), "Using request joint state because /joint_states is stale or unavailable");
-      }
-      if (request.contains("follower_joints")) {
-        setJointVector(*start_state, follower_group_, readVector(request, "follower_joints", 7));
-      }
-      if (request.contains("leader_joints")) {
-        setJointVector(*start_state, "right_panda_arm", readVector(request, "leader_joints", 7));
-      }
-      start_state->update();
+      // Synchronization is a separate callback/request. Planning only
+      // consumes the same authoritative request state; it does not publish
+      // /joint_states or race MoveIt's current-state monitor.
+      auto start_state = makeRequestState(request);
+      RCLCPP_INFO(get_logger(), "Using synchronized request state as planning start state");
+      Eigen::Isometry3d hand_to_tcp = Eigen::Isometry3d::Identity();
+      hand_to_tcp.translation() = effectiveTcpOffset();
+      const auto start_hand_transform = start_state->getGlobalLinkTransform(follower_link_);
+      const auto start_tcp_transform = start_hand_transform * hand_to_tcp;
+      RCLCPP_INFO(get_logger(), "Start state bounds valid: %s", start_state->satisfiesBounds() ? "yes" : "no");
+      RCLCPP_INFO(get_logger(), "Start %s FK hand=(%.5f, %.5f, %.5f), TCP=(%.5f, %.5f, %.5f)",
+                  follower_link_.c_str(),
+                  start_hand_transform.translation().x(), start_hand_transform.translation().y(),
+                  start_hand_transform.translation().z(),
+                  start_tcp_transform.translation().x(), start_tcp_transform.translation().y(),
+                  start_tcp_transform.translation().z());
       move_group_.setStartState(*start_state);
       move_group_.clearPoseTargets();
-      move_group_.setPoseTarget(parsePose(request), follower_link_);
+      const auto follower_pose = parsePose(request);
+      const auto hand_pose = tcpPoseToHandPose(follower_pose);
+      logPose("Requested follower TCP goal", follower_pose);
+      logPose("Converted follower hand goal", hand_pose);
+      const auto offset = effectiveTcpOffset();
+      RCLCPP_INFO(get_logger(), "Using hand->TCP offset in hand frame=(%.5f, %.5f, %.5f)%s",
+                  offset.x(), offset.y(), offset.z(), alter_finger_left_ ? " (altered finger)" : "");
+
+      // This isolates geometric reachability from OMPL/collision failures.
+      // It is only a diagnostic copy; the planning start state is unchanged.
+      auto ik_state = *start_state;
+      const auto* follower_jmg = ik_state.getJointModelGroup(follower_group_);
+      if (!follower_jmg) {
+        RCLCPP_ERROR(get_logger(), "Cannot run IK diagnostic: group '%s' is missing from the robot model",
+                     follower_group_.c_str());
+      } else {
+        const bool ik_ok = ik_state.setFromIK(follower_jmg, hand_pose, follower_link_, 0.5);
+        RCLCPP_INFO(get_logger(), "IK diagnostic for converted hand goal: %s", ik_ok ? "success" : "failure");
+        if (ik_ok) {
+          std::vector<double> ik_joints;
+          ik_state.copyJointGroupPositions(follower_jmg, ik_joints);
+          RCLCPP_INFO(get_logger(),
+                      "IK solution joints: [%.4f, %.4f, %.4f, %.4f, %.4f, %.4f, %.4f]",
+                      ik_joints[0], ik_joints[1], ik_joints[2], ik_joints[3],
+                      ik_joints[4], ik_joints[5], ik_joints[6]);
+        }
+      }
+      publishGoalMarker(follower_pose, task_id);
+      const bool target_set = move_group_.setPoseTarget(hand_pose, follower_link_);
+      RCLCPP_INFO(get_logger(), "MoveIt setPoseTarget(%s) returned %s",
+                  follower_link_.c_str(), target_set ? "true" : "false");
+      if (!target_set) {
+        throw std::runtime_error("MoveIt rejected converted follower hand target");
+      }
 
       moveit::planning_interface::MoveGroupInterface::Plan plan;
       const auto result = move_group_.plan(plan);
       if (result != moveit::planning_interface::MoveItErrorCode::SUCCESS ||
           plan.trajectory_.joint_trajectory.points.empty()) {
+        RCLCPP_ERROR(get_logger(),
+                     "MoveIt planning failed: error_code=%d, joint_names=%zu, points=%zu",
+                     result.val, plan.trajectory_.joint_trajectory.joint_names.size(),
+                     plan.trajectory_.joint_trajectory.points.size());
         publishResponse({{"task_id", task_id}, {"ok", false}, {"stage", "plan"},
                          {"error", "MoveIt planning failed"}});
         move_group_.clearPoseTargets();
@@ -144,6 +370,10 @@ private:
       subtrajectory.info.planner_id = task_id;
       subtrajectory.info.comment = "prior single-arm follower plan";
       subtrajectory.trajectory = plan.trajectory_;
+      last_plan_ = plan;
+      last_plan_task_id_ = task_id;
+      last_plan_trajectory_id_ = trajectory_id;
+      has_last_plan_ = true;
       trajectory_publisher_->publish(subtrajectory);
       if (legacy_trajectory_publisher_) {
         legacy_trajectory_publisher_->publish(subtrajectory);
@@ -162,17 +392,90 @@ private:
     }
   }
 
+  void executeCallback(const std_msgs::msg::String::SharedPtr message) {
+    std::lock_guard<std::mutex> lock(plan_mutex_);
+    json request;
+    try {
+      request = json::parse(message->data);
+      const std::string task_id = request.value("task_id", "");
+      const uint32_t trajectory_id = request.value("trajectory_id", 0u);
+      if (!has_last_plan_) {
+        throw std::runtime_error("no planned trajectory is available");
+      }
+      if (task_id != last_plan_task_id_) {
+        throw std::runtime_error("execute task_id does not match the latest plan");
+      }
+      if (trajectory_id != 0u && trajectory_id != last_plan_trajectory_id_) {
+        throw std::runtime_error("execute trajectory_id does not match the latest plan");
+      }
+
+      RCLCPP_INFO(get_logger(), "Executing accepted follower plan task=%s trajectory_id=%u",
+                  task_id.c_str(), last_plan_trajectory_id_);
+      if (open_follower_gripper_) {
+        if (!gripper_group_.setNamedTarget("open")) {
+          throw std::runtime_error("MoveIt rejected left_hand named target 'open'");
+        }
+        if (last_start_state_) {
+          gripper_group_.setStartState(*last_start_state_);
+        }
+        const auto gripper_result = gripper_group_.move();
+        RCLCPP_INFO(get_logger(), "MoveIt follower gripper open result=%d", gripper_result.val);
+        if (gripper_result != moveit::core::MoveItErrorCode::SUCCESS) {
+          publishExecuteResponse({{"task_id", task_id}, {"ok", false}, {"stage", "gripper"},
+                                  {"trajectory_id", last_plan_trajectory_id_},
+                                  {"error_code", gripper_result.val},
+                                  {"error", "failed to open follower gripper"}});
+          return;
+        }
+      }
+      const auto result = move_group_.execute(last_plan_);
+      RCLCPP_INFO(get_logger(), "MoveIt follower arm execute result=%d", result.val);
+      publishExecuteResponse({{"task_id", task_id},
+                              {"ok", result == moveit::core::MoveItErrorCode::SUCCESS},
+                              {"stage", "executed"},
+                              {"trajectory_id", last_plan_trajectory_id_},
+                              {"error_code", result.val}});
+    } catch (const std::exception& error) {
+      const std::string task_id = request.value("task_id", "");
+      publishExecuteResponse({{"task_id", task_id}, {"ok", false}, {"stage", "execute"},
+                              {"error", error.what()}});
+      RCLCPP_ERROR(get_logger(), "Prior execution request failed: %s", error.what());
+    }
+  }
+
   std::string follower_group_;
   std::string follower_link_;
   std::string default_frame_;
   double planning_time_;
   int planning_attempts_;
   bool publish_legacy_topic_;
+  bool alter_finger_left_;
+  double extended_finger_length_;
+  double tcp_offset_x_;
+  double tcp_offset_y_;
+  double tcp_offset_z_;
+  bool open_follower_gripper_;
+  double open_gripper_width_;
+  bool sync_joint_state_;
+  bool sync_via_move_group_;
   moveit::planning_interface::MoveGroupInterface move_group_;
+  moveit::planning_interface::MoveGroupInterface gripper_group_;
+  moveit::planning_interface::MoveGroupInterface sync_group_;
   std::mutex plan_mutex_;
   std::atomic<uint32_t> next_trajectory_id_{1};
+  moveit::planning_interface::MoveGroupInterface::Plan last_plan_;
+  moveit::core::RobotStatePtr last_start_state_;
+  std::string last_plan_task_id_;
+  uint32_t last_plan_trajectory_id_{0};
+  bool has_last_plan_{false};
   rclcpp::Subscription<std_msgs::msg::String>::SharedPtr request_subscription_;
+  rclcpp::Subscription<std_msgs::msg::String>::SharedPtr sync_request_subscription_;
+  rclcpp::Subscription<std_msgs::msg::String>::SharedPtr execute_request_subscription_;
   rclcpp::Publisher<std_msgs::msg::String>::SharedPtr response_publisher_;
+  rclcpp::Publisher<std_msgs::msg::String>::SharedPtr sync_response_publisher_;
+  rclcpp::Publisher<std_msgs::msg::String>::SharedPtr execute_response_publisher_;
+  rclcpp::Publisher<sensor_msgs::msg::JointState>::SharedPtr joint_state_publisher_;
+  rclcpp::Publisher<visualization_msgs::msg::Marker>::SharedPtr goal_marker_publisher_;
   rclcpp::Publisher<moveit_task_constructor_msgs::msg::SubTrajectory>::SharedPtr trajectory_publisher_;
   rclcpp::Publisher<moveit_task_constructor_msgs::msg::SubTrajectory>::SharedPtr legacy_trajectory_publisher_;
 };

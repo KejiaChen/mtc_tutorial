@@ -82,10 +82,11 @@ class PriorSubtrajectorySubscriber(Node):
         self, path: str, host: str, port: int, traj_pos: np.ndarray,
         traj_vel: np.ndarray, traj_time: np.ndarray, stage_id: int,
         traj_id: int, task_id: str | None = None,
+        filename_override: str | None = None,
     ) -> str:
         os.makedirs(path, exist_ok=True)
         task_name = self.task_id if task_id is None else task_id
-        filename = f"real_world_task_{task_name}_stage_{stage_id}_traj_{traj_id}.txt"
+        filename = filename_override or f"real_world_task_{task_name}_stage_{stage_id}_traj_{traj_id}.txt"
         file_path = os.path.join(path, filename)
         trajectory_data = {
             "time": traj_time.tolist(),
@@ -184,7 +185,9 @@ class PriorSubtrajectorySubscriber(Node):
         names = message.trajectory.joint_trajectory.joint_names
         task_id = message.info.planner_id or self.task_id or "prior_transition"
         trajectory_id = int(message.info.id)
-        filename = f"real_world_task_{task_id}_stage_{message.info.stage_id}_traj_{trajectory_id}.txt"
+        # A replan for one task/stage replaces the previous unaccepted
+        # candidate.  trajectory_id remains in the ready metadata as a version.
+        filename = f"prior_transition_{task_id}_stage_{message.info.stage_id}_follower.txt"
         try:
             if not names or not message.trajectory.joint_trajectory.points:
                 raise ValueError("empty follower trajectory")
@@ -196,7 +199,8 @@ class PriorSubtrajectorySubscriber(Node):
             host = self.left_mios_ip if self.send_to_robot else "local"
             stored_filename = self.write_trajectory_udp(
                 self.follower_output_dir, host, self.left_mios_traj_port,
-                positions, velocities, times, message.info.stage_id, trajectory_id, task_id=task_id,
+                positions, velocities, times, message.info.stage_id, trajectory_id,
+                task_id=task_id, filename_override=filename,
             )
             self._publish_ready({
                 "task_id": task_id, "ok": True, "stage": "trajectory_ready",
