@@ -31,7 +31,12 @@ constexpr char kExecuteRequestTopic[] = "/prior_transition/execute_request";
 constexpr char kExecuteResponseTopic[] = "/prior_transition/execute_response";
 constexpr char kLeaderMoveRequestTopic[] = "/prior_transition/leader_move_request";
 constexpr char kLeaderMoveResponseTopic[] = "/prior_transition/leader_move_response";
+constexpr char kLeaderExecuteRequestTopic[] = "/prior_transition/leader_execute_request";
+constexpr char kLeaderExecuteResponseTopic[] = "/prior_transition/leader_execute_response";
+constexpr char kFollowerFkRequestTopic[] = "/prior_transition/follower_fk_request";
+constexpr char kFollowerFkResponseTopic[] = "/prior_transition/follower_fk_response";
 constexpr char kTrajectoryTopic[] = "/prior_transition/follower_subtrajectory";
+constexpr char kLeaderTrajectoryTopic[] = "/prior_transition/leader_subtrajectory";
 constexpr char kGoalMarkerTopic[] = "/prior_transition/follower_goal_marker";
 }
 
@@ -72,19 +77,23 @@ public:
     sync_response_publisher_ = create_publisher<std_msgs::msg::String>(kSyncResponseTopic, 10);
     execute_response_publisher_ = create_publisher<std_msgs::msg::String>(kExecuteResponseTopic, 10);
     leader_move_response_publisher_ = create_publisher<std_msgs::msg::String>(kLeaderMoveResponseTopic, 10);
+    leader_execute_response_publisher_ = create_publisher<std_msgs::msg::String>(kLeaderExecuteResponseTopic, 10);
+    follower_fk_response_publisher_ = create_publisher<std_msgs::msg::String>(kFollowerFkResponseTopic, 10);
     joint_state_publisher_ = create_publisher<sensor_msgs::msg::JointState>(
       "/joint_states", rclcpp::QoS(10).reliable());
     goal_marker_publisher_ = create_publisher<visualization_msgs::msg::Marker>(
       kGoalMarkerTopic, rclcpp::QoS(1).transient_local());
     trajectory_publisher_ = create_publisher<moveit_task_constructor_msgs::msg::SubTrajectory>(
       kTrajectoryTopic, rclcpp::QoS(1).transient_local());
+    leader_trajectory_publisher_ = create_publisher<moveit_task_constructor_msgs::msg::SubTrajectory>(
+      kLeaderTrajectoryTopic, rclcpp::QoS(1).transient_local());
     if (publish_legacy_topic_) {
       legacy_trajectory_publisher_ = create_publisher<moveit_task_constructor_msgs::msg::SubTrajectory>(
         "/mtc_sub_trajectory", rclcpp::QoS(1).transient_local());
     }
 
-    const double velocity_scaling = declare_parameter<double>("velocity_scaling", 0.05);
-    const double acceleration_scaling = declare_parameter<double>("acceleration_scaling", 0.05);
+    const double velocity_scaling = declare_parameter<double>("velocity_scaling", 0.1);
+    const double acceleration_scaling = declare_parameter<double>("acceleration_scaling", 0.1);
     move_group_.setPoseReferenceFrame(default_frame_);
     move_group_.setPlanningTime(planning_time_);
     move_group_.setNumPlanningAttempts(planning_attempts_);
@@ -116,7 +125,13 @@ public:
       kExecuteRequestTopic, 10, std::bind(&PriorSingleArmPlanner::executeCallback, this, std::placeholders::_1));
     leader_move_request_subscription_ = create_subscription<std_msgs::msg::String>(
       kLeaderMoveRequestTopic, 10,
-      std::bind(&PriorSingleArmPlanner::leaderMoveCallback, this, std::placeholders::_1));
+      std::bind(&PriorSingleArmPlanner::leaderPlanCallback, this, std::placeholders::_1));
+    leader_execute_request_subscription_ = create_subscription<std_msgs::msg::String>(
+      kLeaderExecuteRequestTopic, 10,
+      std::bind(&PriorSingleArmPlanner::leaderExecuteCallback, this, std::placeholders::_1));
+    follower_fk_request_subscription_ = create_subscription<std_msgs::msg::String>(
+      kFollowerFkRequestTopic, 10,
+      std::bind(&PriorSingleArmPlanner::followerFkCallback, this, std::placeholders::_1));
     RCLCPP_INFO(get_logger(), "Listening on %s (group=%s, link=%s)", kRequestTopic,
                 follower_group_.c_str(), follower_link_.c_str());
     RCLCPP_INFO(get_logger(), "Listening on %s (group=%s, link=%s)", kLeaderMoveRequestTopic,
@@ -590,13 +605,17 @@ private:
     leader_move_response_publisher_->publish(message);
   }
 
-  // Plans and executes a single Cartesian move of the leader arm alone, then
-  // reports the resulting joint state. This mirrors what the real-robot
-  // workflow gets for free from lead_arm.move_cart_pose() followed by
-  // lead_arm.get_current_state(): a debug/no-hardware caller (e.g.
-  // shape_control_clip_fixing_prior.py's --moveit-only mode) needs the same
-  // "move then read back joints" step, but through MoveIt instead of MIOS.
-  void leaderMoveCallback(const std_msgs::msg::String::SharedPtr message) {
+  void publishLeaderExecuteResponse(const json& response) {
+    std_msgs::msg::String message;
+    message.data = response.dump();
+    leader_execute_response_publisher_->publish(message);
+  }
+
+  // Plans a single Cartesian move of the leader arm alone (no execution),
+  // mirroring requestCallback()'s plan-only step for the follower: the
+  // caller reviews the candidate (y/r/q) before leaderExecuteCallback()
+  // actually moves the arm, same accept/replan/quit loop as the follower.
+  void leaderPlanCallback(const std_msgs::msg::String::SharedPtr message) {
     std::lock_guard<std::mutex> lock(plan_mutex_);
     json request;
     try {
@@ -618,42 +637,126 @@ private:
         throw std::runtime_error("MoveIt rejected leader hand target");
       }
 
-      // No accept/replan step: mirrors the real-robot leader move, which
-      // also executes unconditionally without an operator review. Plan and
-      // execute separately (rather than move()) so the achieved joint state
-      // can be read straight from the planned trajectory's last waypoint --
-      // MoveGroupInterface::getCurrentState() depends on a live /joint_states
-      // subscription that this node does not otherwise keep warm, and times
-      // out with no useful state right after a fresh execute.
       moveit::planning_interface::MoveGroupInterface::Plan leader_plan;
       const auto plan_result = leader_group_.plan(leader_plan);
+      leader_group_.clearPoseTargets();
       if (plan_result != moveit::core::MoveItErrorCode::SUCCESS ||
           leader_plan.trajectory_.joint_trajectory.points.empty()) {
         RCLCPP_ERROR(get_logger(), "MoveIt leader planning failed: error_code=%d", plan_result.val);
         publishLeaderMoveResponse({{"task_id", task_id}, {"ok", false}, {"stage", "leader_plan"},
                                    {"error_code", plan_result.val},
                                    {"error", "MoveIt failed to plan the leader move"}});
-        leader_group_.clearPoseTargets();
         return;
       }
-      const auto exec_result = leader_group_.execute(leader_plan);
-      RCLCPP_INFO(get_logger(), "MoveIt leader arm execute result=%d", exec_result.val);
-      leader_group_.clearPoseTargets();
-      if (exec_result != moveit::core::MoveItErrorCode::SUCCESS) {
-        publishLeaderMoveResponse({{"task_id", task_id}, {"ok", false}, {"stage", "leader_execute"},
-                                   {"error_code", exec_result.val},
-                                   {"error", "MoveIt failed to execute the leader move"}});
-        return;
-      }
+      // Publish the planned leader trajectory so prior_subtrajectory_subscriber
+      // can forward it to the real leader MIOS server too -- shape_control_
+      // clip_fixing_prior.py now always plans the leader move through MoveIt
+      // (collision-checked) instead of a raw move_cart_pose(), and only
+      // additionally plays this trajectory on real hardware when not running
+      // --moveit-only.
+      const auto leader_trajectory_id = next_trajectory_id_.fetch_add(1);
+      moveit_task_constructor_msgs::msg::SubTrajectory leader_subtrajectory;
+      leader_subtrajectory.info.id = leader_trajectory_id;
+      leader_subtrajectory.info.stage_id = request.value("stage_id", 3u);
+      leader_subtrajectory.info.planner_id = task_id;
+      leader_subtrajectory.info.comment = "prior single-arm leader plan";
+      leader_subtrajectory.trajectory = leader_plan.trajectory_;
+      last_leader_plan_ = leader_plan;
+      last_leader_plan_task_id_ = task_id;
+      last_leader_plan_trajectory_id_ = leader_trajectory_id;
+      has_last_leader_plan_ = true;
+      leader_trajectory_publisher_->publish(leader_subtrajectory);
 
-      const auto leader_joints = finalJointPositions(leader_plan.trajectory_, leader_group_.getJointNames());
-      publishLeaderMoveResponse({{"task_id", task_id}, {"ok", true}, {"stage", "leader_moved"},
-                                 {"leader_joints", leader_joints}});
-      RCLCPP_INFO(get_logger(), "Leader move complete for task %s", task_id.c_str());
+      publishLeaderMoveResponse({{"task_id", task_id}, {"ok", true}, {"stage", "leader_planned"},
+                                 {"trajectory_id", leader_trajectory_id},
+                                 {"waypoint_count", leader_plan.trajectory_.joint_trajectory.points.size()}});
+      RCLCPP_INFO(get_logger(), "Leader plan complete for task %s", task_id.c_str());
     } catch (const std::exception& error) {
       publishLeaderMoveResponse({{"task_id", request.value("task_id", "")}, {"ok", false},
-                                 {"stage", "leader_move"}, {"error", error.what()}});
-      RCLCPP_ERROR(get_logger(), "Leader move request failed: %s", error.what());
+                                 {"stage", "leader_plan"}, {"error", error.what()}});
+      RCLCPP_ERROR(get_logger(), "Leader plan request failed: %s", error.what());
+    }
+  }
+
+  // Executes the last accepted leader plan, mirroring executeCallback() for
+  // the follower (no gripper step, since the leader has none here).
+  void leaderExecuteCallback(const std_msgs::msg::String::SharedPtr message) {
+    std::lock_guard<std::mutex> lock(plan_mutex_);
+    json request;
+    try {
+      request = json::parse(message->data);
+      const std::string task_id = request.value("task_id", "");
+      const uint32_t trajectory_id = request.value("trajectory_id", 0u);
+      if (!has_last_leader_plan_) {
+        throw std::runtime_error("no planned leader trajectory is available");
+      }
+      if (task_id != last_leader_plan_task_id_) {
+        throw std::runtime_error("leader execute task_id does not match the latest plan");
+      }
+      if (trajectory_id != 0u && trajectory_id != last_leader_plan_trajectory_id_) {
+        throw std::runtime_error("leader execute trajectory_id does not match the latest plan");
+      }
+
+      RCLCPP_INFO(get_logger(), "Executing accepted leader plan task=%s trajectory_id=%u",
+                  task_id.c_str(), last_leader_plan_trajectory_id_);
+      const auto result = leader_group_.execute(last_leader_plan_);
+      RCLCPP_INFO(get_logger(), "MoveIt leader arm execute result=%d", result.val);
+      json execute_response = {{"task_id", task_id},
+                                {"ok", result == moveit::core::MoveItErrorCode::SUCCESS},
+                                {"stage", "leader_executed"},
+                                {"trajectory_id", last_leader_plan_trajectory_id_},
+                                {"error_code", result.val}};
+      if (result == moveit::core::MoveItErrorCode::SUCCESS) {
+        execute_response["leader_joints"] =
+          finalJointPositions(last_leader_plan_.trajectory_, leader_group_.getJointNames());
+      }
+      publishLeaderExecuteResponse(execute_response);
+    } catch (const std::exception& error) {
+      const std::string task_id = request.value("task_id", "");
+      publishLeaderExecuteResponse({{"task_id", task_id}, {"ok", false}, {"stage", "leader_execute"},
+                                    {"error", error.what()}});
+      RCLCPP_ERROR(get_logger(), "Leader execute request failed: %s", error.what());
+    }
+  }
+
+  void publishFollowerFkResponse(const json& response) {
+    std_msgs::msg::String message;
+    message.data = response.dump();
+    follower_fk_response_publisher_->publish(message);
+  }
+
+  // Reports the follower TCP orientation FK-computed from a given joint
+  // state, with no planning or execution. A no-hardware caller (e.g.
+  // --moveit-only) needs this to know the follower's actual current
+  // orientation -- e.g. lead_arm.get_current_state()'s live TCP orientation
+  // is not available here -- before it can compute a grasp orientation
+  // relative to it.
+  void followerFkCallback(const std_msgs::msg::String::SharedPtr message) {
+    std::lock_guard<std::mutex> lock(plan_mutex_);
+    json request;
+    try {
+      request = json::parse(message->data);
+      const std::string task_id = request.value("task_id", "prior_transition");
+      const auto follower_joints = readVector(request, "follower_joints", 7);
+
+      auto state = std::make_shared<moveit::core::RobotState>(move_group_.getRobotModel());
+      state->setToDefaultValues();
+      setJointVector(*state, follower_group_, follower_joints);
+      state->update();
+
+      // tcpPoseToHandPose() only translates (along the orientation's local
+      // Z) between the hand link and the TCP frame; the orientation itself
+      // is identical, so the hand link's FK orientation IS the TCP
+      // orientation -- no additional rotation to apply here.
+      const auto hand_transform = state->getGlobalLinkTransform(follower_link_);
+      const Eigen::Quaterniond orientation(hand_transform.rotation());
+      publishFollowerFkResponse({{"task_id", task_id}, {"ok", true}, {"stage", "follower_fk"},
+                                 {"orientation", {orientation.x(), orientation.y(),
+                                                   orientation.z(), orientation.w()}}});
+    } catch (const std::exception& error) {
+      publishFollowerFkResponse({{"task_id", request.value("task_id", "")}, {"ok", false},
+                                 {"stage", "follower_fk"}, {"error", error.what()}});
+      RCLCPP_ERROR(get_logger(), "Follower FK request failed: %s", error.what());
     }
   }
 
@@ -689,17 +792,26 @@ private:
   std::string last_plan_task_id_;
   uint32_t last_plan_trajectory_id_{0};
   bool has_last_plan_{false};
+  moveit::planning_interface::MoveGroupInterface::Plan last_leader_plan_;
+  std::string last_leader_plan_task_id_;
+  uint32_t last_leader_plan_trajectory_id_{0};
+  bool has_last_leader_plan_{false};
   rclcpp::Subscription<std_msgs::msg::String>::SharedPtr request_subscription_;
   rclcpp::Subscription<std_msgs::msg::String>::SharedPtr sync_request_subscription_;
   rclcpp::Subscription<std_msgs::msg::String>::SharedPtr execute_request_subscription_;
   rclcpp::Subscription<std_msgs::msg::String>::SharedPtr leader_move_request_subscription_;
+  rclcpp::Subscription<std_msgs::msg::String>::SharedPtr leader_execute_request_subscription_;
+  rclcpp::Subscription<std_msgs::msg::String>::SharedPtr follower_fk_request_subscription_;
   rclcpp::Publisher<std_msgs::msg::String>::SharedPtr response_publisher_;
   rclcpp::Publisher<std_msgs::msg::String>::SharedPtr sync_response_publisher_;
   rclcpp::Publisher<std_msgs::msg::String>::SharedPtr execute_response_publisher_;
   rclcpp::Publisher<std_msgs::msg::String>::SharedPtr leader_move_response_publisher_;
+  rclcpp::Publisher<std_msgs::msg::String>::SharedPtr leader_execute_response_publisher_;
+  rclcpp::Publisher<std_msgs::msg::String>::SharedPtr follower_fk_response_publisher_;
   rclcpp::Publisher<sensor_msgs::msg::JointState>::SharedPtr joint_state_publisher_;
   rclcpp::Publisher<visualization_msgs::msg::Marker>::SharedPtr goal_marker_publisher_;
   rclcpp::Publisher<moveit_task_constructor_msgs::msg::SubTrajectory>::SharedPtr trajectory_publisher_;
+  rclcpp::Publisher<moveit_task_constructor_msgs::msg::SubTrajectory>::SharedPtr leader_trajectory_publisher_;
   rclcpp::Publisher<moveit_task_constructor_msgs::msg::SubTrajectory>::SharedPtr legacy_trajectory_publisher_;
 };
 

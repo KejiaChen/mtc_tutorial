@@ -17,6 +17,8 @@ def generate_launch_description():
     send_to_robot = DeclareLaunchArgument("send_to_robot", default_value="true")
     follower_ip = DeclareLaunchArgument("follower_ip", default_value="10.157.174.87")
     follower_port = DeclareLaunchArgument("follower_port", default_value="12345")
+    leader_ip = DeclareLaunchArgument("leader_ip", default_value="10.157.174.97")
+    leader_port = DeclareLaunchArgument("leader_port", default_value="12345")
     publish_legacy_topic = DeclareLaunchArgument("publish_legacy_topic", default_value="false")
     start_move_group = DeclareLaunchArgument("start_move_group", default_value="false")
     sync_via_move_group = DeclareLaunchArgument("sync_via_move_group", default_value="true")
@@ -71,13 +73,20 @@ def generate_launch_description():
         output="screen",
         parameters=[
             {"send_to_robot": LaunchConfiguration("send_to_robot")},
-            {"follower_ip": LaunchConfiguration("follower_ip")},
-            {"follower_port": LaunchConfiguration("follower_port")},
+            # prior_subtrajectory_subscriber.py declares these as
+            # left_mios_ip/left_mios_traj_port and right_mios_ip/
+            # right_mios_traj_port, not follower_ip/leader_ip -- map the
+            # user-facing launch arg names to the actual node parameter names.
+            {"left_mios_ip": LaunchConfiguration("follower_ip")},
+            {"left_mios_traj_port": LaunchConfiguration("follower_port")},
+            {"right_mios_ip": LaunchConfiguration("leader_ip")},
+            {"right_mios_traj_port": LaunchConfiguration("leader_port")},
         ],
     )
     return LaunchDescription([
         use_sensone_left, use_sensone_right, alter_finger_left, alter_finger_right,
-        send_to_robot, follower_ip, follower_port, publish_legacy_topic, start_move_group,
+        send_to_robot, follower_ip, follower_port, leader_ip, leader_port,
+        publish_legacy_topic, start_move_group,
         sync_via_move_group,
         move_group, planner, subscriber,
     ])
