@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cmath>
@@ -14,7 +15,9 @@
 #include <geometry_msgs/msg/pose.hpp>
 #include <sensor_msgs/msg/joint_state.hpp>
 #include <visualization_msgs/msg/marker.hpp>
+#include <moveit/collision_detection/collision_common.h>
 #include <moveit/move_group_interface/move_group_interface.h>
+#include <moveit/planning_scene_monitor/planning_scene_monitor.h>
 #include <moveit_task_constructor_msgs/msg/sub_trajectory.hpp>
 
 using json = nlohmann::json;
@@ -26,6 +29,8 @@ constexpr char kSyncRequestTopic[] = "/prior_transition/sync_state_request";
 constexpr char kSyncResponseTopic[] = "/prior_transition/sync_state_response";
 constexpr char kExecuteRequestTopic[] = "/prior_transition/execute_request";
 constexpr char kExecuteResponseTopic[] = "/prior_transition/execute_response";
+constexpr char kLeaderMoveRequestTopic[] = "/prior_transition/leader_move_request";
+constexpr char kLeaderMoveResponseTopic[] = "/prior_transition/leader_move_response";
 constexpr char kTrajectoryTopic[] = "/prior_transition/follower_subtrajectory";
 constexpr char kGoalMarkerTopic[] = "/prior_transition/follower_goal_marker";
 }
@@ -36,6 +41,8 @@ public:
   : Node("prior_single_arm_planner", options),
     follower_group_(declare_parameter<std::string>("follower_group", "left_panda_arm")),
     follower_link_(declare_parameter<std::string>("follower_link", "left_panda_hand")),
+    leader_group_name_(declare_parameter<std::string>("leader_group", "right_panda_arm")),
+    leader_link_(declare_parameter<std::string>("leader_link", "right_panda_hand")),
     default_frame_(declare_parameter<std::string>("default_frame", "world")),
     planning_time_(declare_parameter<double>("planning_time", 10.0)),
     planning_attempts_(declare_parameter<int>("planning_attempts", 5)),
@@ -45,6 +52,13 @@ public:
     tcp_offset_x_(declare_parameter<double>("tcp_offset_x", 0.0)),
     tcp_offset_y_(declare_parameter<double>("tcp_offset_y", 0.0)),
     tcp_offset_z_(declare_parameter<double>("tcp_offset_z", 0.1034)),
+    // No dedicated calibration exists yet for the leader tool; default to the
+    // same offset as the follower since both arms share the same gripper
+    // geometry convention in the Python routing helpers. Revisit once the
+    // real MIOS O_T_EE can be compared against this FK.
+    leader_tcp_offset_x_(declare_parameter<double>("leader_tcp_offset_x", 0.0)),
+    leader_tcp_offset_y_(declare_parameter<double>("leader_tcp_offset_y", 0.0)),
+    leader_tcp_offset_z_(declare_parameter<double>("leader_tcp_offset_z", 0.1034)),
     open_follower_gripper_(declare_parameter<bool>("open_follower_gripper", true)),
     open_gripper_width_(declare_parameter<double>("open_gripper_width", 0.035)),
     sync_joint_state_(declare_parameter<bool>("sync_joint_state", true)),
@@ -52,10 +66,12 @@ public:
     // Keep MoveGroupInterface on this node so launch parameters are visible.
     move_group_(std::shared_ptr<rclcpp::Node>(this, [](rclcpp::Node*) {}), follower_group_),
     gripper_group_(std::shared_ptr<rclcpp::Node>(this, [](rclcpp::Node*) {}), "left_hand"),
-    sync_group_(std::shared_ptr<rclcpp::Node>(this, [](rclcpp::Node*) {}), "dual_arm") {
+    sync_group_(std::shared_ptr<rclcpp::Node>(this, [](rclcpp::Node*) {}), "dual_arm"),
+    leader_group_(std::shared_ptr<rclcpp::Node>(this, [](rclcpp::Node*) {}), leader_group_name_) {
     response_publisher_ = create_publisher<std_msgs::msg::String>(kResponseTopic, 10);
     sync_response_publisher_ = create_publisher<std_msgs::msg::String>(kSyncResponseTopic, 10);
     execute_response_publisher_ = create_publisher<std_msgs::msg::String>(kExecuteResponseTopic, 10);
+    leader_move_response_publisher_ = create_publisher<std_msgs::msg::String>(kLeaderMoveResponseTopic, 10);
     joint_state_publisher_ = create_publisher<sensor_msgs::msg::JointState>(
       "/joint_states", rclcpp::QoS(10).reliable());
     goal_marker_publisher_ = create_publisher<visualization_msgs::msg::Marker>(
@@ -67,23 +83,44 @@ public:
         "/mtc_sub_trajectory", rclcpp::QoS(1).transient_local());
     }
 
+    const double velocity_scaling = declare_parameter<double>("velocity_scaling", 0.05);
+    const double acceleration_scaling = declare_parameter<double>("acceleration_scaling", 0.05);
     move_group_.setPoseReferenceFrame(default_frame_);
     move_group_.setPlanningTime(planning_time_);
     move_group_.setNumPlanningAttempts(planning_attempts_);
-    move_group_.setMaxVelocityScalingFactor(declare_parameter<double>("velocity_scaling", 0.05));
-    move_group_.setMaxAccelerationScalingFactor(declare_parameter<double>("acceleration_scaling", 0.05));
+    move_group_.setMaxVelocityScalingFactor(velocity_scaling);
+    move_group_.setMaxAccelerationScalingFactor(acceleration_scaling);
     sync_group_.setPlanningTime(planning_time_);
     sync_group_.setNumPlanningAttempts(planning_attempts_);
     sync_group_.setMaxVelocityScalingFactor(0.1);
     sync_group_.setMaxAccelerationScalingFactor(0.1);
+    leader_group_.setPoseReferenceFrame(default_frame_);
+    leader_group_.setPlanningTime(planning_time_);
+    leader_group_.setNumPlanningAttempts(planning_attempts_);
+    leader_group_.setMaxVelocityScalingFactor(velocity_scaling);
+    leader_group_.setMaxAccelerationScalingFactor(acceleration_scaling);
+    auto node_alias = std::shared_ptr<rclcpp::Node>(this, [](rclcpp::Node*) {});
+    planning_scene_monitor_ = std::make_shared<planning_scene_monitor::PlanningSceneMonitor>(
+      node_alias, "robot_description");
+    if (planning_scene_monitor_->getPlanningScene()) {
+      planning_scene_monitor_->requestPlanningSceneState();
+      planning_scene_monitor_->startSceneMonitor();
+    } else {
+      RCLCPP_WARN(get_logger(), "PlanningSceneMonitor could not initialize; collision diagnostics disabled");
+    }
     request_subscription_ = create_subscription<std_msgs::msg::String>(
       kRequestTopic, 10, std::bind(&PriorSingleArmPlanner::requestCallback, this, std::placeholders::_1));
     sync_request_subscription_ = create_subscription<std_msgs::msg::String>(
       kSyncRequestTopic, 10, std::bind(&PriorSingleArmPlanner::syncRequestCallback, this, std::placeholders::_1));
     execute_request_subscription_ = create_subscription<std_msgs::msg::String>(
       kExecuteRequestTopic, 10, std::bind(&PriorSingleArmPlanner::executeCallback, this, std::placeholders::_1));
+    leader_move_request_subscription_ = create_subscription<std_msgs::msg::String>(
+      kLeaderMoveRequestTopic, 10,
+      std::bind(&PriorSingleArmPlanner::leaderMoveCallback, this, std::placeholders::_1));
     RCLCPP_INFO(get_logger(), "Listening on %s (group=%s, link=%s)", kRequestTopic,
                 follower_group_.c_str(), follower_link_.c_str());
+    RCLCPP_INFO(get_logger(), "Listening on %s (group=%s, link=%s)", kLeaderMoveRequestTopic,
+                leader_group_name_.c_str(), leader_link_.c_str());
   }
 
 private:
@@ -107,8 +144,35 @@ private:
     state.setJointGroupPositions(joint_group, values);
   }
 
-  geometry_msgs::msg::Pose parsePose(const json& request) const {
-    const auto& pose = request.at("follower_pose");
+  // Reads the last waypoint of a planned trajectory, in the given group's
+  // canonical joint order (looked up by name rather than assumed position
+  // index). Used to report the joints a plan actually ends at without
+  // depending on a live /joint_states subscription (MoveGroupInterface's
+  // getCurrentState() needs one and is not reliably warm right after an
+  // execute() in this node).
+  static std::vector<double> finalJointPositions(
+      const moveit_msgs::msg::RobotTrajectory& trajectory,
+      const std::vector<std::string>& group_joint_names) {
+    if (trajectory.joint_trajectory.points.empty()) {
+      throw std::runtime_error("trajectory has no waypoints");
+    }
+    const auto& joint_names = trajectory.joint_trajectory.joint_names;
+    const auto& last_point = trajectory.joint_trajectory.points.back();
+    std::vector<double> values;
+    values.reserve(group_joint_names.size());
+    for (const auto& name : group_joint_names) {
+      const auto it = std::find(joint_names.begin(), joint_names.end(), name);
+      if (it == joint_names.end() ||
+          static_cast<std::size_t>(std::distance(joint_names.begin(), it)) >= last_point.positions.size()) {
+        throw std::runtime_error("planned trajectory is missing joint " + name);
+      }
+      values.push_back(last_point.positions[std::distance(joint_names.begin(), it)]);
+    }
+    return values;
+  }
+
+  geometry_msgs::msg::Pose parsePose(const json& request, const char* key = "follower_pose") const {
+    const auto& pose = request.at(key);
     const auto position = readVector(pose, "position", 3);
     const auto orientation = readVector(pose, "orientation", 4);
     geometry_msgs::msg::Pose result;
@@ -157,6 +221,69 @@ private:
                 message.name.size(), repeats);
   }
 
+  void logDualArmTargetDiagnostics(const moveit::core::RobotState& state,
+                                   const std::vector<double>& target) const {
+    const auto model = sync_group_.getRobotModel();
+    const auto* group = model ? model->getJointModelGroup("dual_arm") : nullptr;
+    if (!group) {
+      RCLCPP_ERROR(get_logger(), "Diagnostics: dual_arm JointModelGroup is missing");
+      return;
+    }
+    const auto& names = group->getVariableNames();
+    RCLCPP_ERROR(get_logger(), "Diagnostics: dual_arm target count=%zu model count=%zu",
+                 target.size(), names.size());
+    bool target_ok = true;
+    for (std::size_t i = 0; i < names.size() && i < target.size(); ++i) {
+      const auto& bounds = model->getVariableBounds(names[i]);
+      const bool below = bounds.position_bounded_ && target[i] < bounds.min_position_;
+      const bool above = bounds.position_bounded_ && target[i] > bounds.max_position_;
+      const bool ok = !below && !above;
+      target_ok = target_ok && ok;
+      RCLCPP_ERROR(get_logger(),
+                   "Diagnostics joint[%zu] %s target=%.9f bounds=[%.9f, %.9f] bounded=%s status=%s",
+                   i, names[i].c_str(), target[i], bounds.min_position_, bounds.max_position_,
+                   bounds.position_bounded_ ? "true" : "false", ok ? "OK" : "OUT_OF_BOUNDS");
+    }
+    RCLCPP_ERROR(get_logger(), "Diagnostics target bounds result: %s; state dual_arm bounds: %s; full state bounds: %s",
+                 target_ok ? "OK" : "OUT_OF_BOUNDS",
+                 state.satisfiesBounds(group) ? "OK" : "INVALID",
+                 state.satisfiesBounds() ? "OK" : "INVALID");
+  }
+
+  void logCollisionDiagnostics(moveit::core::RobotState start_state,
+                               moveit::core::RobotState* goal_state) const {
+    if (!planning_scene_monitor_) {
+      return;
+    }
+    const auto scene = planning_scene_monitor_->getPlanningScene();
+    if (!scene) {
+      RCLCPP_WARN(get_logger(), "Collision diagnostics: planning scene unavailable");
+      return;
+    }
+    collision_detection::CollisionRequest request;
+    request.contacts = true;
+    request.max_contacts = 100;
+    request.verbose = false;
+    collision_detection::CollisionResult start_result;
+    scene->checkCollision(request, start_result, start_state);
+    RCLCPP_ERROR(get_logger(), "Collision diagnostics start state: %s (%zu contact pairs)",
+                 start_result.collision ? "COLLIDING" : "free", start_result.contacts.size());
+    for (const auto& contact : start_result.contacts) {
+      RCLCPP_ERROR(get_logger(), "  start contact: %s <-> %s",
+                   contact.first.first.c_str(), contact.first.second.c_str());
+    }
+    if (goal_state) {
+      collision_detection::CollisionResult goal_result;
+      scene->checkCollision(request, goal_result, *goal_state);
+      RCLCPP_ERROR(get_logger(), "Collision diagnostics IK goal state: %s (%zu contact pairs)",
+                   goal_result.collision ? "COLLIDING" : "free", goal_result.contacts.size());
+      for (const auto& contact : goal_result.contacts) {
+        RCLCPP_ERROR(get_logger(), "  goal contact: %s <-> %s",
+                     contact.first.first.c_str(), contact.first.second.c_str());
+      }
+    }
+  }
+
   moveit::core::RobotStatePtr makeRequestState(const json& request) {
     if (!request.contains("follower_joints") || !request.contains("leader_joints")) {
       throw std::runtime_error("request must include leader_joints and follower_joints");
@@ -189,6 +316,7 @@ private:
         state->copyJointGroupPositions("dual_arm", dual_arm_positions);
         RCLCPP_INFO(get_logger(), "Dual-arm synchronization target has %zu joints", dual_arm_positions.size());
         if (!sync_group_.setJointValueTarget(dual_arm_positions)) {
+          logDualArmTargetDiagnostics(*state, dual_arm_positions);
           throw std::runtime_error("MoveIt rejected synchronized dual_arm arm-joint goal");
         }
         const auto arm_result = sync_group_.move();
@@ -246,17 +374,22 @@ private:
       tcp_offset_z_ + (alter_finger_left_ ? 0.5 * extended_finger_length_ : 0.0));
   }
 
+  Eigen::Vector3d leaderEffectiveTcpOffset() const {
+    return Eigen::Vector3d(leader_tcp_offset_x_, leader_tcp_offset_y_, leader_tcp_offset_z_);
+  }
+
   // Requests contain the physical TCP pose. MoveGroupInterface expects the
   // pose of the selected link, so convert TCP -> hand using the same offset
   // convention as dual_mtc_routing.cpp.
-  geometry_msgs::msg::Pose tcpPoseToHandPose(const geometry_msgs::msg::Pose& tcp_pose) const {
+  geometry_msgs::msg::Pose tcpPoseToHandPose(const geometry_msgs::msg::Pose& tcp_pose,
+                                              const Eigen::Vector3d& tcp_offset) const {
     const double norm = std::sqrt(
       tcp_pose.orientation.x * tcp_pose.orientation.x +
       tcp_pose.orientation.y * tcp_pose.orientation.y +
       tcp_pose.orientation.z * tcp_pose.orientation.z +
       tcp_pose.orientation.w * tcp_pose.orientation.w);
     if (norm < 1e-9) {
-      throw std::runtime_error("follower_pose has a zero-length quaternion");
+      throw std::runtime_error("pose has a zero-length quaternion");
     }
 
     Eigen::Quaterniond tcp_orientation(
@@ -266,7 +399,7 @@ private:
       tcp_pose.orientation.z / norm);
     const Eigen::Vector3d tcp_position(
       tcp_pose.position.x, tcp_pose.position.y, tcp_pose.position.z);
-    const Eigen::Vector3d hand_position = tcp_position - tcp_orientation * effectiveTcpOffset();
+    const Eigen::Vector3d hand_position = tcp_position - tcp_orientation * tcp_offset;
 
     geometry_msgs::msg::Pose hand_pose = tcp_pose;
     hand_pose.position.x = hand_position.x();
@@ -315,7 +448,7 @@ private:
       move_group_.setStartState(*start_state);
       move_group_.clearPoseTargets();
       const auto follower_pose = parsePose(request);
-      const auto hand_pose = tcpPoseToHandPose(follower_pose);
+      const auto hand_pose = tcpPoseToHandPose(follower_pose, effectiveTcpOffset());
       logPose("Requested follower TCP goal", follower_pose);
       logPose("Converted follower hand goal", hand_pose);
       const auto offset = effectiveTcpOffset();
@@ -340,6 +473,7 @@ private:
                       ik_joints[0], ik_joints[1], ik_joints[2], ik_joints[3],
                       ik_joints[4], ik_joints[5], ik_joints[6]);
         }
+        logCollisionDiagnostics(*start_state, ik_ok ? &ik_state : nullptr);
       }
       publishGoalMarker(follower_pose, task_id);
       const bool target_set = move_group_.setPoseTarget(hand_pose, follower_link_);
@@ -430,11 +564,18 @@ private:
       }
       const auto result = move_group_.execute(last_plan_);
       RCLCPP_INFO(get_logger(), "MoveIt follower arm execute result=%d", result.val);
-      publishExecuteResponse({{"task_id", task_id},
-                              {"ok", result == moveit::core::MoveItErrorCode::SUCCESS},
-                              {"stage", "executed"},
-                              {"trajectory_id", last_plan_trajectory_id_},
-                              {"error_code", result.val}});
+      json execute_response = {{"task_id", task_id},
+                                {"ok", result == moveit::core::MoveItErrorCode::SUCCESS},
+                                {"stage", "executed"},
+                                {"trajectory_id", last_plan_trajectory_id_},
+                                {"error_code", result.val}};
+      if (result == moveit::core::MoveItErrorCode::SUCCESS) {
+        // So a no-hardware caller (e.g. --moveit-only) can track the
+        // follower's actual post-execution joint state instead of reusing a
+        // stale value across subsequent plan requests.
+        execute_response["follower_joints"] = finalJointPositions(last_plan_.trajectory_, move_group_.getJointNames());
+      }
+      publishExecuteResponse(execute_response);
     } catch (const std::exception& error) {
       const std::string task_id = request.value("task_id", "");
       publishExecuteResponse({{"task_id", task_id}, {"ok", false}, {"stage", "execute"},
@@ -443,8 +584,83 @@ private:
     }
   }
 
+  void publishLeaderMoveResponse(const json& response) {
+    std_msgs::msg::String message;
+    message.data = response.dump();
+    leader_move_response_publisher_->publish(message);
+  }
+
+  // Plans and executes a single Cartesian move of the leader arm alone, then
+  // reports the resulting joint state. This mirrors what the real-robot
+  // workflow gets for free from lead_arm.move_cart_pose() followed by
+  // lead_arm.get_current_state(): a debug/no-hardware caller (e.g.
+  // shape_control_clip_fixing_prior.py's --moveit-only mode) needs the same
+  // "move then read back joints" step, but through MoveIt instead of MIOS.
+  void leaderMoveCallback(const std_msgs::msg::String::SharedPtr message) {
+    std::lock_guard<std::mutex> lock(plan_mutex_);
+    json request;
+    try {
+      request = json::parse(message->data);
+      const std::string task_id = request.value("task_id", "prior_transition");
+      if (request.value("frame_id", default_frame_) != default_frame_) {
+        throw std::runtime_error("only frame_id='" + default_frame_ + "' is supported");
+      }
+      const auto leader_pose = parsePose(request, "leader_pose");
+      const auto hand_pose = tcpPoseToHandPose(leader_pose, leaderEffectiveTcpOffset());
+      logPose("Requested leader TCP goal", leader_pose);
+      logPose("Converted leader hand goal", hand_pose);
+
+      leader_group_.clearPoseTargets();
+      const bool target_set = leader_group_.setPoseTarget(hand_pose, leader_link_);
+      RCLCPP_INFO(get_logger(), "MoveIt setPoseTarget(%s) returned %s",
+                  leader_link_.c_str(), target_set ? "true" : "false");
+      if (!target_set) {
+        throw std::runtime_error("MoveIt rejected leader hand target");
+      }
+
+      // No accept/replan step: mirrors the real-robot leader move, which
+      // also executes unconditionally without an operator review. Plan and
+      // execute separately (rather than move()) so the achieved joint state
+      // can be read straight from the planned trajectory's last waypoint --
+      // MoveGroupInterface::getCurrentState() depends on a live /joint_states
+      // subscription that this node does not otherwise keep warm, and times
+      // out with no useful state right after a fresh execute.
+      moveit::planning_interface::MoveGroupInterface::Plan leader_plan;
+      const auto plan_result = leader_group_.plan(leader_plan);
+      if (plan_result != moveit::core::MoveItErrorCode::SUCCESS ||
+          leader_plan.trajectory_.joint_trajectory.points.empty()) {
+        RCLCPP_ERROR(get_logger(), "MoveIt leader planning failed: error_code=%d", plan_result.val);
+        publishLeaderMoveResponse({{"task_id", task_id}, {"ok", false}, {"stage", "leader_plan"},
+                                   {"error_code", plan_result.val},
+                                   {"error", "MoveIt failed to plan the leader move"}});
+        leader_group_.clearPoseTargets();
+        return;
+      }
+      const auto exec_result = leader_group_.execute(leader_plan);
+      RCLCPP_INFO(get_logger(), "MoveIt leader arm execute result=%d", exec_result.val);
+      leader_group_.clearPoseTargets();
+      if (exec_result != moveit::core::MoveItErrorCode::SUCCESS) {
+        publishLeaderMoveResponse({{"task_id", task_id}, {"ok", false}, {"stage", "leader_execute"},
+                                   {"error_code", exec_result.val},
+                                   {"error", "MoveIt failed to execute the leader move"}});
+        return;
+      }
+
+      const auto leader_joints = finalJointPositions(leader_plan.trajectory_, leader_group_.getJointNames());
+      publishLeaderMoveResponse({{"task_id", task_id}, {"ok", true}, {"stage", "leader_moved"},
+                                 {"leader_joints", leader_joints}});
+      RCLCPP_INFO(get_logger(), "Leader move complete for task %s", task_id.c_str());
+    } catch (const std::exception& error) {
+      publishLeaderMoveResponse({{"task_id", request.value("task_id", "")}, {"ok", false},
+                                 {"stage", "leader_move"}, {"error", error.what()}});
+      RCLCPP_ERROR(get_logger(), "Leader move request failed: %s", error.what());
+    }
+  }
+
   std::string follower_group_;
   std::string follower_link_;
+  std::string leader_group_name_;
+  std::string leader_link_;
   std::string default_frame_;
   double planning_time_;
   int planning_attempts_;
@@ -454,6 +670,9 @@ private:
   double tcp_offset_x_;
   double tcp_offset_y_;
   double tcp_offset_z_;
+  double leader_tcp_offset_x_;
+  double leader_tcp_offset_y_;
+  double leader_tcp_offset_z_;
   bool open_follower_gripper_;
   double open_gripper_width_;
   bool sync_joint_state_;
@@ -461,6 +680,8 @@ private:
   moveit::planning_interface::MoveGroupInterface move_group_;
   moveit::planning_interface::MoveGroupInterface gripper_group_;
   moveit::planning_interface::MoveGroupInterface sync_group_;
+  moveit::planning_interface::MoveGroupInterface leader_group_;
+  std::shared_ptr<planning_scene_monitor::PlanningSceneMonitor> planning_scene_monitor_;
   std::mutex plan_mutex_;
   std::atomic<uint32_t> next_trajectory_id_{1};
   moveit::planning_interface::MoveGroupInterface::Plan last_plan_;
@@ -471,9 +692,11 @@ private:
   rclcpp::Subscription<std_msgs::msg::String>::SharedPtr request_subscription_;
   rclcpp::Subscription<std_msgs::msg::String>::SharedPtr sync_request_subscription_;
   rclcpp::Subscription<std_msgs::msg::String>::SharedPtr execute_request_subscription_;
+  rclcpp::Subscription<std_msgs::msg::String>::SharedPtr leader_move_request_subscription_;
   rclcpp::Publisher<std_msgs::msg::String>::SharedPtr response_publisher_;
   rclcpp::Publisher<std_msgs::msg::String>::SharedPtr sync_response_publisher_;
   rclcpp::Publisher<std_msgs::msg::String>::SharedPtr execute_response_publisher_;
+  rclcpp::Publisher<std_msgs::msg::String>::SharedPtr leader_move_response_publisher_;
   rclcpp::Publisher<sensor_msgs::msg::JointState>::SharedPtr joint_state_publisher_;
   rclcpp::Publisher<visualization_msgs::msg::Marker>::SharedPtr goal_marker_publisher_;
   rclcpp::Publisher<moveit_task_constructor_msgs::msg::SubTrajectory>::SharedPtr trajectory_publisher_;
