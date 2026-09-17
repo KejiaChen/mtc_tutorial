@@ -22,6 +22,7 @@ def generate_launch_description():
     publish_legacy_topic = DeclareLaunchArgument("publish_legacy_topic", default_value="false")
     start_move_group = DeclareLaunchArgument("start_move_group", default_value="false")
     sync_via_move_group = DeclareLaunchArgument("sync_via_move_group", default_value="true")
+    leader_height_constraint = DeclareLaunchArgument("leader_height_constraint", default_value="true")
 
     moveit_config = (
         MoveItConfigsBuilder("dual_arm_panda")
@@ -65,7 +66,8 @@ def generate_launch_description():
         parameters=[moveit_config.to_dict(), ompl, chomp,
                     {"publish_legacy_topic": LaunchConfiguration("publish_legacy_topic"),
                      "alter_finger_left": LaunchConfiguration("alter_finger_left"),
-                     "sync_via_move_group": LaunchConfiguration("sync_via_move_group")}],
+                     "sync_via_move_group": LaunchConfiguration("sync_via_move_group"),
+                     "leader_height_constraint_enabled": LaunchConfiguration("leader_height_constraint")}],
     )
     subscriber = Node(
         package="mtc_tutorial",
@@ -87,7 +89,7 @@ def generate_launch_description():
         use_sensone_left, use_sensone_right, alter_finger_left, alter_finger_right,
         send_to_robot, follower_ip, follower_port, leader_ip, leader_port,
         publish_legacy_topic, start_move_group,
-        sync_via_move_group,
+        sync_via_move_group, leader_height_constraint,
         move_group, planner, subscriber,
     ])
 

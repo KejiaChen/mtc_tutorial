@@ -3,6 +3,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <limits>
 #include <mutex>
 #include <stdexcept>
 #include <string>
@@ -18,7 +19,13 @@
 #include <moveit/collision_detection/collision_common.h>
 #include <moveit/move_group_interface/move_group_interface.h>
 #include <moveit/planning_scene_monitor/planning_scene_monitor.h>
+#include <moveit/utils/moveit_error_code.h>
+#include <moveit_msgs/msg/bounding_volume.hpp>
+#include <moveit_msgs/msg/constraints.hpp>
+#include <moveit_msgs/msg/position_constraint.hpp>
 #include <moveit_task_constructor_msgs/msg/sub_trajectory.hpp>
+#include <shape_msgs/msg/solid_primitive.hpp>
+#include <trajectory_msgs/msg/joint_trajectory.hpp>
 
 using json = nlohmann::json;
 
@@ -38,6 +45,7 @@ constexpr char kFollowerFkResponseTopic[] = "/prior_transition/follower_fk_respo
 constexpr char kTrajectoryTopic[] = "/prior_transition/follower_subtrajectory";
 constexpr char kLeaderTrajectoryTopic[] = "/prior_transition/leader_subtrajectory";
 constexpr char kGoalMarkerTopic[] = "/prior_transition/follower_goal_marker";
+constexpr char kLeaderZBoundMarkerTopic[] = "/prior_transition/leader_tcp_zbound_marker";
 }
 
 class PriorSingleArmPlanner final : public rclcpp::Node {
@@ -51,6 +59,13 @@ public:
     default_frame_(declare_parameter<std::string>("default_frame", "world")),
     planning_time_(declare_parameter<double>("planning_time", 10.0)),
     planning_attempts_(declare_parameter<int>("planning_attempts", 5)),
+    // The leader path is now position-constrained to a z-slab
+    // (leaderTcpHeightConstraints()), which forces OMPL into IK-projected
+    // sampling -- much harder to search than a plain pose-to-pose plan, so
+    // it gets its own larger budget instead of slowing down the
+    // unconstrained follower/sync groups too.
+    leader_planning_time_(declare_parameter<double>("leader_planning_time", 30.0)),
+    leader_planning_attempts_(declare_parameter<int>("leader_planning_attempts", 15)),
     publish_legacy_topic_(declare_parameter<bool>("publish_legacy_topic", false)),
     alter_finger_left_(declare_parameter<bool>("alter_finger_left", false)),
     extended_finger_length_(declare_parameter<double>("extended_finger_length", 0.01)),
@@ -64,6 +79,16 @@ public:
     leader_tcp_offset_x_(declare_parameter<double>("leader_tcp_offset_x", 0.0)),
     leader_tcp_offset_y_(declare_parameter<double>("leader_tcp_offset_y", 0.0)),
     leader_tcp_offset_z_(declare_parameter<double>("leader_tcp_offset_z", 0.1034)),
+    // Path constraint on the planned leader trajectory's TCP height: MoveIt
+    // keeps the whole interpolated path's TCP z within this range, not just
+    // the goal. Can be disabled entirely (e.g. from the launch file) since
+    // it forces OMPL into much slower/less reliable IK-projected sampling.
+    leader_height_constraint_enabled_(declare_parameter<bool>("leader_height_constraint_enabled", true)),
+    leader_tcp_min_z_(declare_parameter<double>("leader_tcp_min_z", 0.00)),
+    leader_tcp_max_z_(declare_parameter<double>("leader_tcp_max_z", 0.30)),
+    // Lateral (x/y) size of the RViz debug marker for the above z range --
+    // cosmetic only, the actual planning constraint is unbounded in x/y.
+    leader_tcp_zbound_marker_size_(declare_parameter<double>("leader_tcp_zbound_marker_size", 0.4)),
     open_follower_gripper_(declare_parameter<bool>("open_follower_gripper", true)),
     open_gripper_width_(declare_parameter<double>("open_gripper_width", 0.035)),
     sync_joint_state_(declare_parameter<bool>("sync_joint_state", true)),
@@ -83,6 +108,8 @@ public:
       "/joint_states", rclcpp::QoS(10).reliable());
     goal_marker_publisher_ = create_publisher<visualization_msgs::msg::Marker>(
       kGoalMarkerTopic, rclcpp::QoS(1).transient_local());
+    leader_zbound_marker_publisher_ = create_publisher<visualization_msgs::msg::Marker>(
+      kLeaderZBoundMarkerTopic, rclcpp::QoS(1).transient_local());
     trajectory_publisher_ = create_publisher<moveit_task_constructor_msgs::msg::SubTrajectory>(
       kTrajectoryTopic, rclcpp::QoS(1).transient_local());
     leader_trajectory_publisher_ = create_publisher<moveit_task_constructor_msgs::msg::SubTrajectory>(
@@ -104,8 +131,8 @@ public:
     sync_group_.setMaxVelocityScalingFactor(0.1);
     sync_group_.setMaxAccelerationScalingFactor(0.1);
     leader_group_.setPoseReferenceFrame(default_frame_);
-    leader_group_.setPlanningTime(planning_time_);
-    leader_group_.setNumPlanningAttempts(planning_attempts_);
+    leader_group_.setPlanningTime(leader_planning_time_);
+    leader_group_.setNumPlanningAttempts(leader_planning_attempts_);
     leader_group_.setMaxVelocityScalingFactor(velocity_scaling);
     leader_group_.setMaxAccelerationScalingFactor(acceleration_scaling);
     auto node_alias = std::shared_ptr<rclcpp::Node>(this, [](rclcpp::Node*) {});
@@ -393,6 +420,112 @@ private:
     return Eigen::Vector3d(leader_tcp_offset_x_, leader_tcp_offset_y_, leader_tcp_offset_z_);
   }
 
+  // Path constraint keeping the leader's planned trajectory TCP height
+  // within [leader_tcp_min_z_, leader_tcp_max_z_] for the whole path, not
+  // just the goal. ``target_point_offset`` (in the constrained link's own
+  // frame) is exactly the TCP offset used to convert leader_pose -> hand_pose
+  // above, so MoveIt checks the actual TCP point, not the hand link origin.
+  moveit_msgs::msg::Constraints leaderTcpHeightConstraints() const {
+    moveit_msgs::msg::PositionConstraint position_constraint;
+    position_constraint.header.frame_id = default_frame_;
+    position_constraint.link_name = leader_link_;
+    const auto tcp_offset = leaderEffectiveTcpOffset();
+    position_constraint.target_point_offset.x = tcp_offset.x();
+    position_constraint.target_point_offset.y = tcp_offset.y();
+    position_constraint.target_point_offset.z = tcp_offset.z();
+    position_constraint.weight = 1.0;
+
+    shape_msgs::msg::SolidPrimitive region_box;
+    region_box.type = shape_msgs::msg::SolidPrimitive::BOX;
+    // Wide enough in x/y to never actually constrain lateral motion --
+    // only the z range is meant to bind.
+    region_box.dimensions = {4.0, 4.0, leader_tcp_max_z_ - leader_tcp_min_z_};
+
+    geometry_msgs::msg::Pose region_pose;
+    region_pose.position.x = 0.0;
+    region_pose.position.y = 0.0;
+    region_pose.position.z = (leader_tcp_min_z_ + leader_tcp_max_z_) / 2.0;
+    region_pose.orientation.w = 1.0;
+
+    position_constraint.constraint_region.primitives.push_back(region_box);
+    position_constraint.constraint_region.primitive_poses.push_back(region_pose);
+
+    moveit_msgs::msg::Constraints constraints;
+    constraints.position_constraints.push_back(position_constraint);
+    return constraints;
+  }
+
+  // Debug aid: publish a semi-transparent box in RViz showing the
+  // leaderTcpHeightConstraints() z-slab, centered laterally on the leader's
+  // current TCP position (the constraint region itself is unbounded in
+  // x/y, so this is purely a visualization convenience). ``state`` should be
+  // built from the request's own leader_joints (see makeRequestState()),
+  // not a live getCurrentState()/getCurrentPose() query -- those depend on
+  // a fresh /joint_states subscription that this node does not keep warm
+  // between syncs (see the note on finalJointPositions() above).
+  void publishLeaderZBoundMarker(const moveit::core::RobotState& state) {
+    const Eigen::Vector3d tcp_position = state.getGlobalLinkTransform(leader_link_) * leaderEffectiveTcpOffset();
+    const double center_z = (leader_tcp_min_z_ + leader_tcp_max_z_) / 2.0;
+
+    visualization_msgs::msg::Marker marker;
+    marker.header.frame_id = default_frame_;
+    marker.header.stamp = now();
+    marker.ns = "prior_leader_tcp_zbound";
+    marker.id = 0;
+    marker.type = visualization_msgs::msg::Marker::CUBE;
+    marker.action = visualization_msgs::msg::Marker::ADD;
+    marker.pose.position.x = tcp_position.x();
+    marker.pose.position.y = tcp_position.y();
+    marker.pose.position.z = center_z;
+    marker.pose.orientation.w = 1.0;
+    marker.scale.x = leader_tcp_zbound_marker_size_;
+    marker.scale.y = leader_tcp_zbound_marker_size_;
+    marker.scale.z = leader_tcp_max_z_ - leader_tcp_min_z_;
+    marker.color.r = 1.0f;
+    marker.color.g = 0.6f;
+    marker.color.b = 0.0f;
+    marker.color.a = 0.3f;
+    leader_zbound_marker_publisher_->publish(marker);
+    RCLCPP_INFO(get_logger(),
+                "Published leader TCP z-bound marker at (%.4f, %.4f, %.4f), z in [%.4f, %.4f]",
+                tcp_position.x(), tcp_position.y(), center_z, leader_tcp_min_z_, leader_tcp_max_z_);
+  }
+
+  // Debug aid: FK every waypoint of a planned leader trajectory and log its
+  // TCP z, flagging any waypoint outside [leader_tcp_min_z_,
+  // leader_tcp_max_z_] -- lets us see whether leaderTcpHeightConstraints()
+  // was actually honored across the whole path, not just the goal. Uses a
+  // scratch RobotState (its initial values don't matter -- every waypoint's
+  // joints are set explicitly before each FK) rather than
+  // getCurrentState(), which depends on a live /joint_states subscription
+  // this node does not keep warm (see publishLeaderZBoundMarker() above).
+  void logLeaderTrajectoryHeights(const trajectory_msgs::msg::JointTrajectory& joint_trajectory) {
+    auto state = std::make_shared<moveit::core::RobotState>(leader_group_.getRobotModel());
+    state->setToDefaultValues();
+    const auto tcp_offset = leaderEffectiveTcpOffset();
+    double min_z = std::numeric_limits<double>::infinity();
+    double max_z = -std::numeric_limits<double>::infinity();
+    std::size_t violations = 0;
+    for (std::size_t i = 0; i < joint_trajectory.points.size(); ++i) {
+      state->setJointGroupPositions(leader_group_name_, joint_trajectory.points[i].positions);
+      state->update();
+      const Eigen::Vector3d tcp_position = state->getGlobalLinkTransform(leader_link_) * tcp_offset;
+      const double z = tcp_position.z();
+      min_z = std::min(min_z, z);
+      max_z = std::max(max_z, z);
+      const bool out_of_bounds = z < leader_tcp_min_z_ - 1e-6 || z > leader_tcp_max_z_ + 1e-6;
+      if (out_of_bounds) {
+        ++violations;
+      }
+      RCLCPP_INFO(get_logger(), "  leader path[%zu/%zu] TCP z=%.4f%s", i, joint_trajectory.points.size(),
+                  z, out_of_bounds ? "  <-- OUT OF BOUNDS" : "");
+    }
+    RCLCPP_INFO(
+      get_logger(),
+      "Leader path TCP z range=[%.4f, %.4f] (constraint=[%.4f, %.4f]), %zu/%zu waypoints out of bounds",
+      min_z, max_z, leader_tcp_min_z_, leader_tcp_max_z_, violations, joint_trajectory.points.size());
+  }
+
   // Requests contain the physical TCP pose. MoveGroupInterface expects the
   // pose of the selected link, so convert TCP -> hand using the same offset
   // convention as dual_mtc_routing.cpp.
@@ -628,6 +761,43 @@ private:
       const auto hand_pose = tcpPoseToHandPose(leader_pose, leaderEffectiveTcpOffset());
       logPose("Requested leader TCP goal", leader_pose);
       logPose("Converted leader hand goal", hand_pose);
+      const auto request_state = makeRequestState(request);
+      if (leader_height_constraint_enabled_) {
+        publishLeaderZBoundMarker(*request_state);
+        const double start_tcp_z =
+          (request_state->getGlobalLinkTransform(leader_link_) * leaderEffectiveTcpOffset()).z();
+        RCLCPP_INFO(get_logger(),
+                    "Leader start TCP z=%.4f (constraint=[%.4f, %.4f]) -- goal TCP z=%.4f",
+                    start_tcp_z, leader_tcp_min_z_, leader_tcp_max_z_, leader_pose.position.z);
+      } else {
+        RCLCPP_INFO(get_logger(), "Leader height constraint disabled (leader_height_constraint_enabled=false)");
+      }
+
+      // Isolates plain geometric reachability/collision from OMPL search
+      // failure, same diagnostic requestCallback() runs for the follower.
+      // Note this only checks the unconstrained start/goal states -- it does
+      // NOT prove a *path* satisfying leaderTcpHeightConstraints() exists
+      // between them, so a PLANNING_FAILED with both diagnostics OK usually
+      // means the z-slab made the connecting path too hard to sample, not
+      // that the endpoints themselves are bad.
+      auto leader_ik_state = *request_state;
+      const auto* leader_jmg = leader_ik_state.getJointModelGroup(leader_group_name_);
+      if (!leader_jmg) {
+        RCLCPP_ERROR(get_logger(), "Cannot run IK diagnostic: group '%s' is missing from the robot model",
+                     leader_group_name_.c_str());
+      } else {
+        const bool ik_ok = leader_ik_state.setFromIK(leader_jmg, hand_pose, leader_link_, 0.5);
+        RCLCPP_INFO(get_logger(), "IK diagnostic for converted leader hand goal: %s", ik_ok ? "success" : "failure");
+        if (ik_ok) {
+          std::vector<double> ik_joints;
+          leader_ik_state.copyJointGroupPositions(leader_jmg, ik_joints);
+          RCLCPP_INFO(get_logger(),
+                      "IK solution joints: [%.4f, %.4f, %.4f, %.4f, %.4f, %.4f, %.4f]",
+                      ik_joints[0], ik_joints[1], ik_joints[2], ik_joints[3],
+                      ik_joints[4], ik_joints[5], ik_joints[6]);
+        }
+        logCollisionDiagnostics(*request_state, ik_ok ? &leader_ik_state : nullptr);
+      }
 
       leader_group_.clearPoseTargets();
       const bool target_set = leader_group_.setPoseTarget(hand_pose, leader_link_);
@@ -636,17 +806,28 @@ private:
       if (!target_set) {
         throw std::runtime_error("MoveIt rejected leader hand target");
       }
+      if (leader_height_constraint_enabled_) {
+        leader_group_.setPathConstraints(leaderTcpHeightConstraints());
+      }
 
       moveit::planning_interface::MoveGroupInterface::Plan leader_plan;
       const auto plan_result = leader_group_.plan(leader_plan);
       leader_group_.clearPoseTargets();
+      leader_group_.clearPathConstraints();
       if (plan_result != moveit::core::MoveItErrorCode::SUCCESS ||
           leader_plan.trajectory_.joint_trajectory.points.empty()) {
-        RCLCPP_ERROR(get_logger(), "MoveIt leader planning failed: error_code=%d", plan_result.val);
+        const std::string error_code_name = moveit::core::error_code_to_string(plan_result);
+        RCLCPP_ERROR(get_logger(), "MoveIt leader planning failed: error_code=%d (%s) -- see IK/collision "
+                     "diagnostics above for whether the start/goal themselves are reachable and collision-free",
+                     plan_result.val, error_code_name.c_str());
         publishLeaderMoveResponse({{"task_id", task_id}, {"ok", false}, {"stage", "leader_plan"},
                                    {"error_code", plan_result.val},
+                                   {"error_code_name", error_code_name},
                                    {"error", "MoveIt failed to plan the leader move"}});
         return;
+      }
+      if (leader_height_constraint_enabled_) {
+        logLeaderTrajectoryHeights(leader_plan.trajectory_.joint_trajectory);
       }
       // Publish the planned leader trajectory so prior_subtrajectory_subscriber
       // can forward it to the real leader MIOS server too -- shape_control_
@@ -767,6 +948,8 @@ private:
   std::string default_frame_;
   double planning_time_;
   int planning_attempts_;
+  double leader_planning_time_;
+  int leader_planning_attempts_;
   bool publish_legacy_topic_;
   bool alter_finger_left_;
   double extended_finger_length_;
@@ -776,6 +959,10 @@ private:
   double leader_tcp_offset_x_;
   double leader_tcp_offset_y_;
   double leader_tcp_offset_z_;
+  bool leader_height_constraint_enabled_;
+  double leader_tcp_min_z_;
+  double leader_tcp_max_z_;
+  double leader_tcp_zbound_marker_size_;
   bool open_follower_gripper_;
   double open_gripper_width_;
   bool sync_joint_state_;
@@ -810,6 +997,7 @@ private:
   rclcpp::Publisher<std_msgs::msg::String>::SharedPtr follower_fk_response_publisher_;
   rclcpp::Publisher<sensor_msgs::msg::JointState>::SharedPtr joint_state_publisher_;
   rclcpp::Publisher<visualization_msgs::msg::Marker>::SharedPtr goal_marker_publisher_;
+  rclcpp::Publisher<visualization_msgs::msg::Marker>::SharedPtr leader_zbound_marker_publisher_;
   rclcpp::Publisher<moveit_task_constructor_msgs::msg::SubTrajectory>::SharedPtr trajectory_publisher_;
   rclcpp::Publisher<moveit_task_constructor_msgs::msg::SubTrajectory>::SharedPtr leader_trajectory_publisher_;
   rclcpp::Publisher<moveit_task_constructor_msgs::msg::SubTrajectory>::SharedPtr legacy_trajectory_publisher_;
