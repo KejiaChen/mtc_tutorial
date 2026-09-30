@@ -1687,6 +1687,11 @@ mtc::Task MTCTaskNode::createTask(std::string& start_frame_name, std::string& go
       stage_move_to_align->setTimeout(5.0);
       stage_move_to_align->properties().configureInitFrom(mtc::Stage::PARENT);
 
+      // For the initial clip task, keep the two arm trajectories as separate
+      // sequential sub-trajectories instead of attempting to merge them into
+      // one dual-arm trajectory.
+      stage_move_to_align->properties().set("merge_mode", mtc::stages::Connect::SEQUENTIAL);
+
       // add path constraints
       moveit_msgs::msg::Constraints path_constraints = createBoxConstraints(lead_hand_frame, lead_target_pose, 0.1, 0.1, 0.1);
       stage_move_to_align->setPathConstraints(path_constraints);
