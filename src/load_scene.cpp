@@ -17,6 +17,12 @@
 #include <tf2_ros/transform_listener.h>
 #include <tf2_ros/buffer.h>
 #include <filesystem>
+#include <limits>
+#include <iomanip>
+#include <cmath>
+#include <algorithm>
+#include <cstdint>
+#include <unordered_map>
 
 class ObjectTFBroadcaster
 {
@@ -262,6 +268,92 @@ inline geometry_msgs::msg::Pose firstPoseOf(const moveit_msgs::msg::CollisionObj
   geometry_msgs::msg::Pose p; p.orientation.w = 1.0; return p; // safe fallback
 }
 
+void logMeshSummary(const shapes::Mesh &mesh, const std::string &object_name)
+{
+    double min_x = std::numeric_limits<double>::infinity();
+    double min_y = std::numeric_limits<double>::infinity();
+    double min_z = std::numeric_limits<double>::infinity();
+    double max_x = -std::numeric_limits<double>::infinity();
+    double max_y = -std::numeric_limits<double>::infinity();
+    double max_z = -std::numeric_limits<double>::infinity();
+
+    for (unsigned int i = 0; i < mesh.vertex_count; ++i)
+    {
+        const double x = mesh.vertices[3 * i];
+        const double y = mesh.vertices[3 * i + 1];
+        const double z = mesh.vertices[3 * i + 2];
+        min_x = std::min(min_x, x);
+        min_y = std::min(min_y, y);
+        min_z = std::min(min_z, z);
+        max_x = std::max(max_x, x);
+        max_y = std::max(max_y, y);
+        max_z = std::max(max_z, z);
+    }
+
+    RCLCPP_INFO(
+        rclcpp::get_logger("load_scene"),
+        "Mesh '%s' loaded: vertices=%u triangles=%u local_bounds=[%.6f, %.6f, %.6f]..[%.6f, %.6f, %.6f]",
+        object_name.c_str(), mesh.vertex_count, mesh.triangle_count,
+        min_x, min_y, min_z, max_x, max_y, max_z);
+}
+
+// MoveIt can handle meshes, but very large collision meshes are expensive to
+// insert into the monitored planning scene. Split only the mesh geometry into
+// several CollisionObjects while preserving the original mesh poses.
+std::vector<moveit_msgs::msg::CollisionObject> splitLargeMeshCollisionObject(
+    const moveit_msgs::msg::CollisionObject &object, std::size_t max_triangles_per_object = 10000)
+{
+    if (object.meshes.size() != 1 || object.primitives.size() != 0 || object.planes.size() != 0 ||
+        object.meshes[0].triangles.size() <= max_triangles_per_object)
+        return {object};
+
+    const auto &source_mesh = object.meshes[0];
+    const auto source_pose = object.mesh_poses.empty() ? geometry_msgs::msg::Pose{} : object.mesh_poses[0];
+    std::vector<moveit_msgs::msg::CollisionObject> parts;
+    std::size_t triangle_offset = 0;
+    std::size_t part_index = 0;
+
+    while (triangle_offset < source_mesh.triangles.size())
+    {
+        moveit_msgs::msg::CollisionObject part;
+        part.id = (part_index == 0) ? object.id : object.id + "_part_" + std::to_string(part_index);
+        part.header = object.header;
+        part.operation = moveit_msgs::msg::CollisionObject::ADD;
+
+        shape_msgs::msg::Mesh mesh;
+        std::unordered_map<uint32_t, uint32_t> remap;
+        const std::size_t end = std::min(triangle_offset + max_triangles_per_object,
+                                         source_mesh.triangles.size());
+        mesh.triangles.reserve(end - triangle_offset);
+
+        for (std::size_t i = triangle_offset; i < end; ++i)
+        {
+            shape_msgs::msg::MeshTriangle triangle;
+            const auto &source_triangle = source_mesh.triangles[i];
+            for (std::size_t corner = 0; corner < 3; ++corner)
+            {
+                const uint32_t old_index = source_triangle.vertex_indices[corner];
+                auto [it, inserted] = remap.emplace(old_index, static_cast<uint32_t>(mesh.vertices.size()));
+                if (inserted)
+                    mesh.vertices.push_back(source_mesh.vertices[old_index]);
+                triangle.vertex_indices[corner] = it->second;
+            }
+            mesh.triangles.push_back(triangle);
+        }
+
+        part.meshes.push_back(std::move(mesh));
+        part.mesh_poses.push_back(source_pose);
+        parts.push_back(std::move(part));
+        triangle_offset = end;
+        ++part_index;
+    }
+
+    RCLCPP_WARN(rclcpp::get_logger("load_scene"),
+                "Split mesh collision object '%s' into %zu parts (max %zu triangles/part)",
+                object.id.c_str(), parts.size(), max_triangles_per_object);
+    return parts;
+}
+
 std::vector<moveit_msgs::msg::CollisionObject> loadCustomScene(const std::string &scene_path, const std::string &mesh_path, rclcpp::Node::SharedPtr move_group_node, bool use_qb_board_coordinate)
 {
     // planning_scene_monitor::LockedPlanningSceneRW ps(planning_scene_monitor);
@@ -271,6 +363,14 @@ std::vector<moveit_msgs::msg::CollisionObject> loadCustomScene(const std::string
     // }
 
     moveit::planning_interface::PlanningSceneInterface planning_scene_interface;
+
+    // Incremental world-geometry path used by MoveIt's PlanningSceneMonitor.
+    // This avoids sending the entire scene as one /planning_scene message.
+    auto collision_object_publisher = move_group_node->create_publisher<moveit_msgs::msg::CollisionObject>(
+        "/collision_object", rclcpp::QoS(rclcpp::KeepLast(10)).reliable());
+    RCLCPP_INFO(rclcpp::get_logger("load_scene"),
+                "collision_object publisher has %zu subscriber(s)",
+                collision_object_publisher->get_subscription_count());
     
     using moveit::planning_interface::MoveGroupInterface;
     auto move_group_interface = MoveGroupInterface(move_group_node, "right_panda_arm");
@@ -279,6 +379,27 @@ std::vector<moveit_msgs::msg::CollisionObject> loadCustomScene(const std::string
                                                       move_group_interface.getRobotModel());
 
     ObjectTFBroadcaster object_tf_broadcaster(move_group_node);
+
+    RCLCPP_INFO(
+        rclcpp::get_logger("load_scene"),
+        "loadCustomScene(scene='%s', mesh='%s', use_qb_board_coordinate=%s)",
+        scene_path.c_str(), mesh_path.empty() ? "<none>" : mesh_path.c_str(),
+        use_qb_board_coordinate ? "true" : "false");
+
+    const auto logFile = [](const char *label, const std::string &path) {
+        std::error_code ec;
+        const bool exists = std::filesystem::exists(path, ec);
+        const bool regular = exists && std::filesystem::is_regular_file(path, ec);
+        const auto size = regular ? std::filesystem::file_size(path, ec) : 0;
+        RCLCPP_INFO(
+            rclcpp::get_logger("load_scene"),
+            "%s: path='%s' exists=%s regular=%s size=%zu bytes",
+            label, path.c_str(), exists ? "true" : "false",
+            regular ? "true" : "false", size);
+    };
+    logFile("Scene file", scene_path);
+    if (!mesh_path.empty())
+        logFile("Mesh file", mesh_path);
 
     if (use_qb_board_coordinate)
     {
@@ -296,6 +417,7 @@ std::vector<moveit_msgs::msg::CollisionObject> loadCustomScene(const std::string
         throw std::runtime_error("Failed to open scene file: " + scene_path);
         return collision_objects;
     }
+    RCLCPP_INFO(rclcpp::get_logger("load_scene"), "Opened scene file successfully");
 
     // -------- NEW: prepare an output file to save converted world poses --------
     std::unique_ptr<std::ofstream> fout;
@@ -397,6 +519,11 @@ std::vector<moveit_msgs::msg::CollisionObject> loadCustomScene(const std::string
                 //             object_name.c_str());
             }
 
+            RCLCPP_INFO(
+                rclcpp::get_logger("load_scene"),
+                "Parsed object '%s': shape=%s pose=(%.6f, %.6f, %.6f) quat=(%.6f, %.6f, %.6f, %.6f) dimensions=(%.6f, %.6f, %.6f)",
+                object_name.c_str(), shape_line.c_str(), x, y, z, qx, qy, qz, qw, dx, dy, dz);
+
             // Skip the remaining unused lines in the block
             for (int i = 0; i < 4; ++i)
             {
@@ -451,6 +578,10 @@ std::vector<moveit_msgs::msg::CollisionObject> loadCustomScene(const std::string
                 }
                 std::string uri = "file://" + std::filesystem::absolute(mesh_path).string(); // -> file:///home/...
 
+                RCLCPP_INFO(rclcpp::get_logger("load_scene"),
+                            "Loading mesh object '%s' from resource '%s'",
+                            object_name.c_str(), uri.c_str());
+
                 // auto mesh_co = makeMeshCollisionObject(
                 //     object_name, uri, /*parent_frame=*/"world", pose,
                 //     object_tf_broadcaster, /*scale=*/scale, /*world_frame=*/"world");
@@ -460,9 +591,36 @@ std::vector<moveit_msgs::msg::CollisionObject> loadCustomScene(const std::string
                 if (!mesh)
                     throw std::runtime_error("Failed to load mesh resource: " + uri);
 
+                logMeshSummary(*mesh, object_name);
+
                 shapes::ShapeMsg shape_msg_any;
-                shapes::constructMsgFromShape(mesh.get(), shape_msg_any);
+                if (!shapes::constructMsgFromShape(mesh.get(), shape_msg_any))
+                    throw std::runtime_error("Failed to convert mesh to shape_msgs::msg::Mesh: " + object_name);
                 shape_msgs::msg::Mesh mesh_msg = boost::get<shape_msgs::msg::Mesh>(shape_msg_any);
+
+                std::size_t invalid_triangle_indices = 0;
+                std::size_t nonfinite_vertices = 0;
+                unsigned int max_triangle_index = 0;
+                for (const auto &vertex : mesh_msg.vertices)
+                    if (!std::isfinite(vertex.x) || !std::isfinite(vertex.y) || !std::isfinite(vertex.z))
+                        ++nonfinite_vertices;
+                for (const auto &triangle : mesh_msg.triangles)
+                {
+                    max_triangle_index = std::max(max_triangle_index,
+                                                  std::max(triangle.vertex_indices[0],
+                                                           std::max(triangle.vertex_indices[1], triangle.vertex_indices[2])));
+                    for (const auto index : triangle.vertex_indices)
+                        if (index >= mesh_msg.vertices.size())
+                            ++invalid_triangle_indices;
+                }
+                std::unique_ptr<shapes::Shape> reconstructed_shape(shapes::constructShapeFromMsg(mesh_msg));
+                RCLCPP_INFO(rclcpp::get_logger("load_scene"),
+                            "Collision mesh message '%s': vertices=%zu triangles=%zu max_index=%u invalid_indices=%zu nonfinite_vertices=%zu reconstructible=%s",
+                            object_name.c_str(), mesh_msg.vertices.size(), mesh_msg.triangles.size(),
+                            max_triangle_index, invalid_triangle_indices, nonfinite_vertices,
+                            reconstructed_shape ? "true" : "false");
+                if (!reconstructed_shape)
+                    throw std::runtime_error("MoveIt geometric_shapes could not reconstruct mesh message: " + object_name);
 
                 // Build CollisionObject (world-frame)
                 collision_object.meshes.push_back(mesh_msg);
@@ -471,6 +629,12 @@ std::vector<moveit_msgs::msg::CollisionObject> loadCustomScene(const std::string
             }
 
             collision_objects.push_back(collision_object);
+
+            RCLCPP_INFO(
+                rclcpp::get_logger("load_scene"),
+                "Queued collision object '%s' (meshes=%zu primitives=%zu)",
+                collision_object.id.c_str(), collision_object.meshes.size(),
+                collision_object.primitives.size());
 
             if (fout)
             {
@@ -516,16 +680,76 @@ std::vector<moveit_msgs::msg::CollisionObject> loadCustomScene(const std::string
         }
     }
 
+    // Split only oversized mesh objects before sending them to MoveIt. The
+    // original STL remains unchanged; the resulting parts together represent
+    // exactly the same triangles and poses.
+    std::vector<moveit_msgs::msg::CollisionObject> expanded_collision_objects;
+    for (const auto &object : collision_objects)
+    {
+        auto parts = splitLargeMeshCollisionObject(object);
+        expanded_collision_objects.insert(expanded_collision_objects.end(),
+                                          std::make_move_iterator(parts.begin()),
+                                          std::make_move_iterator(parts.end()));
+    }
+    collision_objects.swap(expanded_collision_objects);
+
     // Add object to planning scene
-    planning_scene_interface.addCollisionObjects(collision_objects);
-    RCLCPP_INFO(rclcpp::get_logger("load_scene"), "Added %zu collision objects to planning scene", collision_objects.size());
+    size_t mesh_vertices = 0;
+    size_t mesh_triangles = 0;
+    for (const auto &object : collision_objects)
+    {
+        for (const auto &mesh : object.meshes)
+        {
+            mesh_vertices += mesh.vertices.size();
+            mesh_triangles += mesh.triangles.size();
+        }
+    }
+    RCLCPP_INFO(
+        rclcpp::get_logger("load_scene"),
+        "Publishing %zu collision objects to MoveIt (mesh vertices=%zu, triangle indices=%zu; approximate mesh payload=%zu bytes)",
+        collision_objects.size(), mesh_vertices, mesh_triangles,
+        mesh_vertices * sizeof(double) * 3 + mesh_triangles * sizeof(uint32_t));
+    // First send each object through the incremental /collision_object topic.
+    // This is the same world-geometry input consumed by MoveIt's monitor and
+    // does not replace the whole scene.
+    for (const auto &object : collision_objects)
+    {
+        collision_object_publisher->publish(object);
+        const bool acknowledged = collision_object_publisher->wait_for_all_acked(std::chrono::seconds(2));
+        RCLCPP_INFO(rclcpp::get_logger("load_scene"),
+                    "Published /collision_object '%s' (acked=%s)",
+                    object.id.c_str(), acknowledged ? "true" : "false");
+        rclcpp::sleep_for(std::chrono::milliseconds(300));
+    }
+
+    // Also use MoveIt's synchronous service API. RViz's "Mesh from file -> Add"
+    // initially modifies only its local PlanningScene; this service is the
+    // programmatic operation that commits the object to move_group.
+    for (const auto &object : collision_objects)
+    {
+        const bool applied = planning_scene_interface.applyCollisionObjects({object});
+        RCLCPP_INFO(rclcpp::get_logger("load_scene"),
+                    "applyCollisionObjects('%s') returned %s",
+                    object.id.c_str(), applied ? "success" : "failure");
+        if (!applied)
+            RCLCPP_ERROR(rclcpp::get_logger("load_scene"),
+                         "MoveIt rejected collision object '%s'", object.id.c_str());
+    }
+
+    rclcpp::sleep_for(std::chrono::milliseconds(1000));
+    auto known_objects = planning_scene_interface.getKnownObjectNames();
+    RCLCPP_INFO(rclcpp::get_logger("load_scene"),
+                "Planning scene currently reports %zu known object(s) after synchronous service calls",
+                known_objects.size());
+    for (const auto &name : known_objects)
+        RCLCPP_INFO(rclcpp::get_logger("load_scene"), "  known object: '%s'", name.c_str());
 
     // publish tf
     for (const auto &collision_object : collision_objects)
     {
         object_tf_broadcaster.publishObjectTF(collision_object.id, firstPoseOf(collision_object));
     }
-    RCLCPP_INFO(rclcpp::get_logger("load_scene"), "Published %d object TFs", collision_objects.size());
+    RCLCPP_INFO(rclcpp::get_logger("load_scene"), "Published %zu object TFs", collision_objects.size());
 
     // Show text in RViz of status and wait for MoveGroup to receive and process the collision object message
     visual_tools.trigger();
@@ -602,16 +826,22 @@ void loadObjectHats(std::vector<moveit_msgs::msg::CollisionObject> &collision_ob
         // sleep for a while
         rclcpp::sleep_for(std::chrono::milliseconds(100));
     }
-    planning_scene_interface.addCollisionObjects(hat_objects);
+    for (const auto &hat_object : hat_objects)
+    {
+        const bool applied = planning_scene_interface.applyCollisionObjects({hat_object});
+        RCLCPP_INFO(rclcpp::get_logger("load_scene"),
+                    "applyCollisionObjects('%s') returned %s",
+                    hat_object.id.c_str(), applied ? "success" : "failure");
+    }
 
-    RCLCPP_INFO(rclcpp::get_logger("load_scene"), "Added %d hat objects to planning scene", hat_objects.size());
+    RCLCPP_INFO(rclcpp::get_logger("load_scene"), "Added %zu hat objects to planning scene", hat_objects.size());
 
     // publish tf for hat objects
     for (const auto &hat_object : hat_objects)
     {
         object_tf_broadcaster.publishObjectTF(hat_object.id, hat_object.primitive_poses[0]);
     }
-    RCLCPP_INFO(rclcpp::get_logger("load_scene"), "Published %d hat object TFs", hat_objects.size());
+    RCLCPP_INFO(rclcpp::get_logger("load_scene"), "Published %zu hat object TFs", hat_objects.size());
 
 }
 
@@ -628,6 +858,13 @@ int main(int argc, char **argv)
 
     std::string scene_file = argv[1];
     std::string mesh_file = argv[2];
+    RCLCPP_INFO(node->get_logger(), "Arguments: argc=%d scene='%s' mesh='%s' clip='%s' use_qb='%s' add_hats='%s'",
+                argc, scene_file.c_str(), mesh_file.c_str(),
+                argc > 3 ? argv[3] : "<missing>",
+                argc > 4 ? argv[4] : "<missing>",
+                argc > 5 ? argv[5] : "<missing>");
+    RCLCPP_INFO(node->get_logger(),
+                "Environment scene is intentionally read in world coordinates; use_qb_board_coordinate applies to clip_file.");
     std::vector<moveit_msgs::msg::CollisionObject> environment_objects;
     try
     {
